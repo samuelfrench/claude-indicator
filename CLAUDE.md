@@ -11,7 +11,7 @@ Translucent PySide6 desktop widget showing Claude Code Max subscription usage li
 - Token refresh via `https://platform.claude.com/v1/oauth/token` with client_id `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
 
 ## Running
-- Requires `LD_LIBRARY_PATH=/home/sam/miniconda3/lib` on this system for xcb-cursor
+- May require `LD_LIBRARY_PATH=<path-to-miniconda>/lib` on some systems for xcb-cursor
 - Autostart configured at `~/.config/autostart/claude-widget.desktop`
 - Dependencies: PySide6, requests
 
