@@ -717,12 +717,12 @@ class ClaudeWidget(QWidget):
                 spacer.setStyleSheet("color: #444460; font-size: 9px; padding: 0 1px;")
                 graph_header.addWidget(spacer)
 
-        self._update_window_tabs()
         layout.addLayout(graph_header)
 
         # Usage graph
         self._graph = UsageGraph()
         layout.addWidget(self._graph)
+        self._update_window_tabs()
 
         layout.addSpacing(2)
 
