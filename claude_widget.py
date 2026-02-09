@@ -2,6 +2,7 @@
 """Translucent desktop widget showing Claude Code Max subscription usage."""
 
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -9,8 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QPoint, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPainterPath, QPen
+from PySide6.QtCore import QPoint, QRectF, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
@@ -20,7 +28,14 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA = "oauth-2025-04-20"
 REFRESH_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes
 COUNTDOWN_INTERVAL_MS = 1000  # 1 second
+HISTORY_PATH = Path.home() / ".claude" / "usage_history.json"
+MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
+MAX_HISTORY_POINTS = 288  # 24h at 5-min intervals
 
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 @dataclass
 class UsageEntry:
@@ -65,6 +80,135 @@ class UsageData:
     error: str = ""
     fetched_at: float = 0.0
 
+    @property
+    def plan_name(self) -> str:
+        if self.seven_day_opus is not None:
+            return "CLAUDE MAX"
+        if self.seven_day_sonnet is not None:
+            return "CLAUDE PRO"
+        return "CLAUDE"
+
+    @property
+    def model_name(self) -> str:
+        if self.seven_day_opus is not None:
+            return "opus"
+        if self.seven_day_sonnet is not None:
+            return "sonnet"
+        return "unknown"
+
+    @property
+    def model_pct(self) -> float:
+        if self.seven_day_opus is not None:
+            return self.seven_day_opus.utilization
+        if self.seven_day_sonnet is not None:
+            return self.seven_day_sonnet.utilization
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# History persistence
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HistoryPoint:
+    timestamp: float
+    five_hour_pct: float
+    seven_day_pct: float
+    model_pct: float
+    model_name: str
+
+
+class UsageHistory:
+    """Stores usage data points to disk for graphing."""
+
+    def __init__(self, path: Path = HISTORY_PATH):
+        self._path = path
+        self.points: list[HistoryPoint] = []
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self._path) as f:
+                raw = json.load(f)
+            self.points = [
+                HistoryPoint(
+                    timestamp=p["timestamp"],
+                    five_hour_pct=p["five_hour_pct"],
+                    seven_day_pct=p["seven_day_pct"],
+                    model_pct=p["model_pct"],
+                    model_name=p.get("model_name", "unknown"),
+                )
+                for p in raw
+            ]
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+            self.points = []
+
+    def add(self, data: UsageData):
+        if data.error:
+            return
+        pt = HistoryPoint(
+            timestamp=data.fetched_at,
+            five_hour_pct=data.five_hour.utilization,
+            seven_day_pct=data.seven_day.utilization,
+            model_pct=data.model_pct,
+            model_name=data.model_name,
+        )
+        self.points.append(pt)
+        self._prune()
+        self._save()
+
+    def _prune(self):
+        cutoff = time.time() - MAX_HISTORY_AGE_S
+        self.points = [p for p in self.points if p.timestamp >= cutoff]
+        if len(self.points) > MAX_HISTORY_POINTS:
+            self.points = self.points[-MAX_HISTORY_POINTS:]
+
+    def _save(self):
+        data = [
+            {
+                "timestamp": p.timestamp,
+                "five_hour_pct": p.five_hour_pct,
+                "seven_day_pct": p.seven_day_pct,
+                "model_pct": p.model_pct,
+                "model_name": p.model_name,
+            }
+            for p in self.points
+        ]
+        tmp_path = self._path.with_suffix(".tmp")
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp_path, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, self._path)
+        except OSError:
+            pass
+
+    @property
+    def avg_five_hour(self) -> float:
+        if not self.points:
+            return 0.0
+        return sum(p.five_hour_pct for p in self.points) / len(self.points)
+
+    @property
+    def peak_five_hour(self) -> float:
+        if not self.points:
+            return 0.0
+        return max(p.five_hour_pct for p in self.points)
+
+    @property
+    def trend(self) -> str:
+        """Compare last 3 vs prior 3 data points. Returns arrow."""
+        if len(self.points) < 6:
+            return "—"
+        recent = sum(p.five_hour_pct for p in self.points[-3:]) / 3
+        prior = sum(p.five_hour_pct for p in self.points[-6:-3]) / 3
+        diff = recent - prior
+        if diff > 2:
+            return "↑"
+        if diff < -2:
+            return "↓"
+        return "→"
+
 
 def _parse_entry(data: dict | None) -> UsageEntry | None:
     if data is None:
@@ -74,6 +218,10 @@ def _parse_entry(data: dict | None) -> UsageEntry | None:
         resets_at=data.get("resets_at", ""),
     )
 
+
+# ---------------------------------------------------------------------------
+# API client
+# ---------------------------------------------------------------------------
 
 class ClaudeUsageClient:
     """Reads OAuth credentials and fetches usage data."""
@@ -176,6 +324,10 @@ class FetchWorker(QThread):
         self.finished.emit(data)
 
 
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
 def _bar_color(pct: float) -> QColor:
     if pct >= 90:
         return QColor(239, 68, 68)  # red
@@ -246,6 +398,194 @@ class UsageBar(QWidget):
         p.end()
 
 
+class UsageGraph(QWidget):
+    """Line chart showing 5-hour utilization over the last 24 hours."""
+
+    ACCENT = QColor(139, 92, 246)  # #8b5cf6 purple
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(110)
+        self._points: list[HistoryPoint] = []
+
+    def set_points(self, points: list[HistoryPoint]):
+        self._points = points
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        h = self.height()
+
+        # Margins for axes labels
+        left_m = 30
+        right_m = 8
+        top_m = 4
+        bottom_m = 16
+        chart_w = w - left_m - right_m
+        chart_h = h - top_m - bottom_m
+
+        tiny_font = QFont("sans-serif", 7)
+        p.setFont(tiny_font)
+        fm = p.fontMetrics()
+
+        # Y-axis labels & grid lines
+        dim_pen = QPen(QColor(60, 60, 80), 1, Qt.PenStyle.SolidLine)
+        for pct in (25, 50, 75):
+            y = top_m + chart_h * (1 - pct / 100)
+            p.setPen(dim_pen)
+            p.drawLine(left_m, int(y), w - right_m, int(y))
+            p.setPen(QColor(100, 100, 120))
+            label = f"{pct}%"
+            lw = fm.horizontalAdvance(label)
+            p.drawText(left_m - lw - 4, int(y) + fm.ascent() // 2, label)
+
+        # 80% threshold dashed line
+        threshold_y = top_m + chart_h * (1 - 80 / 100)
+        dash_pen = QPen(QColor(239, 68, 68, 100), 1, Qt.PenStyle.DashLine)
+        p.setPen(dash_pen)
+        p.drawLine(left_m, int(threshold_y), w - right_m, int(threshold_y))
+
+        now = time.time()
+        t_start = now - MAX_HISTORY_AGE_S  # 24h ago
+
+        # X-axis tick labels
+        p.setPen(QColor(100, 100, 120))
+        for label, hours_ago in [("-24h", 24), ("-18h", 18), ("-12h", 12), ("-6h", 6), ("now", 0)]:
+            t = now - hours_ago * 3600
+            x = left_m + chart_w * ((t - t_start) / MAX_HISTORY_AGE_S)
+            lw = fm.horizontalAdvance(label)
+            p.drawText(int(x - lw // 2), h - 2, label)
+
+        # Not enough data placeholder
+        if len(self._points) < 2:
+            p.setPen(QColor(100, 100, 120))
+            placeholder_font = QFont("sans-serif", 9)
+            p.setFont(placeholder_font)
+            text = "Collecting data..."
+            tw = p.fontMetrics().horizontalAdvance(text)
+            p.drawText(left_m + (chart_w - tw) // 2, top_m + chart_h // 2, text)
+            p.end()
+            return
+
+        # Build path from points
+        def to_xy(pt: HistoryPoint):
+            x = left_m + chart_w * ((pt.timestamp - t_start) / MAX_HISTORY_AGE_S)
+            y = top_m + chart_h * (1 - pt.five_hour_pct / 100)
+            return x, y
+
+        line_path = QPainterPath()
+        fill_path = QPainterPath()
+        first_x, first_y = to_xy(self._points[0])
+        line_path.moveTo(first_x, first_y)
+        fill_path.moveTo(first_x, top_m + chart_h)  # bottom
+        fill_path.lineTo(first_x, first_y)
+
+        last_x, last_y = first_x, first_y
+        for pt in self._points[1:]:
+            x, y = to_xy(pt)
+            line_path.lineTo(x, y)
+            fill_path.lineTo(x, y)
+            last_x, last_y = x, y
+
+        # Close fill path along bottom
+        fill_path.lineTo(last_x, top_m + chart_h)
+        fill_path.closeSubpath()
+
+        # Gradient fill
+        grad = QLinearGradient(0, top_m, 0, top_m + chart_h)
+        grad.setColorAt(0, QColor(139, 92, 246, 50))
+        grad.setColorAt(1, QColor(139, 92, 246, 5))
+        p.fillPath(fill_path, grad)
+
+        # Line
+        line_pen = QPen(self.ACCENT, 2)
+        line_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(line_pen)
+        p.drawPath(line_path)
+
+        # Current value dot
+        p.setBrush(self.ACCENT)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QRectF(last_x - 3, last_y - 3, 6, 6))
+
+        p.end()
+
+
+class StatsRow(QWidget):
+    """Compact row showing AVG, PEAK, TREND, and EXTRA status."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(20)
+        self._avg = 0.0
+        self._peak = 0.0
+        self._trend = "—"
+        self._extra = False
+
+    def set_data(self, avg: float, peak: float, trend: str, extra: bool):
+        self._avg = avg
+        self._peak = peak
+        self._trend = trend
+        self._extra = extra
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+
+        col_w = w // 4
+        y = 14
+
+        # AVG
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(4, y, "AVG:")
+        avg_x = p.fontMetrics().horizontalAdvance("AVG: ") + 4
+        p.setPen(QColor(180, 180, 200))
+        p.drawText(avg_x, y, f"{self._avg:.0f}%")
+
+        # PEAK
+        x2 = col_w
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(x2, y, "PEAK:")
+        peak_x = x2 + p.fontMetrics().horizontalAdvance("PEAK: ")
+        p.setPen(_bar_color(self._peak))
+        p.drawText(peak_x, y, f"{self._peak:.0f}%")
+
+        # TREND
+        x3 = col_w * 2
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(x3, y, "TREND:")
+        trend_x = x3 + p.fontMetrics().horizontalAdvance("TREND: ")
+        trend_color = QColor(34, 197, 94) if self._trend == "↓" else (
+            QColor(239, 68, 68) if self._trend == "↑" else QColor(180, 180, 200)
+        )
+        p.setPen(trend_color)
+        p.drawText(trend_x, y, self._trend)
+
+        # EXTRA
+        x4 = col_w * 3
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(x4, y, "EXT:")
+        ext_x = x4 + p.fontMetrics().horizontalAdvance("EXT: ")
+        ext_text = "ON" if self._extra else "OFF"
+        ext_color = QColor(34, 197, 94) if self._extra else QColor(160, 160, 180)
+        p.setPen(ext_color)
+        p.drawText(ext_x, y, ext_text)
+
+        p.end()
+
+
+# ---------------------------------------------------------------------------
+# Main widget
+# ---------------------------------------------------------------------------
+
 class ClaudeWidget(QWidget):
     """Translucent always-on-top widget displaying Claude Max usage."""
 
@@ -257,16 +597,27 @@ class ClaudeWidget(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(340, 280)
+        self.setFixedSize(340, 420)
 
         self._drag_pos = QPoint()
         self._usage: UsageData | None = None
         self._client = ClaudeUsageClient()
         self._worker: FetchWorker | None = None
+        self._history = UsageHistory()
 
         self._build_ui()
         self._setup_timers()
         self._fetch_usage()
+
+        # Initialize graph with persisted history
+        if self._history.points:
+            self._graph.set_points(self._history.points)
+            self._stats_row.set_data(
+                self._history.avg_five_hour,
+                self._history.peak_five_hour,
+                self._history.trend,
+                False,
+            )
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -275,13 +626,13 @@ class ClaudeWidget(QWidget):
 
         # Header row
         header = QHBoxLayout()
-        title = QLabel("CLAUDE MAX")
+        self._title_label = QLabel("CLAUDE")
         title_font = QFont("sans-serif", 13)
         title_font.setWeight(QFont.Weight.Bold)
         title_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
-        title.setFont(title_font)
-        title.setStyleSheet("color: #d4a574;")  # warm gold
-        header.addWidget(title)
+        self._title_label.setFont(title_font)
+        self._title_label.setStyleSheet("color: #d4a574;")  # warm gold
+        header.addWidget(self._title_label)
         header.addStretch()
 
         # Close button
@@ -313,6 +664,37 @@ class ClaudeWidget(QWidget):
 
         self._model_bar = UsageBar("Sonnet (7-Day)")
         layout.addWidget(self._model_bar)
+
+        layout.addSpacing(2)
+
+        # Graph separator
+        sep_g = QWidget()
+        sep_g.setFixedHeight(1)
+        sep_g.setStyleSheet("background-color: rgba(100, 100, 120, 80);")
+        layout.addWidget(sep_g)
+        layout.addSpacing(2)
+
+        # Graph label
+        graph_label = QLabel("Usage History (24h)")
+        graph_label.setStyleSheet("color: #666680; font-size: 9px;")
+        layout.addWidget(graph_label)
+
+        # Usage graph
+        self._graph = UsageGraph()
+        layout.addWidget(self._graph)
+
+        layout.addSpacing(2)
+
+        # Stats separator
+        sep_s = QWidget()
+        sep_s.setFixedHeight(1)
+        sep_s.setStyleSheet("background-color: rgba(100, 100, 120, 80);")
+        layout.addWidget(sep_s)
+        layout.addSpacing(2)
+
+        # Stats row
+        self._stats_row = StatsRow()
+        layout.addWidget(self._stats_row)
 
         layout.addSpacing(2)
 
@@ -359,6 +741,21 @@ class ClaudeWidget(QWidget):
 
     def _on_usage_fetched(self, data: UsageData):
         self._usage = data
+
+        if not data.error:
+            # Update title with detected plan name
+            self._title_label.setText(data.plan_name)
+
+            # Persist history and update graph/stats
+            self._history.add(data)
+            self._graph.set_points(self._history.points)
+            self._stats_row.set_data(
+                self._history.avg_five_hour,
+                self._history.peak_five_hour,
+                self._history.trend,
+                data.extra_usage_enabled,
+            )
+
         self._update_display()
 
     def _update_display(self):
