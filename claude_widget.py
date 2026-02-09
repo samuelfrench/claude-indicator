@@ -399,14 +399,30 @@ class UsageBar(QWidget):
 
 
 class UsageGraph(QWidget):
-    """Line chart showing 5-hour utilization over the last 24 hours."""
+    """Line chart showing 5-hour utilization with selectable time window."""
 
     ACCENT = QColor(139, 92, 246)  # #8b5cf6 purple
+
+    # (label, duration_seconds, x-axis ticks as (label, seconds_ago))
+    WINDOWS = [
+        ("30m", 30 * 60, [("-30m", 30), ("-20m", 20), ("-10m", 10), ("now", 0)]),
+        ("5h", 5 * 3600, [("-5h", 5), ("-4h", 4), ("-3h", 3), ("-2h", 2), ("-1h", 1), ("now", 0)]),
+        ("24h", MAX_HISTORY_AGE_S, [("-24h", 24), ("-18h", 18), ("-12h", 12), ("-6h", 6), ("now", 0)]),
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(110)
         self._points: list[HistoryPoint] = []
+        self._window_idx = 2  # default to 24h
+
+    @property
+    def _window(self):
+        return self.WINDOWS[self._window_idx]
+
+    def set_window(self, idx: int):
+        self._window_idx = idx
+        self.update()
 
     def set_points(self, points: list[HistoryPoint]):
         self._points = points
@@ -448,18 +464,26 @@ class UsageGraph(QWidget):
         p.drawLine(left_m, int(threshold_y), w - right_m, int(threshold_y))
 
         now = time.time()
-        t_start = now - MAX_HISTORY_AGE_S  # 24h ago
+        _, duration_s, ticks = self._window
+        t_start = now - duration_s
 
         # X-axis tick labels
         p.setPen(QColor(100, 100, 120))
-        for label, hours_ago in [("-24h", 24), ("-18h", 18), ("-12h", 12), ("-6h", 6), ("now", 0)]:
-            t = now - hours_ago * 3600
-            x = left_m + chart_w * ((t - t_start) / MAX_HISTORY_AGE_S)
+        is_minutes = duration_s <= 3600  # 30m window uses minutes
+        for label, ago in ticks:
+            if is_minutes:
+                t = now - ago * 60
+            else:
+                t = now - ago * 3600
+            x = left_m + chart_w * ((t - t_start) / duration_s)
             lw = fm.horizontalAdvance(label)
             p.drawText(int(x - lw // 2), h - 2, label)
 
+        # Filter points to current window
+        visible = [pt for pt in self._points if pt.timestamp >= t_start]
+
         # Not enough data placeholder
-        if len(self._points) < 2:
+        if len(visible) < 2:
             p.setPen(QColor(100, 100, 120))
             placeholder_font = QFont("sans-serif", 9)
             p.setFont(placeholder_font)
@@ -471,19 +495,19 @@ class UsageGraph(QWidget):
 
         # Build path from points
         def to_xy(pt: HistoryPoint):
-            x = left_m + chart_w * ((pt.timestamp - t_start) / MAX_HISTORY_AGE_S)
+            x = left_m + chart_w * ((pt.timestamp - t_start) / duration_s)
             y = top_m + chart_h * (1 - pt.five_hour_pct / 100)
             return x, y
 
         line_path = QPainterPath()
         fill_path = QPainterPath()
-        first_x, first_y = to_xy(self._points[0])
+        first_x, first_y = to_xy(visible[0])
         line_path.moveTo(first_x, first_y)
         fill_path.moveTo(first_x, top_m + chart_h)  # bottom
         fill_path.lineTo(first_x, first_y)
 
         last_x, last_y = first_x, first_y
-        for pt in self._points[1:]:
+        for pt in visible[1:]:
             x, y = to_xy(pt)
             line_path.lineTo(x, y)
             fill_path.lineTo(x, y)
@@ -674,10 +698,27 @@ class ClaudeWidget(QWidget):
         layout.addWidget(sep_g)
         layout.addSpacing(2)
 
-        # Graph label
-        graph_label = QLabel("Usage History (24h)")
-        graph_label.setStyleSheet("color: #666680; font-size: 9px;")
-        layout.addWidget(graph_label)
+        # Graph header with window tabs
+        graph_header = QHBoxLayout()
+        graph_title = QLabel("Usage History")
+        graph_title.setStyleSheet("color: #666680; font-size: 9px;")
+        graph_header.addWidget(graph_title)
+        graph_header.addStretch()
+
+        self._window_labels: list[QLabel] = []
+        for i, (wlabel, _, _) in enumerate(UsageGraph.WINDOWS):
+            tab = QLabel(wlabel)
+            tab.setCursor(Qt.CursorShape.PointingHandCursor)
+            tab.mousePressEvent = lambda _, idx=i: self._set_graph_window(idx)
+            self._window_labels.append(tab)
+            graph_header.addWidget(tab)
+            if i < len(UsageGraph.WINDOWS) - 1:
+                spacer = QLabel("·")
+                spacer.setStyleSheet("color: #444460; font-size: 9px; padding: 0 1px;")
+                graph_header.addWidget(spacer)
+
+        self._update_window_tabs()
+        layout.addLayout(graph_header)
 
         # Usage graph
         self._graph = UsageGraph()
@@ -804,6 +845,22 @@ class ClaudeWidget(QWidget):
         else:
             mins = elapsed // 60
             self._status_label.setText(f"Updated: {mins}m ago")
+
+    def _set_graph_window(self, idx: int):
+        self._graph.set_window(idx)
+        self._update_window_tabs()
+
+    def _update_window_tabs(self):
+        active_idx = self._graph._window_idx
+        for i, tab in enumerate(self._window_labels):
+            if i == active_idx:
+                tab.setStyleSheet(
+                    "color: #8b5cf6; font-size: 9px; font-weight: bold; padding: 0 2px;"
+                )
+            else:
+                tab.setStyleSheet(
+                    "color: #555570; font-size: 9px; padding: 0 2px;"
+                )
 
     def _update_countdowns(self):
         """Update countdown strings every second without re-fetching."""
