@@ -26,11 +26,11 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA = "oauth-2025-04-20"
-REFRESH_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes
+REFRESH_INTERVAL_MS = 60 * 1000  # 60 seconds
 COUNTDOWN_INTERVAL_MS = 1000  # 1 second
 HISTORY_PATH = Path.home() / ".claude" / "usage_history.json"
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
-MAX_HISTORY_POINTS = 288  # 24h at 5-min intervals
+MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +628,7 @@ class ClaudeWidget(QWidget):
         self._client = ClaudeUsageClient()
         self._worker: FetchWorker | None = None
         self._history = UsageHistory()
+        self._next_fetch_at: float = 0.0
 
         self._build_ui()
         self._setup_timers()
@@ -776,6 +777,7 @@ class ClaudeWidget(QWidget):
     def _fetch_usage(self):
         if self._worker and self._worker.isRunning():
             return
+        self._next_fetch_at = time.time() + REFRESH_INTERVAL_MS / 1000
         self._worker = FetchWorker(self._client)
         self._worker.finished.connect(self._on_usage_fetched)
         self._worker.start()
@@ -838,13 +840,9 @@ class ClaudeWidget(QWidget):
         else:
             self._model_bar.hide()
 
-        # Updated time
-        elapsed = int(time.time() - data.fetched_at)
-        if elapsed < 60:
-            self._status_label.setText("Updated: just now")
-        else:
-            mins = elapsed // 60
-            self._status_label.setText(f"Updated: {mins}m ago")
+        # Updated time + next update countdown
+        remaining = max(0, int(self._next_fetch_at - time.time()))
+        self._status_label.setText(f"Updated: just now  ·  Next: {remaining}s")
 
     def _set_graph_window(self, idx: int):
         self._graph.set_window(idx)
