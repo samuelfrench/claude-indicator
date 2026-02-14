@@ -719,8 +719,8 @@ class ClaudeWidget(QWidget):
         layout.addWidget(self._five_hour_bar)
 
         self._estimate_label = QLabel("")
-        self._estimate_label.setStyleSheet("color: #888898; font-size: 8px; padding-left: 2px;")
-        self._estimate_label.setFixedHeight(12)
+        self._estimate_label.setStyleSheet("color: #888898; font-size: 10px; padding-left: 2px;")
+        self._estimate_label.setFixedHeight(16)
         layout.addWidget(self._estimate_label)
         layout.addSpacing(2)
 
