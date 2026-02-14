@@ -195,6 +195,42 @@ class UsageHistory:
             return 0.0
         return max(p.five_hour_pct for p in self.points)
 
+    def estimated_time_left(self, current_pct: float) -> str:
+        """Estimate time until 100% based on last 5 minutes of usage rate."""
+        if not self.points or current_pct >= 100:
+            return ""
+
+        now = time.time()
+        five_min_ago = now - 5 * 60
+        recent = [p for p in self.points if p.timestamp >= five_min_ago]
+
+        if len(recent) < 2:
+            return ""
+
+        oldest = recent[0]
+        newest = recent[-1]
+        time_delta_min = (newest.timestamp - oldest.timestamp) / 60
+
+        if time_delta_min < 0.5:
+            return ""
+
+        rate = (newest.five_hour_pct - oldest.five_hour_pct) / time_delta_min
+
+        if rate <= 0:
+            return "not increasing"
+
+        remaining_min = (100 - current_pct) / rate
+
+        if remaining_min > 1440:
+            return ">24h left at current rate"
+
+        hours = int(remaining_min // 60)
+        minutes = int(remaining_min % 60)
+
+        if hours > 0:
+            return f"~{hours}h {minutes}m left at current rate"
+        return f"~{minutes}m left at current rate"
+
     @property
     def trend(self) -> str:
         """Compare last 3 vs prior 3 data points. Returns arrow."""
@@ -681,6 +717,11 @@ class ClaudeWidget(QWidget):
         # Usage bars
         self._five_hour_bar = UsageBar("5-Hour Window")
         layout.addWidget(self._five_hour_bar)
+
+        self._estimate_label = QLabel("")
+        self._estimate_label.setStyleSheet("color: #888898; font-size: 8px; padding-left: 2px;")
+        self._estimate_label.setFixedHeight(12)
+        layout.addWidget(self._estimate_label)
         layout.addSpacing(2)
 
         self._seven_day_bar = UsageBar("7-Day Window")
@@ -817,6 +858,14 @@ class ClaudeWidget(QWidget):
             data.five_hour.utilization,
             data.five_hour.time_remaining(),
         )
+
+        estimate = self._history.estimated_time_left(data.five_hour.utilization)
+        if estimate:
+            self._estimate_label.setText(estimate)
+            self._estimate_label.show()
+        else:
+            self._estimate_label.hide()
+
         self._seven_day_bar.set_data(
             data.seven_day.utilization,
             data.seven_day.time_remaining(),
