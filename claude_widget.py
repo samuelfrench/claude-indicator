@@ -29,6 +29,7 @@ OAUTH_BETA = "oauth-2025-04-20"
 REFRESH_INTERVAL_MS = 60 * 1000  # 60 seconds
 COUNTDOWN_INTERVAL_MS = 1000  # 1 second
 HISTORY_PATH = Path.home() / ".claude" / "usage_history.json"
+STATS_CACHE_PATH = Path.home() / ".claude" / "stats-cache.json"
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
 
@@ -642,6 +643,100 @@ class StatsRow(QWidget):
         p.end()
 
 
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def read_token_stats() -> dict:
+    """Read token stats from Claude Code's stats-cache.json."""
+    try:
+        with open(STATS_CACHE_PATH) as f:
+            data = json.load(f)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_tokens = 0
+        for entry in data.get("dailyModelTokens", []):
+            if entry.get("date") == today:
+                for count in entry.get("tokensByModel", {}).values():
+                    today_tokens += count
+                break
+
+        total_output = 0
+        total_cache = 0
+        for usage in data.get("modelUsage", {}).values():
+            total_output += usage.get("outputTokens", 0)
+            total_cache += usage.get("cacheReadInputTokens", 0)
+
+        return {
+            "today": today_tokens,
+            "total_output": total_output,
+            "total_cache": total_cache,
+        }
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+        return {}
+
+
+class TokenRow(QWidget):
+    """Compact row showing token usage stats from Claude Code."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(20)
+        self._today = 0
+        self._total_out = 0
+        self._total_cache = 0
+
+    def set_data(self, today: int, total_out: int, total_cache: int):
+        self._today = today
+        self._total_out = total_out
+        self._total_cache = total_cache
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        col_w = w // 3
+        y = 14
+
+        # TODAY
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(4, y, "TODAY:")
+        lbl_w = fm.horizontalAdvance("TODAY: ") + 4
+        p.setPen(QColor(180, 180, 200))
+        p.drawText(lbl_w, y, _fmt_tokens(self._today))
+
+        # OUTPUT (lifetime)
+        x2 = col_w
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(x2, y, "OUT:")
+        out_x = x2 + fm.horizontalAdvance("OUT: ")
+        p.setPen(QColor(180, 180, 200))
+        p.drawText(out_x, y, _fmt_tokens(self._total_out))
+
+        # CACHE (lifetime)
+        x3 = col_w * 2
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(x3, y, "CACHE:")
+        cache_x = x3 + fm.horizontalAdvance("CACHE: ")
+        p.setPen(QColor(139, 92, 246))
+        p.drawText(cache_x, y, _fmt_tokens(self._total_cache))
+
+        p.end()
+
+
 # ---------------------------------------------------------------------------
 # Main widget
 # ---------------------------------------------------------------------------
@@ -657,7 +752,7 @@ class ClaudeWidget(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(340, 420)
+        self.setFixedSize(340, 450)
 
         self._drag_pos = QPoint()
         self._usage: UsageData | None = None
@@ -669,6 +764,15 @@ class ClaudeWidget(QWidget):
         self._build_ui()
         self._setup_timers()
         self._fetch_usage()
+
+        # Initialize token stats
+        tstats = read_token_stats()
+        if tstats:
+            self._token_row.set_data(
+                tstats.get("today", 0),
+                tstats.get("total_output", 0),
+                tstats.get("total_cache", 0),
+            )
 
         # Initialize graph with persisted history
         if self._history.points:
@@ -779,6 +883,10 @@ class ClaudeWidget(QWidget):
         self._stats_row = StatsRow()
         layout.addWidget(self._stats_row)
 
+        # Token stats row
+        self._token_row = TokenRow()
+        layout.addWidget(self._token_row)
+
         layout.addSpacing(2)
 
         # Bottom separator
@@ -838,6 +946,15 @@ class ClaudeWidget(QWidget):
                 self._history.peak_five_hour,
                 self._history.trend,
                 data.extra_usage_enabled,
+            )
+
+        # Read token stats from Claude Code's local cache
+        tstats = read_token_stats()
+        if tstats:
+            self._token_row.set_data(
+                tstats.get("today", 0),
+                tstats.get("total_output", 0),
+                tstats.get("total_cache", 0),
             )
 
         self._update_display()
