@@ -3,6 +3,8 @@
 
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -27,6 +29,7 @@ TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA = "oauth-2025-04-20"
 REFRESH_INTERVAL_MS = 60 * 1000  # 60 seconds
+DEPLOY_REFRESH_MS = 5 * 60 * 1000  # 5 minutes
 COUNTDOWN_INTERVAL_MS = 1000  # 1 second
 HISTORY_PATH = Path.home() / ".claude" / "usage_history.json"
 STATS_CACHE_PATH = Path.home() / ".claude" / "stats-cache.json"
@@ -104,6 +107,34 @@ class UsageData:
         if self.seven_day_sonnet is not None:
             return self.seven_day_sonnet.utilization
         return 0.0
+
+
+@dataclass
+class DeployInfo:
+    project_name: str      # e.g. "coffee-explorer"
+    repo_slug: str         # e.g. "owner/coffee-explorer"
+    last_deploy_at: str    # ISO 8601 timestamp or ""
+    workflow_name: str     # e.g. "Deploy"
+    error: str             # "" if ok, error message otherwise
+
+    def relative_time(self) -> str:
+        if self.error:
+            return self.error
+        if not self.last_deploy_at:
+            return "no runs"
+        try:
+            dt = datetime.fromisoformat(self.last_deploy_at.replace("Z", "+00:00"))
+            delta = datetime.now(timezone.utc) - dt
+            secs = int(delta.total_seconds())
+            if secs < 60:
+                return "just now"
+            if secs < 3600:
+                return f"{secs // 60}m ago"
+            if secs < 86400:
+                return f"{secs // 3600}h ago"
+            return f"{secs // 86400}d ago"
+        except (ValueError, TypeError):
+            return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +288,148 @@ def _parse_entry(data: dict | None) -> UsageEntry | None:
 
 
 # ---------------------------------------------------------------------------
+# Deploy detection helpers
+# ---------------------------------------------------------------------------
+
+_GITHUB_SSH_RE = re.compile(r"git@github\.com:(.+?)(?:\.git)?$")
+_GITHUB_HTTPS_RE = re.compile(r"https?://github\.com/(.+?)(?:\.git)?$")
+
+
+def _parse_github_slug(remote_url: str) -> str | None:
+    """Extract OWNER/REPO from a GitHub SSH or HTTPS remote URL."""
+    remote_url = remote_url.strip()
+    m = _GITHUB_SSH_RE.match(remote_url)
+    if m:
+        return m.group(1)
+    m = _GITHUB_HTTPS_RE.match(remote_url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def scan_claude_projects() -> list[dict]:
+    """Find running Claude Code processes and resolve their project repos."""
+    seen_roots: set[str] = set()
+    projects: list[dict] = []
+
+    try:
+        proc_path = Path("/proc")
+        if not proc_path.exists():
+            return projects
+        pids = [p.name for p in proc_path.iterdir() if p.name.isdigit()]
+    except OSError:
+        return projects
+
+    for pid in pids:
+        try:
+            cmdline_path = proc_path / pid / "cmdline"
+            cmdline = cmdline_path.read_bytes().decode("utf-8", errors="replace")
+            # cmdline is null-separated
+            if "claude" not in cmdline.lower():
+                continue
+            # Skip this widget process itself
+            if "claude_widget" in cmdline:
+                continue
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except (OSError, PermissionError):
+            continue
+
+        if cwd in seen_roots:
+            continue
+
+        # Find git root
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=cwd, capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                continue
+            git_root = result.stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            continue
+
+        if git_root in seen_roots:
+            continue
+        seen_roots.add(git_root)
+
+        # Get remote URL
+        try:
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=git_root, capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                continue
+            remote_url = result.stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            continue
+
+        slug = _parse_github_slug(remote_url)
+        if not slug:
+            continue
+
+        project_name = Path(git_root).name
+        projects.append({
+            "project_name": project_name,
+            "repo_slug": slug,
+            "git_root": git_root,
+        })
+
+    return projects
+
+
+def fetch_deploy_info(project: dict) -> DeployInfo:
+    """Query GitHub Actions for the latest successful deploy on the default branch."""
+    slug = project["repo_slug"]
+    name = project["project_name"]
+
+    # Get default branch
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", slug, "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return DeployInfo(name, slug, "", "", result.stderr.strip()[:40] or "gh error")
+        default_branch = result.stdout.strip()
+        if not default_branch:
+            default_branch = "main"
+    except FileNotFoundError:
+        return DeployInfo(name, slug, "", "", "gh not found")
+    except subprocess.SubprocessError:
+        return DeployInfo(name, slug, "", "", "query failed")
+
+    # Get latest successful run on default branch
+    try:
+        result = subprocess.run(
+            ["gh", "run", "list", "-R", slug, "--status", "success",
+             "--branch", default_branch, "--limit", "1",
+             "--json", "updatedAt,workflowName"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return DeployInfo(name, slug, "", "", result.stderr.strip()[:40] or "gh error")
+
+        runs = json.loads(result.stdout)
+        if not runs:
+            return DeployInfo(name, slug, "", "", "")
+
+        run = runs[0]
+        return DeployInfo(
+            project_name=name,
+            repo_slug=slug,
+            last_deploy_at=run.get("updatedAt", ""),
+            workflow_name=run.get("workflowName", ""),
+            error="",
+        )
+    except (json.JSONDecodeError, KeyError):
+        return DeployInfo(name, slug, "", "", "parse error")
+    except subprocess.SubprocessError:
+        return DeployInfo(name, slug, "", "", "query failed")
+
+
+# ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
 
@@ -359,6 +532,15 @@ class FetchWorker(QThread):
     def run(self):
         data = self.client.fetch()
         self.finished.emit(data)
+
+
+class DeployFetchWorker(QThread):
+    finished = Signal(list)
+
+    def run(self):
+        projects = scan_claude_projects()
+        deploys = [fetch_deploy_info(p) for p in projects]
+        self.finished.emit(deploys)
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +919,102 @@ class TokenRow(QWidget):
         p.end()
 
 
+class DeployRow(QWidget):
+    """Variable-height row showing deploy status per active Claude project."""
+
+    _HEADER_H = 18
+    _ROW_H = 16
+    _PAD = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._deploys: list[DeployInfo] = []
+        self.setFixedHeight(0)
+        self.hide()
+
+    def set_data(self, deploys: list[DeployInfo]):
+        self._deploys = deploys
+        if deploys:
+            h = self._HEADER_H + self._ROW_H * len(deploys) + self._PAD
+            self.setFixedHeight(h)
+            self.show()
+        else:
+            self.setFixedHeight(0)
+            self.hide()
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._deploys:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        # Header
+        hdr_font = QFont("sans-serif", 8)
+        hdr_font.setWeight(QFont.Weight.Medium)
+        p.setFont(hdr_font)
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(4, 13, "DEPLOYS")
+
+        # Per-project rows
+        row_font = QFont("sans-serif", 8)
+        p.setFont(row_font)
+        fm = p.fontMetrics()
+
+        for i, d in enumerate(self._deploys):
+            y = self._HEADER_H + self._ROW_H * i + 12
+
+            # Project name
+            p.setPen(QColor(180, 180, 200))
+            name_text = d.project_name
+            name_w = fm.horizontalAdvance(name_text)
+            p.drawText(8, y, name_text)
+
+            # Separator dot
+            p.setPen(QColor(80, 80, 100))
+            p.drawText(8 + name_w + 4, y, "·")
+            time_x = 8 + name_w + 4 + fm.horizontalAdvance("· ")
+
+            # Relative time with color coding
+            rel = d.relative_time()
+            if d.error:
+                time_color = QColor(239, 68, 68)  # red for errors
+            elif not d.last_deploy_at:
+                time_color = QColor(160, 160, 180)  # dim for no runs
+            else:
+                try:
+                    dt = datetime.fromisoformat(d.last_deploy_at.replace("Z", "+00:00"))
+                    age_s = (datetime.now(timezone.utc) - dt).total_seconds()
+                    if age_s < 3600:
+                        time_color = QColor(34, 197, 94)  # green <1h
+                    elif age_s < 86400:
+                        time_color = QColor(234, 179, 8)  # amber <24h
+                    else:
+                        time_color = QColor(249, 115, 22)  # orange >24h
+                except (ValueError, TypeError):
+                    time_color = QColor(160, 160, 180)
+
+            p.setPen(time_color)
+            p.drawText(time_x, y, rel)
+
+            # Workflow name (right-aligned, dim)
+            if d.workflow_name:
+                wf_text = d.workflow_name
+                max_wf_w = 80
+                wf_w = fm.horizontalAdvance(wf_text)
+                if wf_w > max_wf_w:
+                    while wf_w > max_wf_w - fm.horizontalAdvance("…") and len(wf_text) > 1:
+                        wf_text = wf_text[:-1]
+                        wf_w = fm.horizontalAdvance(wf_text)
+                    wf_text += "…"
+                    wf_w = fm.horizontalAdvance(wf_text)
+                p.setPen(QColor(80, 80, 100))
+                p.drawText(w - wf_w - 4, y, wf_text)
+
+        p.end()
+
+
 # ---------------------------------------------------------------------------
 # Main widget
 # ---------------------------------------------------------------------------
@@ -752,18 +1030,20 @@ class ClaudeWidget(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(340, 450)
+        self.setFixedWidth(340)
 
         self._drag_pos = QPoint()
         self._usage: UsageData | None = None
         self._client = ClaudeUsageClient()
         self._worker: FetchWorker | None = None
+        self._deploy_worker: DeployFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
 
         self._build_ui()
         self._setup_timers()
         self._fetch_usage()
+        self._fetch_deploys()
 
         # Initialize token stats
         tstats = read_token_stats()
@@ -887,6 +1167,10 @@ class ClaudeWidget(QWidget):
         self._token_row = TokenRow()
         layout.addWidget(self._token_row)
 
+        # Deploy status row
+        self._deploy_row = DeployRow()
+        layout.addWidget(self._deploy_row)
+
         layout.addSpacing(2)
 
         # Bottom separator
@@ -913,7 +1197,7 @@ class ClaudeWidget(QWidget):
         layout.addLayout(status_layout)
 
     def _setup_timers(self):
-        # Fetch timer - every 5 minutes
+        # Fetch timer - every 60 seconds
         self._fetch_timer = QTimer(self)
         self._fetch_timer.timeout.connect(self._fetch_usage)
         self._fetch_timer.start(REFRESH_INTERVAL_MS)
@@ -922,6 +1206,11 @@ class ClaudeWidget(QWidget):
         self._countdown_timer = QTimer(self)
         self._countdown_timer.timeout.connect(self._update_countdowns)
         self._countdown_timer.start(COUNTDOWN_INTERVAL_MS)
+
+        # Deploy timer - every 5 minutes
+        self._deploy_timer = QTimer(self)
+        self._deploy_timer.timeout.connect(self._fetch_deploys)
+        self._deploy_timer.start(DEPLOY_REFRESH_MS)
 
     def _fetch_usage(self):
         if self._worker and self._worker.isRunning():
@@ -1030,6 +1319,17 @@ class ClaudeWidget(QWidget):
         """Update countdown strings every second without re-fetching."""
         if self._usage and not self._usage.error:
             self._update_display()
+
+    def _fetch_deploys(self):
+        if self._deploy_worker and self._deploy_worker.isRunning():
+            return
+        self._deploy_worker = DeployFetchWorker()
+        self._deploy_worker.finished.connect(self._on_deploys_fetched)
+        self._deploy_worker.start()
+
+    def _on_deploys_fetched(self, deploys: list):
+        self._deploy_row.set_data(deploys)
+        self.adjustSize()
 
     def paintEvent(self, event):
         p = QPainter(self)
