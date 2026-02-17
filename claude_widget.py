@@ -841,14 +841,6 @@ def read_token_stats() -> dict:
         with open(STATS_CACHE_PATH) as f:
             data = json.load(f)
 
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_tokens = 0
-        for entry in data.get("dailyModelTokens", []):
-            if entry.get("date") == today:
-                for count in entry.get("tokensByModel", {}).values():
-                    today_tokens += count
-                break
-
         total_output = 0
         total_cache = 0
         for usage in data.get("modelUsage", {}).values():
@@ -856,7 +848,6 @@ def read_token_stats() -> dict:
             total_cache += usage.get("cacheReadInputTokens", 0)
 
         return {
-            "today": today_tokens,
             "total_output": total_output,
             "total_cache": total_cache,
         }
@@ -870,12 +861,10 @@ class TokenRow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(20)
-        self._today = 0
         self._total_out = 0
         self._total_cache = 0
 
-    def set_data(self, today: int, total_out: int, total_cache: int):
-        self._today = today
+    def set_data(self, total_out: int, total_cache: int):
         self._total_out = total_out
         self._total_cache = total_cache
         self.update()
@@ -890,26 +879,18 @@ class TokenRow(QWidget):
         p.setFont(font)
         fm = p.fontMetrics()
 
-        col_w = w // 3
+        col_w = w // 2
         y = 14
 
-        # TODAY
-        p.setPen(QColor(100, 100, 120))
-        p.drawText(4, y, "TODAY:")
-        lbl_w = fm.horizontalAdvance("TODAY: ") + 4
-        p.setPen(QColor(180, 180, 200))
-        p.drawText(lbl_w, y, _fmt_tokens(self._today))
-
         # OUTPUT (lifetime)
-        x2 = col_w
         p.setPen(QColor(100, 100, 120))
-        p.drawText(x2, y, "OUT:")
-        out_x = x2 + fm.horizontalAdvance("OUT: ")
+        p.drawText(4, y, "OUT:")
+        out_x = 4 + fm.horizontalAdvance("OUT: ")
         p.setPen(QColor(180, 180, 200))
         p.drawText(out_x, y, _fmt_tokens(self._total_out))
 
         # CACHE (lifetime)
-        x3 = col_w * 2
+        x3 = col_w
         p.setPen(QColor(100, 100, 120))
         p.drawText(x3, y, "CACHE:")
         cache_x = x3 + fm.horizontalAdvance("CACHE: ")
@@ -1049,7 +1030,6 @@ class ClaudeWidget(QWidget):
         tstats = read_token_stats()
         if tstats:
             self._token_row.set_data(
-                tstats.get("today", 0),
                 tstats.get("total_output", 0),
                 tstats.get("total_cache", 0),
             )
@@ -1241,7 +1221,6 @@ class ClaudeWidget(QWidget):
         tstats = read_token_stats()
         if tstats:
             self._token_row.set_data(
-                tstats.get("today", 0),
                 tstats.get("total_output", 0),
                 tstats.get("total_cache", 0),
             )
