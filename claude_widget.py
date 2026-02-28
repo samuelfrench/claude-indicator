@@ -35,6 +35,7 @@ HISTORY_PATH = Path.home() / ".claude" / "usage_history.json"
 STATS_CACHE_PATH = Path.home() / ".claude" / "stats-cache.json"
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
+SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +136,104 @@ class DeployInfo:
             return f"{secs // 86400}d ago"
         except (ValueError, TypeError):
             return "unknown"
+
+
+@dataclass
+class SystemMetrics:
+    cpu_pct: float = 0.0
+    mem_used_gb: float = 0.0
+    mem_total_gb: float = 0.0
+    gpu_pct: float = 0.0
+    gpu_mem_used_gb: float = 0.0
+    gpu_mem_total_gb: float = 0.0
+    gpu_temp: int = 0
+    gpu_available: bool = False
+
+
+class SystemMetricsReader:
+    """Reads CPU, RAM, and GPU metrics from /proc and nvidia-smi."""
+
+    def __init__(self):
+        self._prev_cpu: list[int] | None = None
+        self._gpu_available = False
+        # Seed CPU baseline
+        try:
+            self._prev_cpu = self._read_cpu_times()
+        except OSError:
+            pass
+        # Check nvidia-smi availability once
+        try:
+            subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, timeout=3,
+            )
+            self._gpu_available = True
+        except (FileNotFoundError, subprocess.SubprocessError):
+            self._gpu_available = False
+
+    @staticmethod
+    def _read_cpu_times() -> list[int]:
+        with open("/proc/stat") as f:
+            line = f.readline()  # first line: cpu  user nice system idle ...
+        parts = line.split()
+        # user nice system idle iowait irq softirq steal
+        return [int(x) for x in parts[1:9]]
+
+    def read(self) -> SystemMetrics:
+        m = SystemMetrics()
+
+        # CPU
+        try:
+            cur = self._read_cpu_times()
+            if self._prev_cpu:
+                prev_total = sum(self._prev_cpu)
+                cur_total = sum(cur)
+                prev_idle = self._prev_cpu[3]  # idle is index 3
+                cur_idle = cur[3]
+                total_d = cur_total - prev_total
+                idle_d = cur_idle - prev_idle
+                if total_d > 0:
+                    m.cpu_pct = 100.0 * (1 - idle_d / total_d)
+            self._prev_cpu = cur
+        except OSError:
+            pass
+
+        # RAM
+        try:
+            with open("/proc/meminfo") as f:
+                meminfo = {}
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        meminfo[parts[0].rstrip(":")] = int(parts[1])
+            total_kb = meminfo.get("MemTotal", 0)
+            avail_kb = meminfo.get("MemAvailable", 0)
+            m.mem_total_gb = total_kb / (1024 * 1024)
+            m.mem_used_gb = (total_kb - avail_kb) / (1024 * 1024)
+        except (OSError, ValueError):
+            pass
+
+        # GPU
+        m.gpu_available = self._gpu_available
+        if self._gpu_available:
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi",
+                     "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if result.returncode == 0:
+                    vals = result.stdout.strip().split(",")
+                    if len(vals) >= 4:
+                        m.gpu_pct = float(vals[0].strip())
+                        m.gpu_mem_used_gb = float(vals[1].strip()) / 1024
+                        m.gpu_mem_total_gb = float(vals[2].strip()) / 1024
+                        m.gpu_temp = int(float(vals[3].strip()))
+            except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+                m.gpu_available = False
+
+        return m
 
 
 # ---------------------------------------------------------------------------
@@ -996,6 +1095,151 @@ class DeployRow(QWidget):
         p.end()
 
 
+class SystemMetricsRow(QWidget):
+    """Collapsible row showing CPU, RAM, and GPU system metrics."""
+
+    _COLLAPSED_H = 22
+    _EXPANDED_H = 90  # adjusted if no GPU
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = False
+        self._metrics: SystemMetrics | None = None
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, metrics: SystemMetrics):
+        self._metrics = metrics
+        eh = self._COLLAPSED_H + 22 * (3 if metrics.gpu_available else 2)
+        self._EXPANDED_H = eh
+        if self._expanded:
+            self.setFixedHeight(self._EXPANDED_H)
+        self.update()
+
+    def mousePressEvent(self, event):
+        self._expanded = not self._expanded
+        if self._expanded:
+            self.setFixedHeight(self._EXPANDED_H)
+        else:
+            self.setFixedHeight(self._COLLAPSED_H)
+        # Resize parent widget
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        event.accept()
+
+    def paintEvent(self, event):
+        m = self._metrics
+        if m is None:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        y = 14
+        arrow = "▾" if self._expanded else "▸"
+
+        # Header: SYSTEM ▸/▾
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(4, y, f"SYSTEM {arrow}")
+        header_w = fm.horizontalAdvance(f"SYSTEM {arrow}  ")
+
+        if not self._expanded:
+            # Collapsed: inline summary
+            x = 4 + header_w
+            mem_pct = (m.mem_used_gb / m.mem_total_gb * 100) if m.mem_total_gb > 0 else 0
+
+            # CPU
+            p.setPen(QColor(100, 100, 120))
+            p.drawText(x, y, "CPU ")
+            x += fm.horizontalAdvance("CPU ")
+            p.setPen(_bar_color(m.cpu_pct))
+            cpu_text = f"{m.cpu_pct:.0f}%"
+            p.drawText(x, y, cpu_text)
+            x += fm.horizontalAdvance(cpu_text) + 8
+
+            # RAM
+            p.setPen(QColor(100, 100, 120))
+            p.drawText(x, y, "RAM ")
+            x += fm.horizontalAdvance("RAM ")
+            p.setPen(_bar_color(mem_pct))
+            ram_text = f"{mem_pct:.0f}%"
+            p.drawText(x, y, ram_text)
+            x += fm.horizontalAdvance(ram_text) + 8
+
+            # GPU
+            if m.gpu_available:
+                p.setPen(QColor(100, 100, 120))
+                p.drawText(x, y, "GPU ")
+                x += fm.horizontalAdvance("GPU ")
+                p.setPen(_bar_color(m.gpu_pct))
+                gpu_text = f"{m.gpu_pct:.0f}%"
+                p.drawText(x, y, gpu_text)
+
+                # Temp right-aligned
+                temp_text = f"{m.gpu_temp}°C"
+                temp_w = fm.horizontalAdvance(temp_text)
+                if m.gpu_temp >= 80:
+                    p.setPen(QColor(239, 68, 68))  # red
+                elif m.gpu_temp >= 70:
+                    p.setPen(QColor(249, 115, 22))  # orange
+                else:
+                    p.setPen(QColor(180, 180, 200))
+                p.drawText(w - temp_w - 4, y, temp_text)
+        else:
+            # Expanded: mini progress bars
+            mem_pct = (m.mem_used_gb / m.mem_total_gb * 100) if m.mem_total_gb > 0 else 0
+            bar_h = 8
+            bar_radius = 4
+            label_w = 32
+            detail_w = 80
+            bar_left = label_w + 4
+            bar_right = w - detail_w - 4
+            bar_w = bar_right - bar_left
+
+            rows = [
+                ("CPU", m.cpu_pct, f"{m.cpu_pct:.0f}%"),
+                ("RAM", mem_pct, f"{m.mem_used_gb:.1f}/{m.mem_total_gb:.0f} GB"),
+            ]
+            if m.gpu_available:
+                gpu_detail = f"{m.gpu_pct:.0f}%  {m.gpu_mem_used_gb:.1f}/{m.gpu_mem_total_gb:.0f} GB  {m.gpu_temp}°C"
+                rows.append(("GPU", m.gpu_pct, gpu_detail))
+
+            for i, (label, pct, detail) in enumerate(rows):
+                row_y = self._COLLAPSED_H + 22 * i
+                text_y = row_y + 14
+                bar_y = row_y + 8
+
+                # Label
+                p.setPen(QColor(100, 100, 120))
+                p.drawText(8, text_y, label)
+
+                # Bar background
+                bg_path = QPainterPath()
+                bg_path.addRoundedRect(bar_left, bar_y, bar_w, bar_h, bar_radius, bar_radius)
+                p.fillPath(bg_path, QColor(40, 40, 55))
+
+                # Bar fill
+                fill_w = max(bar_h, bar_w * pct / 100)
+                fill_path = QPainterPath()
+                fill_path.addRoundedRect(bar_left, bar_y, fill_w, bar_h, bar_radius, bar_radius)
+                p.fillPath(fill_path, _bar_color(pct))
+
+                # Detail text
+                p.setPen(QColor(180, 180, 200))
+                p.drawText(bar_right + 6, text_y, detail)
+
+        p.end()
+
+
 # ---------------------------------------------------------------------------
 # Main widget
 # ---------------------------------------------------------------------------
@@ -1020,11 +1264,15 @@ class ClaudeWidget(QWidget):
         self._deploy_worker: DeployFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
+        self._sys_reader = SystemMetricsReader()
 
         self._build_ui()
         self._setup_timers()
         self._fetch_usage()
         self._fetch_deploys()
+
+        # Initial system metrics read so widget isn't blank
+        self._update_system_metrics()
 
         # Initialize token stats
         tstats = read_token_stats()
@@ -1151,6 +1399,10 @@ class ClaudeWidget(QWidget):
         self._deploy_row = DeployRow()
         layout.addWidget(self._deploy_row)
 
+        # System metrics row
+        self._sys_row = SystemMetricsRow()
+        layout.addWidget(self._sys_row)
+
         layout.addSpacing(2)
 
         # Bottom separator
@@ -1191,6 +1443,11 @@ class ClaudeWidget(QWidget):
         self._deploy_timer = QTimer(self)
         self._deploy_timer.timeout.connect(self._fetch_deploys)
         self._deploy_timer.start(DEPLOY_REFRESH_MS)
+
+        # System metrics timer - every 3 seconds
+        self._sys_timer = QTimer(self)
+        self._sys_timer.timeout.connect(self._update_system_metrics)
+        self._sys_timer.start(SYSTEM_METRICS_INTERVAL_MS)
 
     def _fetch_usage(self):
         if self._worker and self._worker.isRunning():
@@ -1309,6 +1566,10 @@ class ClaudeWidget(QWidget):
     def _on_deploys_fetched(self, deploys: list):
         self._deploy_row.set_data(deploys)
         self.adjustSize()
+
+    def _update_system_metrics(self):
+        metrics = self._sys_reader.read()
+        self._sys_row.set_data(metrics)
 
     def paintEvent(self, event):
         p = QPainter(self)
