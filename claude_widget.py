@@ -23,6 +23,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -82,6 +83,9 @@ class UsageData:
     seven_day_sonnet: UsageEntry | None = None
     seven_day_opus: UsageEntry | None = None
     extra_usage_enabled: bool = False
+    extra_usage_utilization: float | None = None
+    extra_usage_used_credits: float | None = None
+    extra_usage_monthly_limit: float | None = None
     error: str = ""
     fetched_at: float = 0.0
 
@@ -609,14 +613,16 @@ class ClaudeUsageClient:
         except (json.JSONDecodeError, ValueError):
             return UsageData(error="Data Unavailable")
 
+        extra = data.get("extra_usage", {})
         return UsageData(
             five_hour=_parse_entry(data.get("five_hour")) or UsageEntry(),
             seven_day=_parse_entry(data.get("seven_day")) or UsageEntry(),
             seven_day_sonnet=_parse_entry(data.get("seven_day_sonnet")),
             seven_day_opus=_parse_entry(data.get("seven_day_opus")),
-            extra_usage_enabled=bool(
-                data.get("extra_usage", {}).get("is_enabled", False)
-            ),
+            extra_usage_enabled=bool(extra.get("is_enabled", False)),
+            extra_usage_utilization=extra.get("utilization"),
+            extra_usage_used_credits=extra.get("used_credits"),
+            extra_usage_monthly_limit=extra.get("monthly_limit"),
             fetched_at=time.time(),
         )
 
@@ -855,8 +861,18 @@ class UsageGraph(QWidget):
         p.end()
 
 
+def read_fast_mode() -> bool:
+    """Read fast mode setting from Claude Code's settings.json."""
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+        return bool(data.get("fastMode", False))
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+        return False
+
+
 class StatsRow(QWidget):
-    """Compact row showing AVG, PEAK, TREND, and EXTRA status."""
+    """Compact row showing AVG, PEAK, TREND, FAST, and EXTRA status."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -865,12 +881,17 @@ class StatsRow(QWidget):
         self._peak = 0.0
         self._trend = "—"
         self._extra = False
+        self._extra_credits: str = ""
+        self._fast = False
 
-    def set_data(self, avg: float, peak: float, trend: str, extra: bool):
+    def set_data(self, avg: float, peak: float, trend: str, extra: bool,
+                 extra_credits: str = "", fast: bool = False):
         self._avg = avg
         self._peak = peak
         self._trend = trend
         self._extra = extra
+        self._extra_credits = extra_credits
+        self._fast = fast
         self.update()
 
     def paintEvent(self, event):
@@ -881,45 +902,63 @@ class StatsRow(QWidget):
         font = QFont("sans-serif", 8)
         font.setWeight(QFont.Weight.Medium)
         p.setFont(font)
+        fm = p.fontMetrics()
 
-        col_w = w // 4
+        col_w = w // 5
         y = 14
 
         # AVG
         p.setPen(QColor(100, 100, 120))
         p.drawText(4, y, "AVG:")
-        avg_x = p.fontMetrics().horizontalAdvance("AVG: ") + 4
+        avg_x = fm.horizontalAdvance("AVG: ") + 4
         p.setPen(QColor(180, 180, 200))
         p.drawText(avg_x, y, f"{self._avg:.0f}%")
 
         # PEAK
         x2 = col_w
         p.setPen(QColor(100, 100, 120))
-        p.drawText(x2, y, "PEAK:")
-        peak_x = x2 + p.fontMetrics().horizontalAdvance("PEAK: ")
+        p.drawText(x2, y, "PK:")
+        peak_x = x2 + fm.horizontalAdvance("PK: ")
         p.setPen(_bar_color(self._peak))
         p.drawText(peak_x, y, f"{self._peak:.0f}%")
 
         # TREND
         x3 = col_w * 2
         p.setPen(QColor(100, 100, 120))
-        p.drawText(x3, y, "TREND:")
-        trend_x = x3 + p.fontMetrics().horizontalAdvance("TREND: ")
+        p.drawText(x3, y, "TR:")
+        trend_x = x3 + fm.horizontalAdvance("TR: ")
         trend_color = QColor(34, 197, 94) if self._trend == "↓" else (
             QColor(239, 68, 68) if self._trend == "↑" else QColor(180, 180, 200)
         )
         p.setPen(trend_color)
         p.drawText(trend_x, y, self._trend)
 
-        # EXTRA
+        # FAST
         x4 = col_w * 3
         p.setPen(QColor(100, 100, 120))
-        p.drawText(x4, y, "EXT:")
-        ext_x = x4 + p.fontMetrics().horizontalAdvance("EXT: ")
-        ext_text = "ON" if self._extra else "OFF"
-        ext_color = QColor(34, 197, 94) if self._extra else QColor(160, 160, 180)
-        p.setPen(ext_color)
-        p.drawText(ext_x, y, ext_text)
+        p.drawText(x4, y, "FAST:")
+        fast_x = x4 + fm.horizontalAdvance("FAST: ")
+        if self._fast:
+            p.setPen(QColor(250, 204, 21))  # yellow/gold bolt color
+            p.drawText(fast_x, y, "ON")
+        else:
+            p.setPen(QColor(160, 160, 180))
+            p.drawText(fast_x, y, "OFF")
+
+        # EXTRA
+        x5 = col_w * 4
+        p.setPen(QColor(100, 100, 120))
+        p.drawText(x5, y, "EXT:")
+        ext_x = x5 + fm.horizontalAdvance("EXT: ")
+        if self._extra and self._extra_credits:
+            p.setPen(QColor(34, 197, 94))
+            p.drawText(ext_x, y, self._extra_credits)
+        elif self._extra:
+            p.setPen(QColor(34, 197, 94))
+            p.drawText(ext_x, y, "ON")
+        else:
+            p.setPen(QColor(160, 160, 180))
+            p.drawText(ext_x, y, "OFF")
 
         p.end()
 
@@ -1290,6 +1329,7 @@ class ClaudeWidget(QWidget):
                 self._history.peak_five_hour,
                 self._history.trend,
                 False,
+                fast=read_fast_mode(),
             )
 
     def _build_ui(self):
@@ -1467,11 +1507,24 @@ class ClaudeWidget(QWidget):
             # Persist history and update graph/stats
             self._history.add(data)
             self._graph.set_points(self._history.points)
+
+            # Build extra usage credits string
+            extra_credits = ""
+            if data.extra_usage_enabled:
+                if data.extra_usage_used_credits is not None:
+                    if data.extra_usage_monthly_limit is not None:
+                        extra_credits = f"${data.extra_usage_used_credits:.0f}/${data.extra_usage_monthly_limit:.0f}"
+                    else:
+                        extra_credits = f"${data.extra_usage_used_credits:.2f}"
+
+            fast_mode = read_fast_mode()
             self._stats_row.set_data(
                 self._history.avg_five_hour,
                 self._history.peak_five_hour,
                 self._history.trend,
                 data.extra_usage_enabled,
+                extra_credits=extra_credits,
+                fast=fast_mode,
             )
 
         # Read token stats from Claude Code's local cache
