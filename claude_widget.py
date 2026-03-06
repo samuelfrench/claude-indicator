@@ -605,6 +605,8 @@ class ClaudeUsageClient:
             )
             if resp.status_code == 401:
                 return UsageData(error="Session Expired")
+            if resp.status_code == 429:
+                return UsageData(error="Rate Limited")
             if resp.status_code != 200:
                 return UsageData(error=f"API Error ({resp.status_code})")
             data = resp.json()
@@ -1498,6 +1500,13 @@ class ClaudeWidget(QWidget):
         self._worker.start()
 
     def _on_usage_fetched(self, data: UsageData):
+        # On rate limit, keep previous data and just update status
+        if data.error == "Rate Limited" and self._usage and not self._usage.error:
+            remaining = max(0, int(self._next_fetch_at - time.time()))
+            self._status_label.setText(f"Rate limited, retrying in {remaining}s")
+            self._status_label.setStyleSheet("color: #f59e0b; font-size: 10px;")
+            return
+
         self._usage = data
 
         if not data.error:
