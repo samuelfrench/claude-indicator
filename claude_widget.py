@@ -14,14 +14,25 @@ from pathlib import Path
 import requests
 from PySide6.QtCore import QPoint, QRectF, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QFont,
+    QIcon,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
 )
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
 
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
@@ -1308,6 +1319,7 @@ class ClaudeWidget(QWidget):
         self._sys_reader = SystemMetricsReader()
 
         self._build_ui()
+        self._setup_tray_icon()
         self._setup_timers()
         self._fetch_usage()
         self._fetch_deploys()
@@ -1648,6 +1660,49 @@ class ClaudeWidget(QWidget):
 
         p.end()
 
+    def _setup_tray_icon(self):
+        # Create a simple purple circle icon programmatically
+        px = QPixmap(64, 64)
+        px.fill(QColor(0, 0, 0, 0))
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor("#8b5cf6"))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(4, 4, 56, 56)
+        p.setPen(QPen(QColor(255, 255, 255), 3))
+        p.setFont(QFont("sans-serif", 28, QFont.Weight.Bold))
+        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "C")
+        p.end()
+
+        icon = QIcon(px)
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Claude Usage Widget")
+        self._tray.activated.connect(self._on_tray_activated)
+
+        menu = QMenu()
+        show_action = QAction("Show", self)
+        show_action.triggered.connect(self._show_from_tray)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(QApplication.quit)
+        menu.addAction(quit_action)
+        self._tray.setContextMenu(menu)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._show_from_tray()
+
+    def _show_from_tray(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -1662,6 +1717,7 @@ class ClaudeWidget(QWidget):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Claude Usage Widget")
+    app.setQuitOnLastWindowClosed(False)
 
     widget = ClaudeWidget()
     widget.show()
