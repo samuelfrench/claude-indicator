@@ -48,6 +48,7 @@ STATS_CACHE_PATH = Path.home() / ".claude" / "stats-cache.json"
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
 SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
+RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +152,16 @@ class DeployInfo:
             return f"{secs // 86400}d ago"
         except (ValueError, TypeError):
             return "unknown"
+
+
+@dataclass
+class RunnerInfo:
+    name: str           # runner agent name
+    target: str         # repo slug (owner/repo) or org name
+    status: str         # "online", "offline", "active"
+    labels: list[str] = field(default_factory=list)
+    runner_dir: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -544,6 +555,103 @@ def fetch_deploy_info(project: dict) -> DeployInfo:
 
 
 # ---------------------------------------------------------------------------
+# Runner detection helpers
+# ---------------------------------------------------------------------------
+
+def scan_runner_dirs() -> list[dict]:
+    """Find local GitHub Actions runner installations by scanning for .runner config files."""
+    runners = []
+    home = Path.home()
+
+    for runner_file in sorted(home.glob("actions-runner*/.runner")):
+        try:
+            with open(runner_file, encoding="utf-8-sig") as f:
+                config = json.load(f)
+            runners.append({
+                "name": config.get("agentName", "unknown"),
+                "github_url": config.get("gitHubUrl", ""),
+                "runner_dir": str(runner_file.parent),
+            })
+        except (OSError, json.JSONDecodeError, KeyError):
+            continue
+
+    return runners
+
+
+def fetch_runners_status() -> list[RunnerInfo]:
+    """Scan local runner dirs and query GitHub API for their status."""
+    local_runners = scan_runner_dirs()
+    if not local_runners:
+        return []
+
+    # Group by GitHub URL to minimize API calls
+    by_url: dict[str, list[dict]] = {}
+    for r in local_runners:
+        by_url.setdefault(r["github_url"], []).append(r)
+
+    results: list[RunnerInfo] = []
+
+    for github_url, group in by_url.items():
+        parts = github_url.rstrip("/").split("github.com/")
+        if len(parts) != 2:
+            for r in group:
+                results.append(RunnerInfo(r["name"], "", "unknown", error="bad URL"))
+            continue
+
+        slug = parts[1]
+        slug_parts = slug.split("/")
+
+        try:
+            if len(slug_parts) == 2:
+                endpoint = f"repos/{slug}/actions/runners"
+            elif len(slug_parts) == 1:
+                endpoint = f"orgs/{slug}/actions/runners"
+            else:
+                for r in group:
+                    results.append(RunnerInfo(r["name"], slug, "unknown", error="invalid slug"))
+                continue
+
+            result = subprocess.run(
+                ["gh", "api", endpoint, "--jq", ".runners"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip()[:30] or "gh error"
+                for r in group:
+                    results.append(RunnerInfo(r["name"], slug, "unknown", error=err))
+                continue
+
+            api_runners = json.loads(result.stdout)
+            status_map: dict[str, tuple[str, list[str]]] = {}
+            for ar in api_runners:
+                name = ar.get("name", "")
+                status = ar.get("status", "offline")
+                busy = ar.get("busy", False)
+                labels = [lb.get("name", "") for lb in ar.get("labels", [])
+                          if lb.get("name", "") not in ("self-hosted", "Linux", "X64")]
+                if busy:
+                    status = "active"
+                status_map[name] = (status, labels)
+
+            for r in group:
+                name = r["name"]
+                if name in status_map:
+                    st, labels = status_map[name]
+                    results.append(RunnerInfo(name, slug, st, labels, r["runner_dir"]))
+                else:
+                    results.append(RunnerInfo(name, slug, "offline", runner_dir=r["runner_dir"]))
+
+        except FileNotFoundError:
+            for r in group:
+                results.append(RunnerInfo(r["name"], slug, "unknown", error="gh not found"))
+        except (subprocess.SubprocessError, json.JSONDecodeError):
+            for r in group:
+                results.append(RunnerInfo(r["name"], slug, "unknown", error="query failed"))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
 
@@ -659,6 +767,14 @@ class DeployFetchWorker(QThread):
         projects = scan_claude_projects()
         deploys = [fetch_deploy_info(p) for p in projects]
         self.finished.emit(deploys)
+
+
+class RunnerFetchWorker(QThread):
+    finished = Signal(list)
+
+    def run(self):
+        runners = fetch_runners_status()
+        self.finished.emit(runners)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,7 +1168,7 @@ class TokenRow(QWidget):
 
 
 class DeployRow(QWidget):
-    """Variable-height row showing deploy status per active Claude project."""
+    """Collapsible row showing deploy status per active Claude project."""
 
     _HEADER_H = 18
     _ROW_H = 16
@@ -1061,19 +1177,59 @@ class DeployRow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._deploys: list[DeployInfo] = []
+        self._expanded = False
         self.setFixedHeight(0)
         self.hide()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_data(self, deploys: list[DeployInfo]):
         self._deploys = deploys
         if deploys:
-            h = self._HEADER_H + self._ROW_H * len(deploys) + self._PAD
-            self.setFixedHeight(h)
+            self._update_height()
             self.show()
         else:
             self.setFixedHeight(0)
             self.hide()
         self.update()
+
+    def _update_height(self):
+        if not self._deploys:
+            self.setFixedHeight(0)
+            return
+        if self._expanded:
+            h = self._HEADER_H + self._ROW_H * len(self._deploys) + self._PAD
+        else:
+            h = self._HEADER_H
+        self.setFixedHeight(h)
+
+    def _deploy_time_color(self, d: DeployInfo) -> QColor:
+        if d.error:
+            return QColor(239, 68, 68)
+        if not d.last_deploy_at:
+            return QColor(160, 160, 180)
+        try:
+            dt = datetime.fromisoformat(d.last_deploy_at.replace("Z", "+00:00"))
+            age_s = (datetime.now(timezone.utc) - dt).total_seconds()
+            if age_s < 3600:
+                return QColor(34, 197, 94)
+            if age_s < 86400:
+                return QColor(234, 179, 8)
+            return QColor(249, 115, 22)
+        except (ValueError, TypeError):
+            return QColor(160, 160, 180)
+
+    def mousePressEvent(self, event):
+        if not self._deploys:
+            return
+        self._expanded = not self._expanded
+        self._update_height()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        event.accept()
 
     def paintEvent(self, event):
         if not self._deploys:
@@ -1082,55 +1238,53 @@ class DeployRow(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w = self.width()
 
-        # Header
         hdr_font = QFont("sans-serif", 8)
         hdr_font.setWeight(QFont.Weight.Medium)
         p.setFont(hdr_font)
-        p.setPen(QColor(100, 100, 120))
-        p.drawText(4, 13, "DEPLOYS")
-
-        # Per-project rows
-        row_font = QFont("sans-serif", 8)
-        p.setFont(row_font)
         fm = p.fontMetrics()
 
+        arrow = "▾" if self._expanded else "▸"
+        p.setPen(QColor(100, 100, 120))
+        header_text = f"DEPLOYS {arrow}"
+        p.drawText(4, 13, header_text)
+
+        if not self._expanded:
+            # Inline summary: project time · project time
+            x = 4 + fm.horizontalAdvance(header_text) + 8
+            for i, d in enumerate(self._deploys):
+                if x > w - 20:
+                    break
+                if i > 0:
+                    p.setPen(QColor(80, 80, 100))
+                    p.drawText(x, 13, "·")
+                    x += fm.horizontalAdvance("· ")
+                p.setPen(QColor(160, 160, 180))
+                p.drawText(x, 13, d.project_name)
+                x += fm.horizontalAdvance(d.project_name) + 4
+                rel = d.relative_time()
+                p.setPen(self._deploy_time_color(d))
+                p.drawText(x, 13, rel)
+                x += fm.horizontalAdvance(rel) + 8
+            p.end()
+            return
+
+        # Expanded: per-project rows
         for i, d in enumerate(self._deploys):
             y = self._HEADER_H + self._ROW_H * i + 12
 
-            # Project name
             p.setPen(QColor(180, 180, 200))
             name_text = d.project_name
             name_w = fm.horizontalAdvance(name_text)
             p.drawText(8, y, name_text)
 
-            # Separator dot
             p.setPen(QColor(80, 80, 100))
             p.drawText(8 + name_w + 4, y, "·")
             time_x = 8 + name_w + 4 + fm.horizontalAdvance("· ")
 
-            # Relative time with color coding
             rel = d.relative_time()
-            if d.error:
-                time_color = QColor(239, 68, 68)  # red for errors
-            elif not d.last_deploy_at:
-                time_color = QColor(160, 160, 180)  # dim for no runs
-            else:
-                try:
-                    dt = datetime.fromisoformat(d.last_deploy_at.replace("Z", "+00:00"))
-                    age_s = (datetime.now(timezone.utc) - dt).total_seconds()
-                    if age_s < 3600:
-                        time_color = QColor(34, 197, 94)  # green <1h
-                    elif age_s < 86400:
-                        time_color = QColor(234, 179, 8)  # amber <24h
-                    else:
-                        time_color = QColor(249, 115, 22)  # orange >24h
-                except (ValueError, TypeError):
-                    time_color = QColor(160, 160, 180)
-
-            p.setPen(time_color)
+            p.setPen(self._deploy_time_color(d))
             p.drawText(time_x, y, rel)
 
-            # Workflow name (right-aligned, dim)
             if d.workflow_name:
                 wf_text = d.workflow_name
                 max_wf_w = 80
@@ -1143,6 +1297,136 @@ class DeployRow(QWidget):
                     wf_w = fm.horizontalAdvance(wf_text)
                 p.setPen(QColor(80, 80, 100))
                 p.drawText(w - wf_w - 4, y, wf_text)
+
+        p.end()
+
+
+class RunnersRow(QWidget):
+    """Collapsible row showing local GitHub Actions runner status."""
+
+    _HEADER_H = 22
+    _ROW_H = 16
+    _PAD = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._runners: list[RunnerInfo] = []
+        self._expanded = False
+        self.setFixedHeight(0)
+        self.hide()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, runners: list[RunnerInfo]):
+        self._runners = runners
+        if runners:
+            self._update_height()
+            self.show()
+        else:
+            self.setFixedHeight(0)
+            self.hide()
+        self.update()
+
+    def _update_height(self):
+        if not self._runners:
+            self.setFixedHeight(0)
+            return
+        if self._expanded:
+            h = self._HEADER_H + self._ROW_H * len(self._runners) + self._PAD
+        else:
+            h = self._HEADER_H
+        self.setFixedHeight(h)
+
+    @staticmethod
+    def _status_color(status: str) -> QColor:
+        if status == "active":
+            return QColor(59, 130, 246)    # blue - busy/working
+        if status == "online":
+            return QColor(34, 197, 94)     # green
+        if status == "offline":
+            return QColor(239, 68, 68)     # red
+        return QColor(160, 160, 180)       # dim gray - unknown
+
+    def mousePressEvent(self, event):
+        if not self._runners:
+            return
+        self._expanded = not self._expanded
+        self._update_height()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        event.accept()
+
+    def paintEvent(self, event):
+        if not self._runners:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        y = 14
+        arrow = "▾" if self._expanded else "▸"
+        p.setPen(QColor(100, 100, 120))
+        header_text = f"RUNNERS {arrow}"
+        p.drawText(4, y, header_text)
+
+        if not self._expanded:
+            # Inline summary: N online · N active · N offline
+            online = sum(1 for r in self._runners if r.status == "online")
+            active = sum(1 for r in self._runners if r.status == "active")
+            offline = sum(1 for r in self._runners if r.status == "offline")
+            x = 4 + fm.horizontalAdvance(header_text) + 8
+
+            if online:
+                p.setPen(QColor(34, 197, 94))
+                txt = f"{online} online"
+                p.drawText(x, y, txt)
+                x += fm.horizontalAdvance(txt) + 6
+            if active:
+                p.setPen(QColor(59, 130, 246))
+                txt = f"{active} active"
+                p.drawText(x, y, txt)
+                x += fm.horizontalAdvance(txt) + 6
+            if offline:
+                p.setPen(QColor(239, 68, 68))
+                txt = f"{offline} offline"
+                p.drawText(x, y, txt)
+
+            p.end()
+            return
+
+        # Expanded: per-runner rows
+        for i, r in enumerate(self._runners):
+            row_y = self._HEADER_H + self._ROW_H * i + 12
+
+            # Runner name
+            p.setPen(QColor(180, 180, 200))
+            p.drawText(8, row_y, r.name)
+            name_w = fm.horizontalAdvance(r.name)
+
+            # Dot separator
+            p.setPen(QColor(80, 80, 100))
+            p.drawText(8 + name_w + 4, row_y, "·")
+            sx = 8 + name_w + 4 + fm.horizontalAdvance("· ")
+
+            # Status
+            status_text = r.error if r.error else r.status
+            p.setPen(self._status_color(r.status))
+            p.drawText(sx, row_y, status_text)
+
+            # Labels (right-aligned, dim)
+            if r.labels:
+                label_text = ", ".join(r.labels[:3])
+                lw = fm.horizontalAdvance(label_text)
+                p.setPen(QColor(80, 80, 100))
+                p.drawText(w - lw - 4, row_y, label_text)
 
         p.end()
 
@@ -1314,6 +1598,7 @@ class ClaudeWidget(QWidget):
         self._client = ClaudeUsageClient()
         self._worker: FetchWorker | None = None
         self._deploy_worker: DeployFetchWorker | None = None
+        self._runner_worker: RunnerFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
         self._sys_reader = SystemMetricsReader()
@@ -1323,6 +1608,7 @@ class ClaudeWidget(QWidget):
         self._setup_timers()
         self._fetch_usage()
         self._fetch_deploys()
+        self._fetch_runners()
 
         # Initial system metrics read so widget isn't blank
         self._update_system_metrics()
@@ -1406,14 +1692,18 @@ class ClaudeWidget(QWidget):
         layout.addWidget(sep_g)
         layout.addSpacing(2)
 
-        # Graph header with window tabs
+        # Graph header with window tabs (collapsible)
+        self._history_expanded = True
         graph_header = QHBoxLayout()
-        graph_title = QLabel("Usage History")
-        graph_title.setStyleSheet("color: #666680; font-size: 9px;")
-        graph_header.addWidget(graph_title)
+        self._graph_title = QLabel("Usage History ▾")
+        self._graph_title.setStyleSheet("color: #666680; font-size: 9px;")
+        self._graph_title.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._graph_title.mousePressEvent = lambda _: self._toggle_history()
+        graph_header.addWidget(self._graph_title)
         graph_header.addStretch()
 
         self._window_labels: list[QLabel] = []
+        self._window_spacers: list[QLabel] = []
         for i, (wlabel, _, _) in enumerate(UsageGraph.WINDOWS):
             tab = QLabel(wlabel)
             tab.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1424,6 +1714,7 @@ class ClaudeWidget(QWidget):
                 spacer = QLabel("·")
                 spacer.setStyleSheet("color: #444460; font-size: 9px; padding: 0 1px;")
                 graph_header.addWidget(spacer)
+                self._window_spacers.append(spacer)
 
         layout.addLayout(graph_header)
 
@@ -1435,10 +1726,10 @@ class ClaudeWidget(QWidget):
         layout.addSpacing(2)
 
         # Stats separator
-        sep_s = QWidget()
-        sep_s.setFixedHeight(1)
-        sep_s.setStyleSheet("background-color: rgba(100, 100, 120, 80);")
-        layout.addWidget(sep_s)
+        self._stats_sep = QWidget()
+        self._stats_sep.setFixedHeight(1)
+        self._stats_sep.setStyleSheet("background-color: rgba(100, 100, 120, 80);")
+        layout.addWidget(self._stats_sep)
         layout.addSpacing(2)
 
         # Stats row
@@ -1452,6 +1743,10 @@ class ClaudeWidget(QWidget):
         # Deploy status row
         self._deploy_row = DeployRow()
         layout.addWidget(self._deploy_row)
+
+        # Runners status row
+        self._runners_row = RunnersRow()
+        layout.addWidget(self._runners_row)
 
         # System metrics row
         self._sys_row = SystemMetricsRow()
@@ -1497,6 +1792,11 @@ class ClaudeWidget(QWidget):
         self._deploy_timer = QTimer(self)
         self._deploy_timer.timeout.connect(self._fetch_deploys)
         self._deploy_timer.start(DEPLOY_REFRESH_MS)
+
+        # Runner timer - every 60 seconds
+        self._runner_timer = QTimer(self)
+        self._runner_timer.timeout.connect(self._fetch_runners)
+        self._runner_timer.start(RUNNER_REFRESH_MS)
 
         # System metrics timer - every 3 seconds
         self._sys_timer = QTimer(self)
@@ -1625,6 +1925,29 @@ class ClaudeWidget(QWidget):
                     "color: #555570; font-size: 9px; padding: 0 2px;"
                 )
 
+    def _toggle_history(self):
+        self._history_expanded = not self._history_expanded
+        visible = self._history_expanded
+        for w in self._window_labels + self._window_spacers:
+            w.setVisible(visible)
+        self._graph.setVisible(visible)
+        self._stats_sep.setVisible(visible)
+        self._stats_row.setVisible(visible)
+        self._token_row.setVisible(visible)
+
+        arrow = "▾" if visible else "▸"
+        if visible:
+            self._graph_title.setText(f"Usage History {arrow}")
+        else:
+            avg = self._history.avg_five_hour
+            peak = self._history.peak_five_hour
+            trend = self._history.trend
+            self._graph_title.setText(
+                f"Usage History {arrow}  AVG {avg:.0f}%  PK {peak:.0f}%  {trend}"
+            )
+        self._update_window_tabs()
+        self.adjustSize()
+
     def _update_countdowns(self):
         """Update countdown strings every second without re-fetching."""
         if self._usage and not self._usage.error:
@@ -1639,6 +1962,17 @@ class ClaudeWidget(QWidget):
 
     def _on_deploys_fetched(self, deploys: list):
         self._deploy_row.set_data(deploys)
+        self.adjustSize()
+
+    def _fetch_runners(self):
+        if self._runner_worker and self._runner_worker.isRunning():
+            return
+        self._runner_worker = RunnerFetchWorker()
+        self._runner_worker.finished.connect(self._on_runners_fetched)
+        self._runner_worker.start()
+
+    def _on_runners_fetched(self, runners: list):
+        self._runners_row.set_data(runners)
         self.adjustSize()
 
     def _update_system_metrics(self):
