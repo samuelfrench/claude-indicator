@@ -44,11 +44,15 @@ REFRESH_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes
 DEPLOY_REFRESH_MS = 5 * 60 * 1000  # 5 minutes
 COUNTDOWN_INTERVAL_MS = 1000  # 1 second
 HISTORY_PATH = Path.home() / ".claude" / "usage_history.json"
+LAST_USAGE_PATH = Path.home() / ".claude" / "last_usage.json"
 STATS_CACHE_PATH = Path.home() / ".claude" / "stats-cache.json"
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
 SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
 RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
+# Rate-limit backoff: /api/oauth/usage rate-limits aggressively (GH anthropics/claude-code#31637)
+RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
+RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +104,7 @@ class UsageData:
     extra_usage_monthly_limit: float | None = None
     error: str = ""
     fetched_at: float = 0.0
+    retry_after_s: float = 0.0  # From 429 Retry-After header
 
     @property
     def plan_name(self) -> str:
@@ -410,6 +415,58 @@ def _parse_entry(data: dict | None) -> UsageEntry | None:
         utilization=float(data.get("utilization", 0)),
         resets_at=data.get("resets_at", ""),
     )
+
+
+def _entry_to_dict(e: UsageEntry | None) -> dict | None:
+    if e is None:
+        return None
+    return {"utilization": e.utilization, "resets_at": e.resets_at}
+
+
+def save_last_usage(data: UsageData) -> None:
+    """Persist successful usage to disk so it survives widget restarts."""
+    payload = {
+        "five_hour": _entry_to_dict(data.five_hour),
+        "seven_day": _entry_to_dict(data.seven_day),
+        "seven_day_sonnet": _entry_to_dict(data.seven_day_sonnet),
+        "seven_day_opus": _entry_to_dict(data.seven_day_opus),
+        "extra_usage_enabled": data.extra_usage_enabled,
+        "extra_usage_utilization": data.extra_usage_utilization,
+        "extra_usage_used_credits": data.extra_usage_used_credits,
+        "extra_usage_monthly_limit": data.extra_usage_monthly_limit,
+        "fetched_at": data.fetched_at,
+    }
+    tmp_path = LAST_USAGE_PATH.with_suffix(".tmp")
+    try:
+        LAST_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, LAST_USAGE_PATH)
+    except OSError:
+        pass
+
+
+def load_last_usage() -> UsageData | None:
+    """Load persisted usage from disk, if any."""
+    try:
+        with open(LAST_USAGE_PATH) as f:
+            raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    try:
+        return UsageData(
+            five_hour=_parse_entry(raw.get("five_hour")) or UsageEntry(),
+            seven_day=_parse_entry(raw.get("seven_day")) or UsageEntry(),
+            seven_day_sonnet=_parse_entry(raw.get("seven_day_sonnet")),
+            seven_day_opus=_parse_entry(raw.get("seven_day_opus")),
+            extra_usage_enabled=bool(raw.get("extra_usage_enabled", False)),
+            extra_usage_utilization=raw.get("extra_usage_utilization"),
+            extra_usage_used_credits=raw.get("extra_usage_used_credits"),
+            extra_usage_monthly_limit=raw.get("extra_usage_monthly_limit"),
+            fetched_at=float(raw.get("fetched_at", 0.0)),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +782,12 @@ class ClaudeUsageClient:
             if resp.status_code == 401:
                 return UsageData(error="Session Expired")
             if resp.status_code == 429:
-                return UsageData(error="Rate Limited")
+                retry_after = resp.headers.get("retry-after", "")
+                try:
+                    retry_after_s = float(retry_after) if retry_after else 0.0
+                except ValueError:
+                    retry_after_s = 0.0
+                return UsageData(error="Rate Limited", retry_after_s=retry_after_s)
             if resp.status_code != 200:
                 return UsageData(error=f"API Error ({resp.status_code})")
             data = resp.json()
@@ -1594,13 +1656,15 @@ class ClaudeWidget(QWidget):
         self.setFixedWidth(340)
 
         self._drag_pos = QPoint()
-        self._usage: UsageData | None = None
+        self._usage: UsageData | None = load_last_usage()
         self._client = ClaudeUsageClient()
         self._worker: FetchWorker | None = None
         self._deploy_worker: DeployFetchWorker | None = None
         self._runner_worker: RunnerFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
+        self._rate_limit_until: float = 0.0
+        self._consecutive_429s: int = 0
         self._sys_reader = SystemMetricsReader()
 
         self._build_ui()
@@ -1624,6 +1688,13 @@ class ClaudeWidget(QWidget):
         # Initialize graph with persisted history
         if self._history.points:
             self._graph.set_points(self._history.points)
+
+        # Seed display from persisted last-good usage so values survive restarts
+        if self._usage and not self._usage.error:
+            self._title_label.setText(self._usage.plan_name)
+            self._seed_stats_row_from_usage(self._usage)
+            self._update_display()
+        elif self._history.points:
             self._stats_row.set_data(
                 self._history.avg_five_hour,
                 self._history.peak_five_hour,
@@ -1778,7 +1849,8 @@ class ClaudeWidget(QWidget):
         layout.addLayout(status_layout)
 
     def _setup_timers(self):
-        # Fetch timer - every 60 seconds
+        # Fetch timer — polls on the normal cadence; _fetch_usage no-ops while
+        # a backoff window is active, and a one-shot QTimer fires when it ends.
         self._fetch_timer = QTimer(self)
         self._fetch_timer.timeout.connect(self._fetch_usage)
         self._fetch_timer.start(REFRESH_INTERVAL_MS)
@@ -1806,47 +1878,64 @@ class ClaudeWidget(QWidget):
     def _fetch_usage(self):
         if self._worker and self._worker.isRunning():
             return
+        if time.time() < self._rate_limit_until:
+            # Still rate-limited; next one-shot QTimer fires when window expires
+            return
         self._next_fetch_at = time.time() + REFRESH_INTERVAL_MS / 1000
         self._worker = FetchWorker(self._client)
         self._worker.finished.connect(self._on_usage_fetched)
         self._worker.start()
 
+    def _seed_stats_row_from_usage(self, data: UsageData):
+        """Push extra_usage state from data into the stats row."""
+        extra_credits = ""
+        if data.extra_usage_enabled and data.extra_usage_used_credits is not None:
+            used = data.extra_usage_used_credits
+            if data.extra_usage_monthly_limit is not None:
+                extra_credits = f"${used:.2f}/${data.extra_usage_monthly_limit:.0f}"
+            else:
+                extra_credits = f"${used:.2f}"
+        self._stats_row.set_data(
+            self._history.avg_five_hour,
+            self._history.peak_five_hour,
+            self._history.trend,
+            data.extra_usage_enabled,
+            extra_credits=extra_credits,
+            fast=read_fast_mode(),
+        )
+
     def _on_usage_fetched(self, data: UsageData):
-        # On rate limit, keep previous data and just update status
-        if data.error == "Rate Limited" and self._usage and not self._usage.error:
-            remaining = max(0, int(self._next_fetch_at - time.time()))
-            self._status_label.setText(f"Rate limited, retrying in {remaining}s")
-            self._status_label.setStyleSheet("color: #f59e0b; font-size: 10px;")
+        # Rate-limited: set backoff and reschedule, keep previous data on screen
+        if data.error == "Rate Limited":
+            self._consecutive_429s += 1
+            exp_delay = min(
+                RATE_LIMIT_MIN_BACKOFF_S * (2 ** (self._consecutive_429s - 1)),
+                RATE_LIMIT_MAX_BACKOFF_S,
+            )
+            delay = max(data.retry_after_s, exp_delay)
+            self._rate_limit_until = time.time() + delay
+            self._next_fetch_at = self._rate_limit_until
+            QTimer.singleShot(int(delay * 1000) + 1000, self._fetch_usage)
+            if self._usage and not self._usage.error:
+                # Preserve last-good _usage; just annotate status
+                return
+            # First fetch ever returned 429; store the error so display shows it
+            self._usage = data
+            self._update_display()
             return
+
+        # Any non-429 response resets the backoff
+        self._consecutive_429s = 0
+        self._rate_limit_until = 0.0
 
         self._usage = data
 
         if not data.error:
-            # Update title with detected plan name
             self._title_label.setText(data.plan_name)
-
-            # Persist history and update graph/stats
             self._history.add(data)
             self._graph.set_points(self._history.points)
-
-            # Build extra usage credits string
-            extra_credits = ""
-            if data.extra_usage_enabled:
-                if data.extra_usage_used_credits is not None:
-                    if data.extra_usage_monthly_limit is not None:
-                        extra_credits = f"${data.extra_usage_used_credits:.0f}/${data.extra_usage_monthly_limit:.0f}"
-                    else:
-                        extra_credits = f"${data.extra_usage_used_credits:.2f}"
-
-            fast_mode = read_fast_mode()
-            self._stats_row.set_data(
-                self._history.avg_five_hour,
-                self._history.peak_five_hour,
-                self._history.trend,
-                data.extra_usage_enabled,
-                extra_credits=extra_credits,
-                fast=fast_mode,
-            )
+            self._seed_stats_row_from_usage(data)
+            save_last_usage(data)
 
         # Read token stats from Claude Code's local cache
         tstats = read_token_stats()
@@ -1863,12 +1952,27 @@ class ClaudeWidget(QWidget):
         if data is None:
             return
 
+        # Show error when we have no cached data to fall back on
         if data.error:
-            self._status_label.setText(data.error)
-            self._status_label.setStyleSheet("color: #ef4444; font-size: 10px;")
+            now = time.time()
+            if data.error == "Rate Limited" and now < self._rate_limit_until:
+                delay = int(self._rate_limit_until - now)
+                if delay >= 60:
+                    delay_str = f"{delay // 60}m {delay % 60:02d}s"
+                else:
+                    delay_str = f"{delay}s"
+                self._status_label.setText(f"Rate limited · retry in {delay_str}")
+                self._status_label.setStyleSheet("color: #f59e0b; font-size: 10px;")
+            else:
+                self._status_label.setText(data.error)
+                self._status_label.setStyleSheet("color: #ef4444; font-size: 10px;")
             return
 
-        self._status_label.setStyleSheet("color: #666680; font-size: 10px;")
+        # Cached-good path: if we're in a rate-limit window, indicate stale data
+        if time.time() < self._rate_limit_until:
+            self._status_label.setStyleSheet("color: #f59e0b; font-size: 10px;")
+        else:
+            self._status_label.setStyleSheet("color: #666680; font-size: 10px;")
 
         self._five_hour_bar.set_data(
             data.five_hour.utilization,
@@ -1905,9 +2009,36 @@ class ClaudeWidget(QWidget):
         else:
             self._model_bar.hide()
 
-        # Updated time + next update countdown
-        remaining = max(0, int(self._next_fetch_at - time.time()))
-        self._status_label.setText(f"Updated: just now  ·  Next: {remaining}s")
+        # Status line: if rate-limited, show "Stale · next in Xm Ys" countdown,
+        # otherwise show true data age and next-update countdown.
+        now = time.time()
+        if now < self._rate_limit_until:
+            delay = int(self._rate_limit_until - now)
+            if delay >= 60:
+                delay_str = f"{delay // 60}m {delay % 60:02d}s"
+            else:
+                delay_str = f"{delay}s"
+            age = self._format_age(now - data.fetched_at) if data.fetched_at else "?"
+            self._status_label.setText(
+                f"Rate limited · {age} old · retry in {delay_str}"
+            )
+        else:
+            remaining = max(0, int(self._next_fetch_at - now))
+            age = self._format_age(now - data.fetched_at) if data.fetched_at else "just now"
+            self._status_label.setText(f"Updated: {age}  ·  Next: {remaining}s")
+
+    @staticmethod
+    def _format_age(seconds: float) -> str:
+        seconds = int(max(0, seconds))
+        if seconds < 10:
+            return "just now"
+        if seconds < 60:
+            return f"{seconds}s ago"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m ago"
+        hours = minutes // 60
+        return f"{hours}h {minutes % 60}m ago"
 
     def _set_graph_window(self, idx: int):
         self._graph.set_window(idx)
@@ -1950,7 +2081,7 @@ class ClaudeWidget(QWidget):
 
     def _update_countdowns(self):
         """Update countdown strings every second without re-fetching."""
-        if self._usage and not self._usage.error:
+        if self._usage:
             self._update_display()
 
     def _fetch_deploys(self):
