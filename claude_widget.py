@@ -45,6 +45,8 @@ DEPLOY_REFRESH_MS = 5 * 60 * 1000  # 5 minutes
 COUNTDOWN_INTERVAL_MS = 1000  # 1 second
 HISTORY_PATH = Path.home() / ".claude" / "usage_history.json"
 LAST_USAGE_PATH = Path.home() / ".claude" / "last_usage.json"
+RATE_LIMIT_STATE_PATH = Path.home() / ".claude" / "widget_rate_limit.json"
+LOG_PATH = Path.home() / ".claude" / "widget.log"
 STATS_CACHE_PATH = Path.home() / ".claude" / "stats-cache.json"
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
@@ -467,6 +469,43 @@ def load_last_usage() -> UsageData | None:
         )
     except (TypeError, ValueError):
         return None
+
+
+def save_rate_limit_until(until_ts: float, consecutive_429s: int) -> None:
+    """Persist rate-limit state so restarts don't re-hit a live window."""
+    tmp = RATE_LIMIT_STATE_PATH.with_suffix(".tmp")
+    try:
+        RATE_LIMIT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump({"until": until_ts, "consecutive_429s": consecutive_429s}, f)
+        os.replace(tmp, RATE_LIMIT_STATE_PATH)
+    except OSError:
+        pass
+
+
+def load_rate_limit_until() -> tuple[float, int]:
+    """Return (until_ts, consecutive_429s) from disk; (0, 0) if absent/stale."""
+    try:
+        with open(RATE_LIMIT_STATE_PATH) as f:
+            raw = json.load(f)
+        until = float(raw.get("until", 0.0))
+        count = int(raw.get("consecutive_429s", 0))
+        # If the window has already elapsed, treat as cleared.
+        if until <= time.time():
+            return 0.0, 0
+        return until, count
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return 0.0, 0
+
+
+def log_line(msg: str) -> None:
+    """Append a timestamped line to ~/.claude/widget.log."""
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1663,8 +1702,20 @@ class ClaudeWidget(QWidget):
         self._runner_worker: RunnerFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
-        self._rate_limit_until: float = 0.0
-        self._consecutive_429s: int = 0
+        saved_until, saved_count = load_rate_limit_until()
+        self._rate_limit_until: float = saved_until
+        self._consecutive_429s: int = saved_count
+        if saved_until > time.time():
+            remaining = int(saved_until - time.time())
+            log_line(
+                f"startup: resuming rate-limit cooldown from disk, "
+                f"{remaining}s remaining (#{saved_count} consecutive 429s)"
+            )
+            # Schedule the one-shot retry for when the persisted window ends
+            QTimer.singleShot(
+                int((saved_until - time.time()) * 1000) + 1000,
+                self._fetch_usage,
+            )
         self._sys_reader = SystemMetricsReader()
 
         self._build_ui()
@@ -1898,7 +1949,10 @@ class ClaudeWidget(QWidget):
             return
         if not force and time.time() < self._rate_limit_until:
             # Still rate-limited; next one-shot QTimer fires when window expires
+            remaining = int(self._rate_limit_until - time.time())
+            log_line(f"skip fetch: rate-limit cooldown, {remaining}s remaining")
             return
+        log_line(f"fetch start (force={force})")
         self._next_fetch_at = time.time() + REFRESH_INTERVAL_MS / 1000
         self._worker = FetchWorker(self._client)
         self._worker.finished.connect(self._on_usage_fetched)
@@ -1933,11 +1987,10 @@ class ClaudeWidget(QWidget):
             delay = max(data.retry_after_s, exp_delay)
             self._rate_limit_until = time.time() + delay
             self._next_fetch_at = self._rate_limit_until
-            print(
-                f"[{datetime.now().isoformat(timespec='seconds')}] 429 #"
-                f"{self._consecutive_429s} retry_after={data.retry_after_s:.0f}s "
-                f"exp={exp_delay}s -> next fetch in {int(delay)}s",
-                file=sys.stderr, flush=True,
+            save_rate_limit_until(self._rate_limit_until, self._consecutive_429s)
+            log_line(
+                f"429 #{self._consecutive_429s} retry_after={data.retry_after_s:.0f}s "
+                f"exp={exp_delay}s -> next fetch in {int(delay)}s"
             )
             QTimer.singleShot(int(delay * 1000) + 1000, self._fetch_usage)
             if self._usage and not self._usage.error:
@@ -1950,13 +2003,12 @@ class ClaudeWidget(QWidget):
 
         # Any non-429 response resets the backoff
         if self._consecutive_429s > 0 or self._rate_limit_until > 0:
-            print(
-                f"[{datetime.now().isoformat(timespec='seconds')}] "
-                f"rate-limit cleared after {self._consecutive_429s} consecutive 429s",
-                file=sys.stderr, flush=True,
+            log_line(
+                f"rate-limit cleared after {self._consecutive_429s} consecutive 429s"
             )
         self._consecutive_429s = 0
         self._rate_limit_until = 0.0
+        save_rate_limit_until(0.0, 0)
 
         self._usage = data
 
@@ -1966,6 +2018,12 @@ class ClaudeWidget(QWidget):
             self._graph.set_points(self._history.points)
             self._seed_stats_row_from_usage(data)
             save_last_usage(data)
+            log_line(
+                f"fetch ok: 5h={data.five_hour.utilization:.0f}% "
+                f"7d={data.seven_day.utilization:.0f}% plan={data.plan_name}"
+            )
+        elif data.error:
+            log_line(f"fetch error: {data.error}")
 
         # Read token stats from Claude Code's local cache
         tstats = read_token_stats()
