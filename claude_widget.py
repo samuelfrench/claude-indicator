@@ -1695,6 +1695,19 @@ class ClaudeWidget(QWidget):
             self._seed_stats_row_from_usage(self._usage)
             self._update_display()
         elif self._history.points:
+            # No last_usage.json but we have history. Synthesize a UsageData
+            # from the most recent point so the bars show *something* instead
+            # of "Rate Limited" with nothing behind it.
+            latest = self._history.points[-1]
+            model_entry = UsageEntry(utilization=latest.model_pct)
+            self._usage = UsageData(
+                five_hour=UsageEntry(utilization=latest.five_hour_pct),
+                seven_day=UsageEntry(utilization=latest.seven_day_pct),
+                seven_day_sonnet=model_entry if latest.model_name == "sonnet" else None,
+                seven_day_opus=model_entry if latest.model_name == "opus" else None,
+                fetched_at=latest.timestamp,
+            )
+            self._title_label.setText(self._usage.plan_name)
             self._stats_row.set_data(
                 self._history.avg_five_hour,
                 self._history.peak_five_hour,
@@ -1702,6 +1715,7 @@ class ClaudeWidget(QWidget):
                 False,
                 fast=read_fast_mode(),
             )
+            self._update_display()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
