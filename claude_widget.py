@@ -1843,7 +1843,11 @@ class ClaudeWidget(QWidget):
             "color: #666680; font-size: 16px; padding: 0 4px;"
         )
         refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.mousePressEvent = lambda _: self._fetch_usage()
+        # Click = force a fetch, bypassing the rate-limit cooldown. Useful when
+        # the user believes the server window has cleared. Long-running 429
+        # loops may keep extending the window, so use sparingly.
+        refresh_btn.mousePressEvent = lambda _: self._fetch_usage(force=True)
+        refresh_btn.setToolTip("Refresh now (bypasses rate-limit cooldown)")
         status_layout.addWidget(refresh_btn)
 
         layout.addLayout(status_layout)
@@ -1875,10 +1879,10 @@ class ClaudeWidget(QWidget):
         self._sys_timer.timeout.connect(self._update_system_metrics)
         self._sys_timer.start(SYSTEM_METRICS_INTERVAL_MS)
 
-    def _fetch_usage(self):
+    def _fetch_usage(self, force: bool = False):
         if self._worker and self._worker.isRunning():
             return
-        if time.time() < self._rate_limit_until:
+        if not force and time.time() < self._rate_limit_until:
             # Still rate-limited; next one-shot QTimer fires when window expires
             return
         self._next_fetch_at = time.time() + REFRESH_INTERVAL_MS / 1000
@@ -1915,6 +1919,12 @@ class ClaudeWidget(QWidget):
             delay = max(data.retry_after_s, exp_delay)
             self._rate_limit_until = time.time() + delay
             self._next_fetch_at = self._rate_limit_until
+            print(
+                f"[{datetime.now().isoformat(timespec='seconds')}] 429 #"
+                f"{self._consecutive_429s} retry_after={data.retry_after_s:.0f}s "
+                f"exp={exp_delay}s -> next fetch in {int(delay)}s",
+                file=sys.stderr, flush=True,
+            )
             QTimer.singleShot(int(delay * 1000) + 1000, self._fetch_usage)
             if self._usage and not self._usage.error:
                 # Preserve last-good _usage; just annotate status
@@ -1925,6 +1935,12 @@ class ClaudeWidget(QWidget):
             return
 
         # Any non-429 response resets the backoff
+        if self._consecutive_429s > 0 or self._rate_limit_until > 0:
+            print(
+                f"[{datetime.now().isoformat(timespec='seconds')}] "
+                f"rate-limit cleared after {self._consecutive_429s} consecutive 429s",
+                file=sys.stderr, flush=True,
+            )
         self._consecutive_429s = 0
         self._rate_limit_until = 0.0
 
