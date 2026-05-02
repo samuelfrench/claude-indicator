@@ -52,6 +52,7 @@ MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
 SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
 RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
+TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
 # Rate-limit backoff: /api/oauth/usage rate-limits aggressively (GH anthropics/claude-code#31637)
 RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
 RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
@@ -169,6 +170,31 @@ class RunnerInfo:
     labels: list[str] = field(default_factory=list)
     runner_dir: str = ""
     error: str = ""
+
+
+@dataclass
+class TaskLoopInfo:
+    name: str            # project name
+    model: str           # e.g. "claude-sonnet-4-6"
+    effort: str          # e.g. "xhigh"
+    cooldown_minutes: int
+    last_task_ts: float | None = None   # Unix timestamp of last completed task, or None
+    error: str = ""
+
+    def next_run_str(self) -> str:
+        if self.last_task_ts is None:
+            return "last run: unknown"
+        elapsed = time.time() - self.last_task_ts
+        remaining = self.cooldown_minutes * 60 - elapsed
+        if remaining <= 0:
+            return "next run: any time"
+        mins = int(remaining // 60)
+        secs = int(remaining % 60)
+        if mins >= 60:
+            return f"next run: ~{mins // 60}h {mins % 60}m"
+        if mins > 0:
+            return f"next run: ~{mins}m"
+        return f"next run: ~{secs}s"
 
 
 @dataclass
@@ -747,6 +773,73 @@ def fetch_runners_status() -> list[RunnerInfo]:
     return results
 
 
+PROJECTS_JSON_PATH = Path.home() / "claude-workspace" / "clawd-bot" / "config" / "projects.json"
+CLAWD_DYNAMO_TABLE = "clawd-bot-tasks"
+CLAWD_DYNAMO_REGION = "us-east-1"
+
+
+def fetch_task_loop_status() -> list[TaskLoopInfo]:
+    """Read projects.json and query DynamoDB for last-completed timestamps."""
+    # Read projects.json
+    try:
+        with open(PROJECTS_JSON_PATH) as f:
+            projects_cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+    enabled = {
+        name: cfg
+        for name, cfg in projects_cfg.items()
+        if cfg.get("autonomous", {}).get("enabled", False)
+    }
+    if not enabled:
+        return []
+
+    # Try to query DynamoDB for last completed task per project
+    last_ts: dict[str, float | None] = {name: None for name in enabled}
+    try:
+        import boto3  # noqa: PLC0415
+        from boto3.dynamodb.conditions import Key  # noqa: PLC0415
+        ddb = boto3.resource("dynamodb", region_name=CLAWD_DYNAMO_REGION)
+        table = ddb.Table(CLAWD_DYNAMO_TABLE)
+        for name in enabled:
+            # Scan with filter — cheap because the table is small
+            resp = table.scan(
+                FilterExpression=Key("project").eq(name),
+                ProjectionExpression="#st, created_at",
+                ExpressionAttributeNames={"#st": "status"},
+            )
+            items = resp.get("Items", [])
+            # Find the most recent completed item
+            completed = [
+                it for it in items
+                if it.get("status") in ("completed", "failed")
+            ]
+            if completed:
+                def _ts(it: dict) -> float:
+                    raw = it.get("created_at", "")
+                    try:
+                        return datetime.fromisoformat(raw).timestamp()
+                    except (ValueError, TypeError):
+                        return 0.0
+                last_ts[name] = max(_ts(it) for it in completed)
+    except Exception:  # noqa: BLE001
+        # No boto3, no creds, network error — degrade gracefully
+        pass
+
+    results: list[TaskLoopInfo] = []
+    for name, cfg in enabled.items():
+        auto = cfg["autonomous"]
+        results.append(TaskLoopInfo(
+            name=name,
+            model=auto.get("model", "unknown"),
+            effort=auto.get("effort", "—"),
+            cooldown_minutes=int(auto.get("cooldown_minutes", 0)),
+            last_task_ts=last_ts.get(name),
+        ))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
@@ -882,6 +975,14 @@ class RunnerFetchWorker(QThread):
     def run(self):
         runners = fetch_runners_status()
         self.finished.emit(runners)
+
+
+class TaskLoopFetchWorker(QThread):
+    finished = Signal(list)
+
+    def run(self):
+        loops = fetch_task_loop_status()
+        self.finished.emit(loops)
 
 
 # ---------------------------------------------------------------------------
@@ -1538,6 +1639,110 @@ class RunnersRow(QWidget):
         p.end()
 
 
+class TaskLoopWidget(QWidget):
+    """Collapsible row showing active autonomous task loop parameters for each clawd-bot project."""
+
+    _HEADER_H = 22
+    _ROW_H = 18
+    _PAD = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loops: list[TaskLoopInfo] = []
+        self._expanded = False
+        self.setFixedHeight(0)
+        self.hide()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, loops: list[TaskLoopInfo]):
+        self._loops = loops
+        if loops:
+            self._update_height()
+            self.show()
+        else:
+            self.setFixedHeight(0)
+            self.hide()
+        self.update()
+
+    def _update_height(self):
+        if not self._loops:
+            self.setFixedHeight(0)
+            return
+        if self._expanded:
+            h = self._HEADER_H + self._ROW_H * len(self._loops) + self._PAD
+        else:
+            h = self._HEADER_H
+        self.setFixedHeight(h)
+
+    def mousePressEvent(self, event):
+        if not self._loops:
+            return
+        self._expanded = not self._expanded
+        self._update_height()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        event.accept()
+
+    def paintEvent(self, event):
+        if not self._loops:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        y = 14
+        arrow = "▾" if self._expanded else "▸"
+        p.setPen(QColor(100, 100, 120))
+        header_text = f"CLAWD TASK LOOPS {arrow}"
+        p.drawText(4, y, header_text)
+
+        if not self._expanded:
+            # Inline summary: N active loops
+            x = 4 + fm.horizontalAdvance(header_text) + 8
+            p.setPen(QColor(180, 140, 80))
+            p.drawText(x, y, f"{len(self._loops)} active")
+            p.end()
+            return
+
+        # Expanded: per-project rows
+        for i, loop in enumerate(self._loops):
+            row_y = self._HEADER_H + self._ROW_H * i + 13
+
+            # Project name
+            p.setPen(QColor(180, 180, 200))
+            p.drawText(8, row_y, loop.name)
+            name_w = fm.horizontalAdvance(loop.name)
+
+            # Separator dot
+            p.setPen(QColor(80, 80, 100))
+            dot_x = 8 + name_w + 4
+            p.drawText(dot_x, row_y, "·")
+            sx = dot_x + fm.horizontalAdvance("· ")
+
+            # Model (abbreviated) + effort
+            model_short = loop.model.replace("claude-", "").replace("-", "-")
+            detail = f"{model_short} {loop.effort} {loop.cooldown_minutes}m"
+            p.setPen(QColor(120, 120, 150))
+            p.drawText(sx, row_y, detail)
+
+            # Next run (right-aligned)
+            next_str = loop.next_run_str()
+            nw = fm.horizontalAdvance(next_str)
+            p.setPen(QColor(100, 160, 100))
+            p.drawText(w - nw - 4, row_y, next_str)
+
+        p.end()
+
+
 class SystemMetricsRow(QWidget):
     """Collapsible row showing CPU, RAM, and GPU system metrics."""
 
@@ -1706,6 +1911,7 @@ class ClaudeWidget(QWidget):
         self._worker: FetchWorker | None = None
         self._deploy_worker: DeployFetchWorker | None = None
         self._runner_worker: RunnerFetchWorker | None = None
+        self._task_loop_worker: TaskLoopFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
         saved_until, saved_count = load_rate_limit_until()
@@ -1730,6 +1936,7 @@ class ClaudeWidget(QWidget):
         self._fetch_usage()
         self._fetch_deploys()
         self._fetch_runners()
+        self._fetch_task_loops()
 
         # Initial system metrics read so widget isn't blank
         self._update_system_metrics()
@@ -1890,6 +2097,10 @@ class ClaudeWidget(QWidget):
         self._runners_row = RunnersRow()
         layout.addWidget(self._runners_row)
 
+        # Clawd task loop row
+        self._task_loop_row = TaskLoopWidget()
+        layout.addWidget(self._task_loop_row)
+
         # System metrics row
         self._sys_row = SystemMetricsRow()
         layout.addWidget(self._sys_row)
@@ -1944,6 +2155,11 @@ class ClaudeWidget(QWidget):
         self._runner_timer = QTimer(self)
         self._runner_timer.timeout.connect(self._fetch_runners)
         self._runner_timer.start(RUNNER_REFRESH_MS)
+
+        # Task loop timer - every 60 seconds
+        self._task_loop_timer = QTimer(self)
+        self._task_loop_timer.timeout.connect(self._fetch_task_loops)
+        self._task_loop_timer.start(TASK_LOOP_REFRESH_MS)
 
         # System metrics timer - every 3 seconds
         self._sys_timer = QTimer(self)
@@ -2198,6 +2414,17 @@ class ClaudeWidget(QWidget):
 
     def _on_runners_fetched(self, runners: list):
         self._runners_row.set_data(runners)
+        self.adjustSize()
+
+    def _fetch_task_loops(self):
+        if self._task_loop_worker and self._task_loop_worker.isRunning():
+            return
+        self._task_loop_worker = TaskLoopFetchWorker()
+        self._task_loop_worker.finished.connect(self._on_task_loops_fetched)
+        self._task_loop_worker.start()
+
+    def _on_task_loops_fetched(self, loops: list):
+        self._task_loop_row.set_data(loops)
         self.adjustSize()
 
     def _update_system_metrics(self):
