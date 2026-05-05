@@ -53,6 +53,7 @@ MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
 SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
 RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
+TASK_GROUP_REFRESH_MS = 60 * 1000  # 60 seconds
 # Rate-limit backoff: /api/oauth/usage rate-limits aggressively (GH anthropics/claude-code#31637)
 RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
 RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
@@ -195,6 +196,28 @@ class TaskLoopInfo:
         if mins > 0:
             return f"next run: ~{mins}m"
         return f"next run: ~{secs}s"
+
+
+@dataclass
+class TaskGroupInfo:
+    """Path-scoped activity tracker — last commit timestamp for files under a sub-path."""
+    label: str
+    last_activity_ts: float | None = None
+    error: str = ""
+
+    def status_str(self) -> str:
+        if self.error:
+            return self.error
+        if self.last_activity_ts is None:
+            return "no activity"
+        elapsed = time.time() - self.last_activity_ts
+        if elapsed < 60:
+            return "just now"
+        if elapsed < 3600:
+            return f"{int(elapsed // 60)}m ago"
+        if elapsed < 86400:
+            return f"{int(elapsed // 3600)}h ago"
+        return f"{int(elapsed // 86400)}d ago"
 
 
 @dataclass
@@ -840,6 +863,42 @@ def fetch_task_loop_status() -> list[TaskLoopInfo]:
     return results
 
 
+# Path-scoped task groups: (label, repo_path, sub_path).
+# Status = last commit touching <repo>/<sub_path>; sub_path "" means whole repo.
+# Append a tuple to add a new group (e.g. SEO content, distribution drafts).
+TASK_GROUPS_CONFIG: list[tuple[str, Path, str]] = [
+    (
+        "honey-explorer outreach",
+        Path.home() / "claude-workspace" / "honey-explorer",
+        "outreach/",
+    ),
+]
+
+
+def fetch_task_groups() -> list[TaskGroupInfo]:
+    """Per configured task group, return last-commit timestamp for the sub-path."""
+    results: list[TaskGroupInfo] = []
+    for label, repo, sub in TASK_GROUPS_CONFIG:
+        info = TaskGroupInfo(label=label)
+        if not repo.exists():
+            info.error = "repo missing"
+            results.append(info)
+            continue
+        cmd = ["git", "-C", str(repo), "log", "-1", "--format=%ct"]
+        if sub:
+            cmd += ["--", sub]
+        try:
+            out = subprocess.check_output(
+                cmd, text=True, timeout=5, stderr=subprocess.DEVNULL
+            ).strip()
+            if out:
+                info.last_activity_ts = float(out)
+        except (subprocess.SubprocessError, ValueError, OSError):
+            info.error = "git error"
+        results.append(info)
+    return results
+
+
 # ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
@@ -983,6 +1042,14 @@ class TaskLoopFetchWorker(QThread):
     def run(self):
         loops = fetch_task_loop_status()
         self.finished.emit(loops)
+
+
+class TaskGroupFetchWorker(QThread):
+    finished = Signal(list)
+
+    def run(self):
+        groups = fetch_task_groups()
+        self.finished.emit(groups)
 
 
 # ---------------------------------------------------------------------------
@@ -1743,6 +1810,118 @@ class TaskLoopWidget(QWidget):
         p.end()
 
 
+class TaskGroupWidget(QWidget):
+    """Collapsible row showing path-scoped task groups (last git activity per group)."""
+
+    _HEADER_H = 22
+    _ROW_H = 18
+    _PAD = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._groups: list[TaskGroupInfo] = []
+        self._expanded = False
+        self.setFixedHeight(0)
+        self.hide()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, groups: list[TaskGroupInfo]):
+        self._groups = groups
+        if groups:
+            self._update_height()
+            self.show()
+        else:
+            self.setFixedHeight(0)
+            self.hide()
+        self.update()
+
+    def _update_height(self):
+        if not self._groups:
+            self.setFixedHeight(0)
+            return
+        if self._expanded:
+            h = self._HEADER_H + self._ROW_H * len(self._groups) + self._PAD
+        else:
+            h = self._HEADER_H
+        self.setFixedHeight(h)
+
+    def mousePressEvent(self, event):
+        if not self._groups:
+            return
+        self._expanded = not self._expanded
+        self._update_height()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        event.accept()
+
+    @staticmethod
+    def _activity_color(group: TaskGroupInfo) -> QColor:
+        if group.error or group.last_activity_ts is None:
+            return QColor(239, 68, 68)  # red
+        elapsed = time.time() - group.last_activity_ts
+        if elapsed >= 24 * 3600:
+            return QColor(239, 68, 68)  # red — days
+        if elapsed >= 6 * 3600:
+            return QColor(249, 115, 22)  # orange — 6h+
+        if elapsed >= 2 * 3600:
+            return QColor(234, 179, 8)  # yellow — 2h+
+        return QColor(34, 197, 94)  # green — fresh
+
+    def _stalest(self) -> TaskGroupInfo | None:
+        # Surface the group most likely to be stuck so the collapsed header is informative.
+        with_ts = [g for g in self._groups if g.last_activity_ts is not None]
+        errored = [g for g in self._groups if g.error or g.last_activity_ts is None]
+        if errored:
+            return errored[0]
+        if with_ts:
+            return min(with_ts, key=lambda g: g.last_activity_ts or 0)
+        return None
+
+    def paintEvent(self, event):
+        if not self._groups:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        y = 14
+        arrow = "▾" if self._expanded else "▸"
+        p.setPen(QColor(100, 100, 120))
+        header_text = f"TASK GROUPS {arrow}"
+        p.drawText(4, y, header_text)
+
+        if not self._expanded:
+            stale = self._stalest()
+            if stale is not None:
+                summary = f"{stale.label}: {stale.status_str()}"
+                x = 4 + fm.horizontalAdvance(header_text) + 8
+                p.setPen(self._activity_color(stale))
+                p.drawText(x, y, summary)
+            p.end()
+            return
+
+        for i, group in enumerate(self._groups):
+            row_y = self._HEADER_H + self._ROW_H * i + 13
+            p.setPen(QColor(180, 180, 200))
+            p.drawText(8, row_y, group.label)
+
+            status = group.status_str()
+            sw = fm.horizontalAdvance(status)
+            p.setPen(self._activity_color(group))
+            p.drawText(w - sw - 4, row_y, status)
+
+        p.end()
+
+
 class SystemMetricsRow(QWidget):
     """Collapsible row showing CPU, RAM, and GPU system metrics."""
 
@@ -1912,6 +2091,7 @@ class ClaudeWidget(QWidget):
         self._deploy_worker: DeployFetchWorker | None = None
         self._runner_worker: RunnerFetchWorker | None = None
         self._task_loop_worker: TaskLoopFetchWorker | None = None
+        self._task_group_worker: TaskGroupFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
         saved_until, saved_count = load_rate_limit_until()
@@ -1937,6 +2117,7 @@ class ClaudeWidget(QWidget):
         self._fetch_deploys()
         self._fetch_runners()
         self._fetch_task_loops()
+        self._fetch_task_groups()
 
         # Initial system metrics read so widget isn't blank
         self._update_system_metrics()
@@ -2101,6 +2282,10 @@ class ClaudeWidget(QWidget):
         self._task_loop_row = TaskLoopWidget()
         layout.addWidget(self._task_loop_row)
 
+        # Path-scoped task groups row
+        self._task_group_row = TaskGroupWidget()
+        layout.addWidget(self._task_group_row)
+
         # System metrics row
         self._sys_row = SystemMetricsRow()
         layout.addWidget(self._sys_row)
@@ -2160,6 +2345,11 @@ class ClaudeWidget(QWidget):
         self._task_loop_timer = QTimer(self)
         self._task_loop_timer.timeout.connect(self._fetch_task_loops)
         self._task_loop_timer.start(TASK_LOOP_REFRESH_MS)
+
+        # Task group timer - every 60 seconds
+        self._task_group_timer = QTimer(self)
+        self._task_group_timer.timeout.connect(self._fetch_task_groups)
+        self._task_group_timer.start(TASK_GROUP_REFRESH_MS)
 
         # System metrics timer - every 3 seconds
         self._sys_timer = QTimer(self)
@@ -2425,6 +2615,17 @@ class ClaudeWidget(QWidget):
 
     def _on_task_loops_fetched(self, loops: list):
         self._task_loop_row.set_data(loops)
+        self.adjustSize()
+
+    def _fetch_task_groups(self):
+        if self._task_group_worker and self._task_group_worker.isRunning():
+            return
+        self._task_group_worker = TaskGroupFetchWorker()
+        self._task_group_worker.finished.connect(self._on_task_groups_fetched)
+        self._task_group_worker.start()
+
+    def _on_task_groups_fetched(self, groups: list):
+        self._task_group_row.set_data(groups)
         self.adjustSize()
 
     def _update_system_metrics(self):
