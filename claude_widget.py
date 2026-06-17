@@ -2712,6 +2712,14 @@ class ClaudeWidget(QWidget):
         header.addWidget(self._title_label)
         header.addStretch()
 
+        self._minimize_btn = QLabel("–")
+        self._minimize_btn.setStyleSheet(
+            "color: #666680; font-size: 14px; padding: 2px 6px;"
+        )
+        self._minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._minimize_btn.mousePressEvent = lambda _: self.hide_to_tray()
+        header.addWidget(self._minimize_btn)
+
         # Close button
         close_btn = QLabel("✕")
         close_btn.setStyleSheet(
@@ -3179,9 +3187,9 @@ class ClaudeWidget(QWidget):
         self._tray.activated.connect(self._on_tray_activated)
 
         menu = QMenu()
-        show_action = QAction("Show", self)
-        show_action.triggered.connect(self._show_from_tray)
-        menu.addAction(show_action)
+        self._show_hide_action = QAction("Show/Hide", self)
+        self._show_hide_action.triggered.connect(self._toggle_from_tray)
+        menu.addAction(self._show_hide_action)
         menu.addSeparator()
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(QApplication.quit)
@@ -3191,16 +3199,25 @@ class ClaudeWidget(QWidget):
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self._show_from_tray()
+            self._toggle_from_tray()
 
     def _show_from_tray(self):
         self.show()
         self.raise_()
         self.activateWindow()
 
+    def hide_to_tray(self):
+        self.hide()
+
+    def _toggle_from_tray(self):
+        if self.isVisible():
+            self.hide_to_tray()
+        else:
+            self._show_from_tray()
+
     def closeEvent(self, event):
         event.ignore()
-        self.hide()
+        self.hide_to_tray()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

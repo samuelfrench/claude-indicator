@@ -3,12 +3,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
 from claude_widget import (
+    ClaudeWidget,
     CodexUsageWorker,
     CodexUsageRow,
     CodexUsageSummary,
@@ -51,6 +53,61 @@ class WidgetUiTest(unittest.TestCase):
         self.assertTrue(widget.estimate_label.isHidden())
         self.assertTrue(widget.seven_day_bar.isHidden())
         self.assertTrue(widget.model_bar.isHidden())
+
+    def _make_inert_claude_widget(self):
+        patches = [
+            patch.object(ClaudeWidget, "_setup_timers", lambda self: None),
+            patch.object(ClaudeWidget, "_fetch_usage", lambda self, force=False: None),
+            patch.object(ClaudeWidget, "_fetch_deploys", lambda self: None),
+            patch.object(ClaudeWidget, "_fetch_runners", lambda self: None),
+            patch.object(ClaudeWidget, "_fetch_task_loops", lambda self: None),
+            patch.object(ClaudeWidget, "_fetch_task_groups", lambda self: None),
+            patch.object(ClaudeWidget, "_update_system_metrics", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
+        ]
+        for active_patch in patches:
+            active_patch.start()
+            self.addCleanup(active_patch.stop)
+        widget = ClaudeWidget()
+        self.addCleanup(widget.deleteLater)
+        return widget
+
+    def test_claude_header_minimize_button_hides_to_tray(self):
+        widget = self._make_inert_claude_widget()
+        calls = []
+        widget.hide_to_tray = lambda: calls.append("hide")
+
+        widget._minimize_btn.mousePressEvent(None)
+
+        self.assertEqual(calls, ["hide"])
+
+    def test_claude_close_event_uses_hide_to_tray(self):
+        widget = self._make_inert_claude_widget()
+        calls = []
+        widget.hide_to_tray = lambda: calls.append("hide")
+
+        class Event:
+            ignored = False
+
+            def ignore(self):
+                self.ignored = True
+
+        event = Event()
+        widget.closeEvent(event)
+
+        self.assertTrue(event.ignored)
+        self.assertEqual(calls, ["hide"])
+
+    def test_claude_tray_show_hide_action_toggles_visibility(self):
+        widget = self._make_inert_claude_widget()
+
+        self.assertEqual(widget._show_hide_action.text(), "Show/Hide")
+        widget.show()
+        widget._show_hide_action.trigger()
+        self.assertFalse(widget.isVisible())
+
+        widget._show_hide_action.trigger()
+        self.assertTrue(widget.isVisible())
 
     def test_codex_usage_row_expands_to_show_detail_rows(self):
         row = CodexUsageRow()
