@@ -84,6 +84,23 @@ class WidgetUiTest(unittest.TestCase):
         self.assertIn("5h limit: 37.5% used", row.toolTip())
         self.assertIn("7d limit: 12.0% used", row.toolTip())
 
+    def test_codex_usage_row_collapsed_metrics_show_limit_windows(self):
+        row = CodexUsageRow()
+        summary = CodexUsageSummary(
+            latest_thread_tokens=12_345,
+            primary_limit_used_percent=37.5,
+            primary_limit_window_minutes=300,
+            secondary_limit_used_percent=12.0,
+            secondary_limit_window_minutes=10080,
+        )
+
+        metrics = row._collapsed_metrics(summary)
+
+        self.assertEqual(
+            [(label, value) for label, value, _color in metrics],
+            [("5H", "37.5%"), ("7D", "12.0%"), ("LAST", "12.3K")],
+        )
+
     def test_read_latest_codex_rate_limit_uses_newest_session_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sessions_dir = Path(tmpdir)

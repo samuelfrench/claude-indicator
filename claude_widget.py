@@ -1811,11 +1811,6 @@ class CodexUsageRow(QWidget):
 
     _COLLAPSED_H = 20
     _EXPANDED_H = 146
-    METRICS = [
-        ("USE", "primary_limit_used_percent", QColor(16, 163, 127)),
-        ("LAST", "latest_thread_tokens", QColor(16, 163, 127)),
-        ("TOTAL", "total_tokens", QColor(180, 180, 200)),
-    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1882,13 +1877,26 @@ class CodexUsageRow(QWidget):
         ).astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
 
     @staticmethod
-    def _format_metric_value(summary: CodexUsageSummary, attr: str) -> str:
-        value = getattr(summary, attr)
-        if attr.endswith("_percent"):
-            return _fmt_percent(value)
-        if attr == "thread_count":
-            return str(value)
-        return _fmt_tokens(value)
+    def _collapsed_metrics(summary: CodexUsageSummary):
+        primary_window = summary.primary_limit_window_minutes or 300
+        secondary_window = summary.secondary_limit_window_minutes or 10080
+        return [
+            (
+                _format_codex_window(primary_window).upper(),
+                _fmt_percent(summary.primary_limit_used_percent),
+                QColor(16, 163, 127),
+            ),
+            (
+                _format_codex_window(secondary_window).upper(),
+                _fmt_percent(summary.secondary_limit_used_percent),
+                QColor(16, 163, 127),
+            ),
+            (
+                "LAST",
+                _fmt_tokens(summary.latest_thread_tokens),
+                QColor(180, 180, 200),
+            ),
+        ]
 
     def mousePressEvent(self, event):
         self.toggle_expanded()
@@ -1911,12 +1919,12 @@ class CodexUsageRow(QWidget):
         p.drawText(4, y, f"CODEX {arrow}")
 
         title_w = fm.horizontalAdvance("CODEX ▾") + 12
-        col_w = max(1, (w - title_w - 8) // len(self.METRICS))
         summary = self._summary or CodexUsageSummary()
+        metrics = self._collapsed_metrics(summary)
+        col_w = max(1, (w - title_w - 8) // len(metrics))
 
-        for idx, (label, attr, value_color) in enumerate(self.METRICS):
+        for idx, (label, value_text, value_color) in enumerate(metrics):
             x = 4 + title_w + idx * col_w
-            value_text = self._format_metric_value(summary, attr)
             p.setPen(QColor(100, 100, 120))
             p.drawText(x, y, f"{label}:")
             value_x = x + fm.horizontalAdvance(f"{label}: ")
