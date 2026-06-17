@@ -1,7 +1,7 @@
 # Claude Indicator
 
 ## Project Description
-Translucent PySide6 desktop widget showing Claude Code Max subscription usage limits with color-coded progress bars, a 24-hour usage graph, stats row, and countdown timers.
+Translucent PySide6 desktop widget showing Claude Code Max subscription usage limits plus local Codex usage-limit percentages, with color-coded progress bars, a 24-hour usage graph, stats row, and countdown timers.
 
 ## Architecture
 - **Single-file app**: `claude_widget.py` contains all logic (client, UI, timers, history)
@@ -10,6 +10,7 @@ Translucent PySide6 desktop widget showing Claude Code Max subscription usage li
 - **UsageBar**: Custom-painted progress bars with color coding (green/yellow/orange/red)
 - **UsageGraph**: QPainter line chart showing 5-hour utilization over last 24 hours with gradient fill, grid lines, and 80% threshold
 - **StatsRow**: Compact custom-painted row with AVG, PEAK, TREND, and EXTRA usage stats
+- **CodexUsageRow**: Reads `~/.codex/state_*.sqlite` plus `~/.codex/sessions/**/*.jsonl` token-count events and shows Codex 5-hour/7-day limit percentages, latest-thread tokens, lifetime tokens, and thread count
 - **UsageHistory**: Persists data points to `~/.claude/usage_history.json` (max 288 points / 24h), atomic writes via os.replace()
 - **Dynamic plan name**: Title detects CLAUDE MAX (opus present), CLAUDE PRO (sonnet present), or CLAUDE (neither)
 - Token refresh via `https://platform.claude.com/v1/oauth/token` with client_id `9d1c250a-e61b-44d9-88ed-5944d1962f5e`

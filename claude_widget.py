@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Translucent desktop widget showing Claude Code Max subscription usage."""
+"""Translucent desktop widget showing Claude usage plus local Codex totals."""
 
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
 
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+CODEX_HOME = Path.home() / ".codex"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -54,6 +56,10 @@ SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
 RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_GROUP_REFRESH_MS = 60 * 1000  # 60 seconds
+CODEX_REFRESH_MS = 15 * 1000  # 15 seconds
+CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
+CODEX_RATE_LIMIT_SCAN_FILES = 20
+CODEX_RATE_LIMIT_TAIL_BYTES = 4 * 1024 * 1024
 # Rate-limit backoff: /api/oauth/usage rate-limits aggressively (GH anthropics/claude-code#31637)
 RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
 RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
@@ -230,6 +236,37 @@ class SystemMetrics:
     gpu_mem_total_gb: float = 0.0
     gpu_temp: int = 0
     gpu_available: bool = False
+
+
+@dataclass
+class CodexUsageSummary:
+    latest_thread_tokens: int = 0
+    total_tokens: int = 0
+    thread_count: int = 0
+    latest_thread_title: str = ""
+    latest_model: str = ""
+    latest_updated_at: int = 0
+    latest_cwd: str = ""
+    primary_limit_used_percent: float | None = None
+    primary_limit_window_minutes: int = 0
+    primary_limit_resets_at: int = 0
+    secondary_limit_used_percent: float | None = None
+    secondary_limit_window_minutes: int = 0
+    secondary_limit_resets_at: int = 0
+    plan_type: str = ""
+    rate_limit_reached_type: str = ""
+
+
+@dataclass
+class CodexRateLimit:
+    primary_used_percent: float | None = None
+    primary_window_minutes: int = 0
+    primary_resets_at: int = 0
+    secondary_used_percent: float | None = None
+    secondary_window_minutes: int = 0
+    secondary_resets_at: int = 0
+    plan_type: str = ""
+    rate_limit_reached_type: str = ""
 
 
 class SystemMetricsReader:
@@ -1052,6 +1089,18 @@ class TaskGroupFetchWorker(QThread):
         self.finished.emit(groups)
 
 
+class CodexUsageWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        reader = self._reader or read_codex_usage_summary
+        self.result.emit(reader())
+
+
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
@@ -1124,6 +1173,103 @@ class UsageBar(QWidget):
         p.fillPath(fill_path, _bar_color(self._pct))
 
         p.end()
+
+
+class UsageLimitsWidget(QWidget):
+    """Collapsible group containing the Claude usage limit bars."""
+
+    _HEADER_H = 20
+    _EXPANDED_H = 176
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = True
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self._header = QLabel("Usage Limits ▾")
+        self._header.setFixedHeight(self._HEADER_H)
+        self._header.setStyleSheet("color: #666680; font-size: 9px;")
+        layout.addWidget(self._header)
+
+        self.five_hour_bar = UsageBar("5-Hour Window")
+        layout.addWidget(self.five_hour_bar)
+
+        self.estimate_label = QLabel("")
+        self.estimate_label.setStyleSheet(
+            "color: #888898; font-size: 10px; padding-left: 2px;"
+        )
+        self.estimate_label.setFixedHeight(16)
+        layout.addWidget(self.estimate_label)
+
+        self.seven_day_bar = UsageBar("7-Day Window")
+        layout.addWidget(self.seven_day_bar)
+
+        self.model_bar = UsageBar("Sonnet (7-Day)")
+        layout.addWidget(self.model_bar)
+
+        self._model_available = False
+        self._update_children_visibility()
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def toggle_expanded(self):
+        self._expanded = not self._expanded
+        self._update_children_visibility()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+
+    def set_data(self, data: UsageData, estimate: str = ""):
+        self.five_hour_bar.set_data(
+            data.five_hour.utilization,
+            data.five_hour.time_remaining(),
+        )
+        self.seven_day_bar.set_data(
+            data.seven_day.utilization,
+            data.seven_day.time_remaining(),
+        )
+
+        if data.seven_day_opus:
+            self.model_bar._label = "Opus (7-Day)"
+            self.model_bar.set_data(
+                data.seven_day_opus.utilization,
+                data.seven_day_opus.time_remaining(),
+            )
+            self._model_available = True
+        elif data.seven_day_sonnet:
+            self.model_bar._label = "Sonnet (7-Day)"
+            self.model_bar.set_data(
+                data.seven_day_sonnet.utilization,
+                data.seven_day_sonnet.time_remaining(),
+            )
+            self._model_available = True
+        else:
+            self._model_available = False
+
+        self.estimate_label.setText(estimate)
+        self._update_children_visibility()
+        self.update()
+
+    def _update_children_visibility(self):
+        visible = self._expanded
+        self.five_hour_bar.setVisible(visible)
+        self.estimate_label.setVisible(visible and bool(self.estimate_label.text()))
+        self.seven_day_bar.setVisible(visible)
+        self.model_bar.setVisible(visible and self._model_available)
+        self._header.setText("Usage Limits ▾" if visible else "Usage Limits ▸")
+        self.setFixedHeight(self._EXPANDED_H if visible else self._HEADER_H)
+
+    def mousePressEvent(self, event):
+        self.toggle_expanded()
+        event.accept()
 
 
 class UsageGraph(QWidget):
@@ -1377,6 +1523,40 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def _fmt_percent(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.1f}%"
+
+
+def _format_codex_window(minutes: int) -> str:
+    if minutes == 300:
+        return "5h"
+    if minutes == 10080:
+        return "7d"
+    if minutes and minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes and minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m" if minutes else "limit"
+
+
+def _format_epoch_remaining(epoch_seconds: int) -> str:
+    if not epoch_seconds:
+        return "unknown"
+    delta = int(epoch_seconds - time.time())
+    if delta <= 0:
+        return "now"
+    days = delta // 86400
+    hours = (delta % 86400) // 3600
+    minutes = (delta % 3600) // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def read_token_stats() -> dict:
     """Read token stats from Claude Code's stats-cache.json."""
     try:
@@ -1395,6 +1575,190 @@ def read_token_stats() -> dict:
         }
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
         return {}
+
+
+def _latest_codex_state_path() -> Path | None:
+    try:
+        candidates = sorted(
+            CODEX_HOME.glob("state_*.sqlite"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    return candidates[0] if candidates else None
+
+
+def _recent_codex_session_files(
+    sessions_dir: Path = CODEX_SESSIONS_DIR,
+    limit: int = CODEX_RATE_LIMIT_SCAN_FILES,
+) -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        for year_dir in sorted(
+            (path for path in sessions_dir.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )[:2]:
+            for month_dir in sorted(
+                (path for path in year_dir.iterdir() if path.is_dir()),
+                key=lambda path: path.name,
+                reverse=True,
+            )[:2]:
+                day_dirs = sorted(
+                    (path for path in month_dir.iterdir() if path.is_dir()),
+                    key=lambda path: path.name,
+                    reverse=True,
+                )
+                for day_dir in day_dirs[:7]:
+                    candidates.extend(path for path in day_dir.glob("*.jsonl") if path.is_file())
+                    if len(candidates) >= limit * 4:
+                        break
+                if len(candidates) >= limit * 4:
+                    break
+            if len(candidates) >= limit * 4:
+                break
+
+        if not candidates:
+            candidates = [path for path in sessions_dir.glob("*.jsonl") if path.is_file()]
+        if not candidates:
+            candidates = [path for path in sessions_dir.rglob("*.jsonl") if path.is_file()]
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    return candidates[:limit]
+
+
+def _tail_text_lines(path: Path, max_bytes: int = CODEX_RATE_LIMIT_TAIL_BYTES) -> list[str]:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            data = f.read()
+    except OSError:
+        return []
+
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    return lines
+
+
+def _parse_codex_rate_limit_event(line: str) -> CodexRateLimit | None:
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+    if event.get("type") != "event_msg":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    limits = payload.get("rate_limits") or event.get("rate_limits")
+    if not isinstance(limits, dict) or limits.get("limit_id") != "codex":
+        return None
+
+    primary = limits.get("primary") if isinstance(limits.get("primary"), dict) else {}
+    secondary = limits.get("secondary") if isinstance(limits.get("secondary"), dict) else {}
+    return CodexRateLimit(
+        primary_used_percent=_safe_float(primary.get("used_percent")),
+        primary_window_minutes=int(primary.get("window_minutes") or 0),
+        primary_resets_at=int(primary.get("resets_at") or 0),
+        secondary_used_percent=_safe_float(secondary.get("used_percent")),
+        secondary_window_minutes=int(secondary.get("window_minutes") or 0),
+        secondary_resets_at=int(secondary.get("resets_at") or 0),
+        plan_type=str(limits.get("plan_type") or ""),
+        rate_limit_reached_type=str(limits.get("rate_limit_reached_type") or ""),
+    )
+
+
+def _safe_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_latest_codex_rate_limit(
+    sessions_dir: Path = CODEX_SESSIONS_DIR,
+) -> CodexRateLimit | None:
+    """Read the newest cached Codex rate-limit percentage from session JSONL."""
+    for session_path in _recent_codex_session_files(sessions_dir):
+        for line in reversed(_tail_text_lines(session_path)):
+            rate_limit = _parse_codex_rate_limit_event(line)
+            if rate_limit is not None:
+                return rate_limit
+    return None
+
+
+def read_codex_usage_summary(
+    db_path: Path | None = None,
+    sessions_dir: Path = CODEX_SESSIONS_DIR,
+) -> CodexUsageSummary | None:
+    """Read local Codex token totals from the state database."""
+    summary = CodexUsageSummary()
+    has_state = False
+    db_path = db_path or _latest_codex_state_path()
+    if db_path is not None:
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
+                cwd_expr = "COALESCE(cwd, '')" if "cwd" in columns else "''"
+                query = f"""
+                    WITH codex_threads AS (
+                        SELECT title, COALESCE(model, '') AS model, updated_at, tokens_used,
+                               {cwd_expr} AS cwd
+                        FROM threads
+                        WHERE model_provider = 'openai'
+                    ),
+                    latest AS (
+                        SELECT title, model, updated_at, tokens_used, cwd
+                        FROM codex_threads
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                    )
+                    SELECT
+                        (SELECT COUNT(*) FROM codex_threads),
+                        COALESCE((SELECT SUM(tokens_used) FROM codex_threads), 0),
+                        COALESCE((SELECT tokens_used FROM latest), 0),
+                        COALESCE((SELECT title FROM latest), ''),
+                        COALESCE((SELECT model FROM latest), ''),
+                        COALESCE((SELECT updated_at FROM latest), 0),
+                        COALESCE((SELECT cwd FROM latest), '')
+                """
+                row = conn.execute(query).fetchone()
+        except sqlite3.Error:
+            row = None
+
+        if row is not None:
+            summary.thread_count = int(row[0] or 0)
+            summary.total_tokens = int(row[1] or 0)
+            summary.latest_thread_tokens = int(row[2] or 0)
+            summary.latest_thread_title = row[3] or ""
+            summary.latest_model = row[4] or ""
+            summary.latest_updated_at = int(row[5] or 0)
+            summary.latest_cwd = row[6] or ""
+            has_state = True
+
+    rate_limit = read_latest_codex_rate_limit(sessions_dir=sessions_dir)
+    if rate_limit is not None:
+        summary.primary_limit_used_percent = rate_limit.primary_used_percent
+        summary.primary_limit_window_minutes = rate_limit.primary_window_minutes
+        summary.primary_limit_resets_at = rate_limit.primary_resets_at
+        summary.secondary_limit_used_percent = rate_limit.secondary_used_percent
+        summary.secondary_limit_window_minutes = rate_limit.secondary_window_minutes
+        summary.secondary_limit_resets_at = rate_limit.secondary_resets_at
+        summary.plan_type = rate_limit.plan_type
+        summary.rate_limit_reached_type = rate_limit.rate_limit_reached_type
+
+    if not has_state and rate_limit is None:
+        return None
+    return summary
 
 
 class TokenRow(QWidget):
@@ -1438,6 +1802,166 @@ class TokenRow(QWidget):
         cache_x = x3 + fm.horizontalAdvance("CACHE: ")
         p.setPen(QColor(139, 92, 246))
         p.drawText(cache_x, y, _fmt_tokens(self._total_cache))
+
+        p.end()
+
+
+class CodexUsageRow(QWidget):
+    """Compact row showing local Codex token usage totals."""
+
+    _COLLAPSED_H = 20
+    _EXPANDED_H = 146
+    METRICS = [
+        ("USE", "primary_limit_used_percent", QColor(16, 163, 127)),
+        ("LAST", "latest_thread_tokens", QColor(16, 163, 127)),
+        ("TOTAL", "total_tokens", QColor(180, 180, 200)),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self._summary: CodexUsageSummary | None = None
+        self._available = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("No local Codex usage found yet.")
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def toggle_expanded(self):
+        self._expanded = not self._expanded
+        self._update_height()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        self.update()
+
+    def set_data(self, summary: CodexUsageSummary | None):
+        self._summary = summary
+        self._available = summary is not None and (
+            summary.thread_count > 0 or summary.primary_limit_used_percent is not None
+        )
+        if not self._available:
+            self.setToolTip("No local Codex usage found yet.")
+        else:
+            title = summary.latest_thread_title or "Untitled thread"
+            model = summary.latest_model or "unknown"
+            cwd = summary.latest_cwd or "unknown"
+            primary_label = _format_codex_window(summary.primary_limit_window_minutes)
+            secondary_label = _format_codex_window(summary.secondary_limit_window_minutes)
+            self.setToolTip(
+                f"{primary_label} limit: {_fmt_percent(summary.primary_limit_used_percent)} used; "
+                f"resets in {_format_epoch_remaining(summary.primary_limit_resets_at)}\n"
+                f"{secondary_label} limit: {_fmt_percent(summary.secondary_limit_used_percent)} used; "
+                f"resets in {_format_epoch_remaining(summary.secondary_limit_resets_at)}\n"
+                f"Plan: {summary.plan_type or 'unknown'}\n"
+                f"Latest Codex thread: {title}\n"
+                f"Model: {model}\n"
+                f"Updated: {self._format_updated_at(summary)}\n"
+                f"CWD: {cwd}\n"
+                f"Latest tokens: {_fmt_tokens(summary.latest_thread_tokens)}\n"
+                f"Total tokens: {_fmt_tokens(summary.total_tokens)} across "
+                f"{summary.thread_count} threads"
+            )
+        self._update_height()
+        self.update()
+
+    def _update_height(self):
+        self.setFixedHeight(self._EXPANDED_H if self._expanded else self._COLLAPSED_H)
+
+    @staticmethod
+    def _format_updated_at(summary: CodexUsageSummary) -> str:
+        if not summary.latest_updated_at:
+            return "unknown"
+        return datetime.fromtimestamp(
+            summary.latest_updated_at, tz=timezone.utc
+        ).astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+
+    @staticmethod
+    def _format_metric_value(summary: CodexUsageSummary, attr: str) -> str:
+        value = getattr(summary, attr)
+        if attr.endswith("_percent"):
+            return _fmt_percent(value)
+        if attr == "thread_count":
+            return str(value)
+        return _fmt_tokens(value)
+
+    def mousePressEvent(self, event):
+        self.toggle_expanded()
+        event.accept()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+        y = 14
+        arrow = "▾" if self._expanded else "▸"
+
+        title_color = QColor(16, 163, 127) if self._available else QColor(100, 100, 120)
+        p.setPen(title_color)
+        p.drawText(4, y, f"CODEX {arrow}")
+
+        title_w = fm.horizontalAdvance("CODEX ▾") + 12
+        col_w = max(1, (w - title_w - 8) // len(self.METRICS))
+        summary = self._summary or CodexUsageSummary()
+
+        for idx, (label, attr, value_color) in enumerate(self.METRICS):
+            x = 4 + title_w + idx * col_w
+            value_text = self._format_metric_value(summary, attr)
+            p.setPen(QColor(100, 100, 120))
+            p.drawText(x, y, f"{label}:")
+            value_x = x + fm.horizontalAdvance(f"{label}: ")
+            p.setPen(value_color if self._available else QColor(160, 160, 180))
+            p.drawText(value_x, y, value_text if self._available else "—")
+
+        if self._expanded:
+            primary_label = _format_codex_window(summary.primary_limit_window_minutes).upper()
+            secondary_label = _format_codex_window(summary.secondary_limit_window_minutes).upper()
+            details = [
+                (
+                    f"{primary_label} LIMIT",
+                    f"{_fmt_percent(summary.primary_limit_used_percent)} used · "
+                    f"resets {_format_epoch_remaining(summary.primary_limit_resets_at)}",
+                ),
+                (
+                    f"{secondary_label} LIMIT",
+                    f"{_fmt_percent(summary.secondary_limit_used_percent)} used · "
+                    f"resets {_format_epoch_remaining(summary.secondary_limit_resets_at)}",
+                ),
+                ("PLAN", summary.plan_type or "unknown"),
+                ("THREAD", summary.latest_thread_title or "Untitled thread"),
+                ("MODEL", summary.latest_model or "unknown"),
+                ("UPDATED", self._format_updated_at(summary)),
+                ("CWD", summary.latest_cwd or "unknown"),
+                (
+                    "TOKENS",
+                    f"latest {_fmt_tokens(summary.latest_thread_tokens)} · "
+                    f"total {_fmt_tokens(summary.total_tokens)} · "
+                    f"{summary.thread_count} threads",
+                ),
+            ]
+            detail_font = QFont("sans-serif", 8)
+            detail_font.setWeight(QFont.Weight.Normal)
+            p.setFont(detail_font)
+            detail_fm = p.fontMetrics()
+            label_w = max(detail_fm.horizontalAdvance(label) for label, _ in details) + 8
+            row_y = 32
+            for label, value in details:
+                p.setPen(QColor(100, 100, 120))
+                p.drawText(12, row_y, f"{label}:")
+                p.setPen(QColor(180, 180, 200) if self._available else QColor(120, 120, 140))
+                text = detail_fm.elidedText(value if self._available else "—", Qt.TextElideMode.ElideMiddle, max(20, w - label_w - 18))
+                p.drawText(12 + label_w, row_y, text)
+                row_y += 14
 
         p.end()
 
@@ -2092,6 +2616,7 @@ class ClaudeWidget(QWidget):
         self._runner_worker: RunnerFetchWorker | None = None
         self._task_loop_worker: TaskLoopFetchWorker | None = None
         self._task_group_worker: TaskGroupFetchWorker | None = None
+        self._codex_worker: CodexUsageWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
         saved_until, saved_count = load_rate_limit_until()
@@ -2129,6 +2654,7 @@ class ClaudeWidget(QWidget):
                 tstats.get("total_output", 0),
                 tstats.get("total_cache", 0),
             )
+        self._refresh_codex_usage()
 
         # Initialize graph with persisted history
         if self._history.points:
@@ -2197,22 +2723,12 @@ class ClaudeWidget(QWidget):
         layout.addSpacing(4)
 
         # Usage bars
-        self._five_hour_bar = UsageBar("5-Hour Window")
-        layout.addWidget(self._five_hour_bar)
-
-        self._estimate_label = QLabel("")
-        self._estimate_label.setStyleSheet("color: #888898; font-size: 10px; padding-left: 2px;")
-        self._estimate_label.setFixedHeight(16)
-        layout.addWidget(self._estimate_label)
-        layout.addSpacing(2)
-
-        self._seven_day_bar = UsageBar("7-Day Window")
-        layout.addWidget(self._seven_day_bar)
-        layout.addSpacing(2)
-
-        self._model_bar = UsageBar("Sonnet (7-Day)")
-        layout.addWidget(self._model_bar)
-
+        self._usage_limits = UsageLimitsWidget()
+        layout.addWidget(self._usage_limits)
+        self._five_hour_bar = self._usage_limits.five_hour_bar
+        self._estimate_label = self._usage_limits.estimate_label
+        self._seven_day_bar = self._usage_limits.seven_day_bar
+        self._model_bar = self._usage_limits.model_bar
         layout.addSpacing(2)
 
         # Graph separator
@@ -2269,6 +2785,10 @@ class ClaudeWidget(QWidget):
         # Token stats row
         self._token_row = TokenRow()
         layout.addWidget(self._token_row)
+
+        # Codex usage row
+        self._codex_row = CodexUsageRow()
+        layout.addWidget(self._codex_row)
 
         # Deploy status row
         self._deploy_row = DeployRow()
@@ -2355,6 +2875,11 @@ class ClaudeWidget(QWidget):
         self._sys_timer = QTimer(self)
         self._sys_timer.timeout.connect(self._update_system_metrics)
         self._sys_timer.start(SYSTEM_METRICS_INTERVAL_MS)
+
+        # Codex usage timer - lightweight local sqlite read
+        self._codex_timer = QTimer(self)
+        self._codex_timer.timeout.connect(self._refresh_codex_usage)
+        self._codex_timer.start(CODEX_REFRESH_MS)
 
     def _fetch_usage(self, force: bool = False):
         if self._worker and self._worker.isRunning():
@@ -2474,40 +2999,8 @@ class ClaudeWidget(QWidget):
         else:
             self._status_label.setStyleSheet("color: #666680; font-size: 10px;")
 
-        self._five_hour_bar.set_data(
-            data.five_hour.utilization,
-            data.five_hour.time_remaining(),
-        )
-
         estimate = self._history.estimated_time_left(data.five_hour.utilization)
-        if estimate:
-            self._estimate_label.setText(estimate)
-            self._estimate_label.show()
-        else:
-            self._estimate_label.hide()
-
-        self._seven_day_bar.set_data(
-            data.seven_day.utilization,
-            data.seven_day.time_remaining(),
-        )
-
-        # Show opus or sonnet model-specific limit, whichever exists
-        if data.seven_day_opus:
-            self._model_bar._label = "Opus (7-Day)"
-            self._model_bar.set_data(
-                data.seven_day_opus.utilization,
-                data.seven_day_opus.time_remaining(),
-            )
-            self._model_bar.show()
-        elif data.seven_day_sonnet:
-            self._model_bar._label = "Sonnet (7-Day)"
-            self._model_bar.set_data(
-                data.seven_day_sonnet.utilization,
-                data.seven_day_sonnet.time_remaining(),
-            )
-            self._model_bar.show()
-        else:
-            self._model_bar.hide()
+        self._usage_limits.set_data(data, estimate=estimate)
 
         # Status line: if rate-limited, show "Stale · next in Xm Ys" countdown,
         # otherwise show true data age and next-update countdown.
@@ -2631,6 +3124,17 @@ class ClaudeWidget(QWidget):
     def _update_system_metrics(self):
         metrics = self._sys_reader.read()
         self._sys_row.set_data(metrics)
+
+    def _refresh_codex_usage(self):
+        if self._codex_worker and self._codex_worker.isRunning():
+            return
+        self._codex_worker = CodexUsageWorker()
+        self._codex_worker.result.connect(self._on_codex_usage_read)
+        self._codex_worker.start()
+
+    def _on_codex_usage_read(self, summary: CodexUsageSummary | None):
+        self._codex_row.set_data(summary)
+        self.adjustSize()
 
     def paintEvent(self, event):
         p = QPainter(self)

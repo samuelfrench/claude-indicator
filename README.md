@@ -1,6 +1,6 @@
 # Claude Indicator
 
-A translucent desktop widget for Linux that displays your Claude Code Max subscription usage in real time. Shows color-coded progress bars for rate limit windows with live countdown timers.
+A translucent desktop widget for Linux that displays your Claude Code Max subscription usage in real time plus your local Codex usage-limit percentage. Shows color-coded progress bars for rate limit windows with live countdown timers.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![PySide6](https://img.shields.io/badge/PySide6-6.6+-green)
@@ -10,6 +10,7 @@ A translucent desktop widget for Linux that displays your Claude Code Max subscr
 
 - **Real-time usage tracking** — monitors 5-hour and 7-day rate limit windows
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
+- **Codex limit percentage** — shows current Codex 5-hour usage percentage, 7-day percentage, latest-thread tokens, and lifetime local totals from cached local Codex state
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
 - **Live countdown timers** — shows time remaining until each window resets
 - **Always-on-top translucent widget** — frameless, draggable, stays visible over other windows
@@ -21,6 +22,7 @@ A translucent desktop widget for Linux that displays your Claude Code Max subscr
 The widget displays a dark translucent overlay with:
 - "CLAUDE MAX" header in warm gold
 - Up to 3 progress bars (5-Hour Window, 7-Day Window, Model-specific 7-Day)
+- A compact `CODEX` row with current Codex limit percentage and local usage totals
 - Percentage and reset countdown on each bar
 - Last-updated timestamp and manual refresh button
 
@@ -81,7 +83,8 @@ LD_LIBRARY_PATH=/path/to/miniconda3/lib python claude_widget.py
 1. **Reads OAuth credentials** from `~/.claude/.credentials.json` (written by Claude Code CLI)
 2. **Refreshes the access token** if it's within 5 minutes of expiry, using the OAuth refresh flow
 3. **Fetches usage data** from `GET https://api.anthropic.com/api/oauth/usage` with the `anthropic-beta: oauth-2025-04-20` header
-4. **Renders the widget** using PySide6 with custom-painted progress bars and translucent background
+4. **Reads local Codex usage** from `~/.codex/state_*.sqlite` and cached session `token_count` events under `~/.codex/sessions/`
+5. **Renders the widget** using PySide6 with custom-painted progress bars and translucent background
 
 ### Architecture
 
@@ -92,6 +95,7 @@ The entire application is a single file (`claude_widget.py`) with these componen
 | `ClaudeUsageClient` | Handles OAuth credential reading, token refresh, and API calls |
 | `FetchWorker` | QThread that fetches usage data off the main thread |
 | `UsageBar` | Custom-painted widget for a single progress bar with label, percentage, and countdown |
+| `CodexUsageRow` | Custom-painted summary row backed by local Codex SQLite state and cached rate-limit events |
 | `ClaudeWidget` | Main frameless, translucent, always-on-top widget with drag support |
 | `UsageData` / `UsageEntry` | Dataclasses modeling the API response |
 
