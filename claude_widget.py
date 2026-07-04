@@ -3143,6 +3143,7 @@ class ClaudeWidget(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(340)
+        self._tray: QSystemTrayIcon | None = None
 
         self._drag_pos = QPoint()
         self._usage: UsageData | None = load_last_usage()
@@ -3173,6 +3174,7 @@ class ClaudeWidget(QWidget):
         self._sys_reader = SystemMetricsReader()
 
         self._build_ui()
+        self.adjustSize()
         self._setup_tray_icon()
         self._setup_timers()
         self._fetch_usage()
@@ -3258,7 +3260,9 @@ class ClaudeWidget(QWidget):
             "color: #666680; font-size: 14px; padding: 2px 6px;"
         )
         self._minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._minimize_btn.mousePressEvent = lambda _: self.hide_to_tray()
+        self._minimize_btn.mousePressEvent = lambda _: (
+            self._toggle_from_tray() if self._tray else self.close()
+        )
         header.addWidget(self._minimize_btn)
 
         # Close button
@@ -3733,6 +3737,10 @@ class ClaudeWidget(QWidget):
         p.end()
 
     def _setup_tray_icon(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            log_line("system tray unavailable; running without tray controls")
+            return
+
         # Create a simple purple circle icon programmatically
         px = QPixmap(64, 64)
         px.fill(QColor(0, 0, 0, 0))
@@ -3767,11 +3775,15 @@ class ClaudeWidget(QWidget):
             self._toggle_from_tray()
 
     def _show_from_tray(self):
+        if self._tray is None:
+            return
         self.show()
         self.raise_()
         self.activateWindow()
 
     def hide_to_tray(self):
+        if self._tray is None:
+            return
         self.hide()
 
     def _toggle_from_tray(self):
@@ -3781,8 +3793,11 @@ class ClaudeWidget(QWidget):
             self._show_from_tray()
 
     def closeEvent(self, event):
-        event.ignore()
-        self.hide_to_tray()
+        if self._tray is not None:
+            event.ignore()
+            self.hide_to_tray()
+            return
+        event.accept()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -3802,6 +3817,9 @@ def main():
 
     widget = ClaudeWidget()
     widget.show()
+    widget.adjustSize()
+    widget.raise_()
+    widget.activateWindow()
 
     # Position at top-right of screen with some padding
     screen = app.primaryScreen().geometry()
