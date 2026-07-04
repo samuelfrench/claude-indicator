@@ -103,11 +103,21 @@ class UsageEntry:
 
 
 @dataclass
+class ModelLimit:
+    """A usage limit scoped to one model (e.g. the Fable weekly cap)."""
+
+    name: str    # display name from the API scope, e.g. "Fable"
+    window: str  # window label for the bar, e.g. "7-Day"
+    entry: UsageEntry = field(default_factory=UsageEntry)
+
+
+@dataclass
 class UsageData:
     five_hour: UsageEntry = field(default_factory=UsageEntry)
     seven_day: UsageEntry = field(default_factory=UsageEntry)
     seven_day_sonnet: UsageEntry | None = None
     seven_day_opus: UsageEntry | None = None
+    model_limits: list[ModelLimit] = field(default_factory=list)
     extra_usage_enabled: bool = False
     extra_usage_utilization: float | None = None
     extra_usage_used_credits: float | None = None
@@ -125,19 +135,31 @@ class UsageData:
         return "CLAUDE"
 
     @property
+    def display_model_limits(self) -> list[ModelLimit]:
+        """Scoped limits from the API plus legacy opus/sonnet keys, deduped."""
+        limits = list(self.model_limits)
+        seen = {ml.name.lower() for ml in limits}
+        for name, entry in (
+            ("Opus", self.seven_day_opus),
+            ("Sonnet", self.seven_day_sonnet),
+        ):
+            if entry is not None and name.lower() not in seen:
+                limits.append(ModelLimit(name=name, window="7-Day", entry=entry))
+                seen.add(name.lower())
+        return limits
+
+    @property
     def model_name(self) -> str:
-        if self.seven_day_opus is not None:
-            return "opus"
-        if self.seven_day_sonnet is not None:
-            return "sonnet"
+        limits = self.display_model_limits
+        if limits:
+            return limits[0].name.lower()
         return "unknown"
 
     @property
     def model_pct(self) -> float:
-        if self.seven_day_opus is not None:
-            return self.seven_day_opus.utilization
-        if self.seven_day_sonnet is not None:
-            return self.seven_day_sonnet.utilization
+        limits = self.display_model_limits
+        if limits:
+            return limits[0].entry.utilization
         return 0.0
 
 
@@ -511,6 +533,50 @@ def _entry_to_dict(e: UsageEntry | None) -> dict | None:
     return {"utilization": e.utilization, "resets_at": e.resets_at}
 
 
+# Maps the API `limits[].group` value to the window label shown on the bar.
+LIMIT_GROUP_WINDOWS = {"session": "5-Hour", "weekly": "7-Day"}
+
+
+def _parse_model_limits(data: dict) -> list[ModelLimit]:
+    """Extract model-scoped limits from the /api/oauth/usage `limits` array.
+
+    Model-specific caps (e.g. the Fable weekly limit) are reported as
+    entries whose scope names a model; plan-wide entries have no scope.
+    """
+    limits: list[ModelLimit] = []
+    seen: set[str] = set()
+    raw = data.get("limits")
+    if not isinstance(raw, list):
+        return limits
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        scope = item.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        if not isinstance(model, dict):
+            continue
+        name = model.get("display_name") or model.get("id") or ""
+        if not name or name.lower() in seen:
+            continue
+        group = item.get("group") or ""
+        try:
+            pct = float(item.get("percent") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        limits.append(
+            ModelLimit(
+                name=name,
+                window=LIMIT_GROUP_WINDOWS.get(group, group.title()),
+                entry=UsageEntry(
+                    utilization=pct,
+                    resets_at=item.get("resets_at") or "",
+                ),
+            )
+        )
+        seen.add(name.lower())
+    return limits
+
+
 def save_last_usage(data: UsageData) -> None:
     """Persist successful usage to disk so it survives widget restarts."""
     payload = {
@@ -518,6 +584,14 @@ def save_last_usage(data: UsageData) -> None:
         "seven_day": _entry_to_dict(data.seven_day),
         "seven_day_sonnet": _entry_to_dict(data.seven_day_sonnet),
         "seven_day_opus": _entry_to_dict(data.seven_day_opus),
+        "model_limits": [
+            {
+                "name": ml.name,
+                "window": ml.window,
+                "entry": _entry_to_dict(ml.entry),
+            }
+            for ml in data.model_limits
+        ],
         "extra_usage_enabled": data.extra_usage_enabled,
         "extra_usage_utilization": data.extra_usage_utilization,
         "extra_usage_used_credits": data.extra_usage_used_credits,
@@ -547,6 +621,15 @@ def load_last_usage() -> UsageData | None:
             seven_day=_parse_entry(raw.get("seven_day")) or UsageEntry(),
             seven_day_sonnet=_parse_entry(raw.get("seven_day_sonnet")),
             seven_day_opus=_parse_entry(raw.get("seven_day_opus")),
+            model_limits=[
+                ModelLimit(
+                    name=str(ml.get("name", "")),
+                    window=str(ml.get("window", "")),
+                    entry=_parse_entry(ml.get("entry")) or UsageEntry(),
+                )
+                for ml in raw.get("model_limits") or []
+                if isinstance(ml, dict) and ml.get("name")
+            ],
             extra_usage_enabled=bool(raw.get("extra_usage_enabled", False)),
             extra_usage_utilization=raw.get("extra_usage_utilization"),
             extra_usage_used_credits=raw.get("extra_usage_used_credits"),
@@ -1036,6 +1119,7 @@ class ClaudeUsageClient:
             seven_day=_parse_entry(data.get("seven_day")) or UsageEntry(),
             seven_day_sonnet=_parse_entry(data.get("seven_day_sonnet")),
             seven_day_opus=_parse_entry(data.get("seven_day_opus")),
+            model_limits=_parse_model_limits(data),
             extra_usage_enabled=bool(extra.get("is_enabled", False)),
             extra_usage_utilization=extra.get("utilization"),
             extra_usage_used_credits=extra.get("used_credits"),
@@ -1179,7 +1263,9 @@ class UsageLimitsWidget(QWidget):
     """Collapsible group containing the Claude usage limit bars."""
 
     _HEADER_H = 20
-    _EXPANDED_H = 176
+    _BAR_H = 44
+    _ESTIMATE_H = 16
+    _SPACING = 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1208,10 +1294,10 @@ class UsageLimitsWidget(QWidget):
         self.seven_day_bar = UsageBar("7-Day Window")
         layout.addWidget(self.seven_day_bar)
 
-        self.model_bar = UsageBar("Sonnet (7-Day)")
-        layout.addWidget(self.model_bar)
+        # One bar per model-scoped limit (Fable, Opus, ...), built on demand
+        # from UsageData.display_model_limits.
+        self.model_bars: list[UsageBar] = []
 
-        self._model_available = False
         self._update_children_visibility()
 
     def is_expanded(self) -> bool:
@@ -1236,36 +1322,45 @@ class UsageLimitsWidget(QWidget):
             data.seven_day.utilization,
             data.seven_day.time_remaining(),
         )
-
-        if data.seven_day_opus:
-            self.model_bar._label = "Opus (7-Day)"
-            self.model_bar.set_data(
-                data.seven_day_opus.utilization,
-                data.seven_day_opus.time_remaining(),
-            )
-            self._model_available = True
-        elif data.seven_day_sonnet:
-            self.model_bar._label = "Sonnet (7-Day)"
-            self.model_bar.set_data(
-                data.seven_day_sonnet.utilization,
-                data.seven_day_sonnet.time_remaining(),
-            )
-            self._model_available = True
-        else:
-            self._model_available = False
+        self._sync_model_bars(data.display_model_limits)
 
         self.estimate_label.setText(estimate)
         self._update_children_visibility()
         self.update()
+
+    def _sync_model_bars(self, limits: list[ModelLimit]):
+        labels = [
+            f"{ml.name} ({ml.window})" if ml.window else ml.name for ml in limits
+        ]
+        if labels != [bar._label for bar in self.model_bars]:
+            for bar in self.model_bars:
+                self.layout().removeWidget(bar)
+                bar.setParent(None)
+                bar.deleteLater()
+            self.model_bars = [UsageBar(label) for label in labels]
+            for bar in self.model_bars:
+                self.layout().addWidget(bar)
+        for bar, ml in zip(self.model_bars, limits):
+            bar.set_data(ml.entry.utilization, ml.entry.time_remaining())
+
+    def _expanded_height(self) -> int:
+        base = (
+            self._HEADER_H
+            + self._SPACING + self._BAR_H       # 5-hour bar
+            + self._SPACING + self._ESTIMATE_H  # pace estimate
+            + self._SPACING + self._BAR_H       # 7-day bar
+        )
+        return base + (self._SPACING + self._BAR_H) * len(self.model_bars)
 
     def _update_children_visibility(self):
         visible = self._expanded
         self.five_hour_bar.setVisible(visible)
         self.estimate_label.setVisible(visible and bool(self.estimate_label.text()))
         self.seven_day_bar.setVisible(visible)
-        self.model_bar.setVisible(visible and self._model_available)
+        for bar in self.model_bars:
+            bar.setVisible(visible)
         self._header.setText("Usage Limits ▾" if visible else "Usage Limits ▸")
-        self.setFixedHeight(self._EXPANDED_H if visible else self._HEADER_H)
+        self.setFixedHeight(self._expanded_height() if visible else self._HEADER_H)
 
     def mousePressEvent(self, event):
         self.toggle_expanded()
@@ -2684,6 +2779,17 @@ class ClaudeWidget(QWidget):
                 seven_day=UsageEntry(utilization=latest.seven_day_pct),
                 seven_day_sonnet=model_entry if latest.model_name == "sonnet" else None,
                 seven_day_opus=model_entry if latest.model_name == "opus" else None,
+                model_limits=(
+                    [
+                        ModelLimit(
+                            name=latest.model_name.title(),
+                            window="7-Day",
+                            entry=model_entry,
+                        )
+                    ]
+                    if latest.model_name not in ("opus", "sonnet", "unknown", "")
+                    else []
+                ),
                 fetched_at=latest.timestamp,
             )
             self._title_label.setText(self._usage.plan_name)
@@ -2744,7 +2850,6 @@ class ClaudeWidget(QWidget):
         self._five_hour_bar = self._usage_limits.five_hour_bar
         self._estimate_label = self._usage_limits.estimate_label
         self._seven_day_bar = self._usage_limits.seven_day_bar
-        self._model_bar = self._usage_limits.model_bar
         layout.addSpacing(2)
 
         # Graph separator
@@ -2971,9 +3076,14 @@ class ClaudeWidget(QWidget):
             self._graph.set_points(self._history.points)
             self._seed_stats_row_from_usage(data)
             save_last_usage(data)
+            scoped = "".join(
+                f" {ml.name.lower()}={ml.entry.utilization:.0f}%"
+                for ml in data.model_limits
+            )
             log_line(
                 f"fetch ok: 5h={data.five_hour.utilization:.0f}% "
-                f"7d={data.seven_day.utilization:.0f}% plan={data.plan_name}"
+                f"7d={data.seven_day.utilization:.0f}%{scoped} "
+                f"plan={data.plan_name}"
             )
         elif data.error:
             log_line(f"fetch error: {data.error}")

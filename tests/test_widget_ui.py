@@ -11,11 +11,16 @@ from PySide6.QtWidgets import QApplication
 
 from claude_widget import (
     ClaudeWidget,
+    ClaudeUsageClient,
     CodexUsageWorker,
     CodexUsageRow,
     CodexUsageSummary,
+    ModelLimit,
+    _parse_model_limits,
+    load_last_usage,
     read_latest_codex_rate_limit,
     read_codex_usage_summary,
+    save_last_usage,
     UsageData,
     UsageEntry,
     UsageLimitsWidget,
@@ -43,7 +48,10 @@ class WidgetUiTest(unittest.TestCase):
         self.assertFalse(widget.five_hour_bar.isHidden())
         self.assertFalse(widget.estimate_label.isHidden())
         self.assertFalse(widget.seven_day_bar.isHidden())
-        self.assertFalse(widget.model_bar.isHidden())
+        self.assertEqual(
+            [bar._label for bar in widget.model_bars], ["Sonnet (7-Day)"]
+        )
+        self.assertFalse(widget.model_bars[0].isHidden())
 
         widget.toggle_expanded()
 
@@ -52,7 +60,184 @@ class WidgetUiTest(unittest.TestCase):
         self.assertTrue(widget.five_hour_bar.isHidden())
         self.assertTrue(widget.estimate_label.isHidden())
         self.assertTrue(widget.seven_day_bar.isHidden())
-        self.assertTrue(widget.model_bar.isHidden())
+        self.assertTrue(widget.model_bars[0].isHidden())
+
+    _SCOPED_LIMITS_PAYLOAD = {
+        "five_hour": {"utilization": 9.0, "resets_at": "2026-07-04T14:39:59+00:00"},
+        "seven_day": {"utilization": 3.0, "resets_at": "2026-07-07T07:59:59+00:00"},
+        "seven_day_opus": None,
+        "seven_day_sonnet": None,
+        "extra_usage": {"is_enabled": False},
+        "limits": [
+            {
+                "kind": "session",
+                "group": "session",
+                "percent": 9,
+                "severity": "normal",
+                "resets_at": "2026-07-04T14:39:59+00:00",
+                "scope": None,
+                "is_active": True,
+            },
+            {
+                "kind": "weekly_all",
+                "group": "weekly",
+                "percent": 3,
+                "severity": "normal",
+                "resets_at": "2026-07-07T07:59:59+00:00",
+                "scope": None,
+                "is_active": False,
+            },
+            {
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 3,
+                "severity": "normal",
+                "resets_at": "2026-07-07T07:59:59+00:00",
+                "scope": {
+                    "model": {"id": None, "display_name": "Fable"},
+                    "surface": None,
+                },
+                "is_active": False,
+            },
+        ],
+    }
+
+    def test_parse_model_limits_extracts_model_scoped_entries_only(self):
+        limits = _parse_model_limits(self._SCOPED_LIMITS_PAYLOAD)
+
+        self.assertEqual(len(limits), 1)
+        self.assertEqual(limits[0].name, "Fable")
+        self.assertEqual(limits[0].window, "7-Day")
+        self.assertEqual(limits[0].entry.utilization, 3.0)
+        self.assertEqual(limits[0].entry.resets_at, "2026-07-07T07:59:59+00:00")
+
+    def test_fetch_populates_model_limits_from_limits_array(self):
+        client = ClaudeUsageClient()
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return WidgetUiTest._SCOPED_LIMITS_PAYLOAD
+
+        creds = {"accessToken": "token", "expiresAt": 4_102_444_800_000}
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=creds
+        ), patch("claude_widget.requests.get", return_value=FakeResponse()):
+            data = client.fetch()
+
+        self.assertEqual(data.error, "")
+        self.assertEqual([ml.name for ml in data.model_limits], ["Fable"])
+        self.assertEqual(data.model_name, "fable")
+        self.assertEqual(data.model_pct, 3.0)
+
+    def test_display_model_limits_merges_scoped_and_legacy_without_duplicates(self):
+        data = UsageData(
+            model_limits=[
+                ModelLimit(
+                    name="Fable", window="7-Day", entry=UsageEntry(utilization=3.0)
+                )
+            ],
+            seven_day_opus=UsageEntry(utilization=55.0),
+        )
+
+        self.assertEqual(
+            [(ml.name, ml.entry.utilization) for ml in data.display_model_limits],
+            [("Fable", 3.0), ("Opus", 55.0)],
+        )
+
+        deduped = UsageData(
+            model_limits=[
+                ModelLimit(
+                    name="Opus", window="7-Day", entry=UsageEntry(utilization=41.0)
+                )
+            ],
+            seven_day_opus=UsageEntry(utilization=55.0),
+        )
+        self.assertEqual(
+            [(ml.name, ml.entry.utilization) for ml in deduped.display_model_limits],
+            [("Opus", 41.0)],
+        )
+
+    def test_last_usage_round_trips_model_limits(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "last_usage.json"
+            saved = UsageData(
+                five_hour=UsageEntry(
+                    utilization=9.0, resets_at="2026-07-04T14:39:59+00:00"
+                ),
+                seven_day=UsageEntry(
+                    utilization=3.0, resets_at="2026-07-07T07:59:59+00:00"
+                ),
+                model_limits=[
+                    ModelLimit(
+                        name="Fable",
+                        window="7-Day",
+                        entry=UsageEntry(
+                            utilization=3.0, resets_at="2026-07-07T07:59:59+00:00"
+                        ),
+                    )
+                ],
+                fetched_at=1_783_158_609.0,
+            )
+            with patch("claude_widget.LAST_USAGE_PATH", path):
+                save_last_usage(saved)
+                loaded = load_last_usage()
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual([ml.name for ml in loaded.model_limits], ["Fable"])
+        self.assertEqual(loaded.model_limits[0].window, "7-Day")
+        self.assertEqual(loaded.model_limits[0].entry.utilization, 3.0)
+        self.assertEqual(
+            loaded.model_limits[0].entry.resets_at, "2026-07-07T07:59:59+00:00"
+        )
+
+    def test_usage_limits_widget_builds_one_bar_per_model_limit(self):
+        widget = UsageLimitsWidget()
+        widget.set_data(
+            UsageData(
+                five_hour=UsageEntry(utilization=9.0),
+                seven_day=UsageEntry(utilization=3.0),
+                model_limits=[
+                    ModelLimit(
+                        name="Fable",
+                        window="7-Day",
+                        entry=UsageEntry(utilization=3.0),
+                    )
+                ],
+            )
+        )
+
+        self.assertEqual([bar._label for bar in widget.model_bars], ["Fable (7-Day)"])
+        self.assertEqual(widget.model_bars[0]._pct, 3.0)
+        self.assertFalse(widget.model_bars[0].isHidden())
+        self.assertEqual(widget.height(), 176)
+
+        widget.toggle_expanded()
+        self.assertTrue(widget.model_bars[0].isHidden())
+
+    def test_usage_limits_widget_rebuilds_bars_when_limits_change(self):
+        widget = UsageLimitsWidget()
+        fable = ModelLimit(
+            name="Fable", window="7-Day", entry=UsageEntry(utilization=3.0)
+        )
+        opus = ModelLimit(
+            name="Opus", window="7-Day", entry=UsageEntry(utilization=41.0)
+        )
+
+        widget.set_data(UsageData(model_limits=[fable]))
+        self.assertEqual([bar._label for bar in widget.model_bars], ["Fable (7-Day)"])
+
+        widget.set_data(UsageData(model_limits=[opus, fable]))
+        self.assertEqual(
+            [bar._label for bar in widget.model_bars],
+            ["Opus (7-Day)", "Fable (7-Day)"],
+        )
+        self.assertEqual(widget.height(), 222)
+
+        widget.set_data(UsageData())
+        self.assertEqual(widget.model_bars, [])
+        self.assertEqual(widget.height(), 130)
 
     def _make_inert_claude_widget(self):
         patches = [
@@ -71,6 +256,28 @@ class WidgetUiTest(unittest.TestCase):
         widget = ClaudeWidget()
         self.addCleanup(widget.deleteLater)
         return widget
+
+    def test_widget_grows_when_model_limit_bar_appears(self):
+        widget = self._make_inert_claude_widget()
+        widget.show()
+        widget._usage_limits.set_data(UsageData())
+        QApplication.processEvents()
+        before = widget.height()
+
+        widget._usage_limits.set_data(
+            UsageData(
+                model_limits=[
+                    ModelLimit(
+                        name="Fable",
+                        window="7-Day",
+                        entry=UsageEntry(utilization=3.0),
+                    )
+                ]
+            )
+        )
+        QApplication.processEvents()
+
+        self.assertGreater(widget.height(), before)
 
     def test_claude_header_minimize_button_hides_to_tray(self):
         widget = self._make_inert_claude_widget()
