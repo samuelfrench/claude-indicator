@@ -247,6 +247,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_fetch_runners", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_task_loops", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_task_groups", lambda self: None),
+            patch.object(ClaudeWidget, "_fetch_cron_jobs", lambda self: None),
             patch.object(ClaudeWidget, "_update_system_metrics", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
         ]

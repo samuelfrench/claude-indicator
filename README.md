@@ -11,6 +11,7 @@ A translucent desktop widget for Linux that displays your Claude Code Max subscr
 - **Real-time usage tracking** — monitors 5-hour and 7-day rate limit windows
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
 - **Codex limit percentage** — shows current Codex 5-hour usage percentage, 7-day percentage, latest-thread tokens, and lifetime local totals from cached local Codex state
+- **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
 - **Live countdown timers** — shows time remaining until each window resets
 - **Always-on-top translucent widget** — frameless, draggable, stays visible over other windows
@@ -23,8 +24,21 @@ The widget displays a dark translucent overlay with:
 - "CLAUDE MAX" header in warm gold
 - Up to 3 progress bars (5-Hour Window, 7-Day Window, Model-specific 7-Day)
 - A compact `CODEX` row with current Codex limit percentage and local usage totals
+- `CRON JOBS` row that collapses to one line and expands to show per-job status and timing
 - Percentage and reset countdown on each bar
 - Last-updated timestamp and manual refresh button
+
+## Cron Manager behavior
+
+- **What appears**: one collapsed row labeled `CRON JOBS` with a late-job count summary
+- **Expand**: click the row to expand a compact list of user cron jobs
+- **Job status meanings**:
+  - `ok` — matched a recent journal execution for the expected previous schedule slot (with 180s grace)
+  - `late` — cron job is overdue relative to the expected next/previous run window within the available journal history
+  - `unknown` — no reliable evidence in the collected 48h journal window
+- **Per job fields**: label (from inline/full-line comments or fallback to command), schedule, last run age (`just now`, `Xm ago`, `Xh ago`, `Xd ago`), and next run estimate for common 5-field cron patterns
+- **Data source**: `crontab -l` for job definitions and `journalctl _COMM=cron` for command execution history
+- **Refresh interval**: every 5 minutes
 
 ## Prerequisites
 
@@ -84,7 +98,8 @@ LD_LIBRARY_PATH=/path/to/miniconda3/lib python claude_widget.py
 2. **Refreshes the access token** if it's within 5 minutes of expiry, using the OAuth refresh flow
 3. **Fetches usage data** from `GET https://api.anthropic.com/api/oauth/usage` with the `anthropic-beta: oauth-2025-04-20` header
 4. **Reads local Codex usage** from `~/.codex/state_*.sqlite` and cached session `token_count` events under `~/.codex/sessions/`
-5. **Renders the widget** using PySide6 with custom-painted progress bars and translucent background
+5. **Builds cron health** from `crontab -l` plus `journalctl` execution logs, using command equality and local-time schedule prediction
+6. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, and collapsible custom rows
 
 ### Architecture
 
@@ -96,6 +111,9 @@ The entire application is a single file (`claude_widget.py`) with these componen
 | `FetchWorker` | QThread that fetches usage data off the main thread |
 | `UsageBar` | Custom-painted widget for a single progress bar with label, percentage, and countdown |
 | `CodexUsageRow` | Custom-painted summary row backed by local Codex SQLite state and cached rate-limit events |
+| `CronJobsWidget` | Collapsible row showing per-job cron health, last run age, and next run estimate |
+| `CronJobsFetchWorker`, `CronJobInfo` | Background worker and model used to parse crontab + journal history |
+| `Cron parsing helpers` | Parsers for `crontab -l`, schedule matching, and journal matching |
 | `ClaudeWidget` | Main frameless, translucent, always-on-top widget with drag support |
 | `UsageData` / `UsageEntry` | Dataclasses modeling the API response |
 

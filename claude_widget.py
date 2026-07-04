@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Translucent desktop widget showing Claude usage plus local Codex totals."""
 
+import getpass
 import json
 import os
 import re
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -57,6 +58,9 @@ RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_GROUP_REFRESH_MS = 60 * 1000  # 60 seconds
 CODEX_REFRESH_MS = 15 * 1000  # 15 seconds
+CRON_REFRESH_MS = 5 * 60 * 1000  # 5 minutes — crontab/journal state changes slowly
+CRON_JOURNAL_WINDOW_HOURS = 48
+CRON_LATE_GRACE_S = 180  # allow journal lag before flagging a run as missed
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 CODEX_RATE_LIMIT_SCAN_FILES = 20
 CODEX_RATE_LIMIT_TAIL_BYTES = 4 * 1024 * 1024
@@ -246,6 +250,43 @@ class TaskGroupInfo:
         if elapsed < 86400:
             return f"{int(elapsed // 3600)}h ago"
         return f"{int(elapsed // 86400)}d ago"
+
+
+@dataclass
+class CronJobInfo:
+    """One user crontab entry plus run history recovered from the journal."""
+    label: str
+    schedule: str
+    command: str
+    last_run_ts: float | None = None
+    runs_24h: int = 0
+    next_run_ts: float | None = None
+    status: str = "unknown"  # ok | late | unknown
+    error: str = ""
+
+    def last_run_str(self) -> str:
+        if self.last_run_ts is None:
+            return "no runs" if self.status == "late" else "n/a"
+        elapsed = time.time() - self.last_run_ts
+        if elapsed < 60:
+            return "just now"
+        if elapsed < 3600:
+            return f"{int(elapsed // 60)}m ago"
+        if elapsed < 86400:
+            return f"{int(elapsed // 3600)}h ago"
+        return f"{int(elapsed // 86400)}d ago"
+
+    def next_run_str(self) -> str:
+        if self.next_run_ts is None:
+            return ""
+        remaining = self.next_run_ts - time.time()
+        if remaining <= 0:
+            return "next: now"
+        if remaining < 3600:
+            return f"next {int(remaining // 60)}m"
+        if remaining < 86400:
+            return f"next {int(remaining // 3600)}h"
+        return f"next {int(remaining // 86400)}d"
 
 
 @dataclass
@@ -1020,6 +1061,269 @@ def fetch_task_groups() -> list[TaskGroupInfo]:
 
 
 # ---------------------------------------------------------------------------
+# Cron job manager
+# ---------------------------------------------------------------------------
+
+_CRON_ALIASES = {
+    "@hourly": "0 * * * *",
+    "@daily": "0 0 * * *",
+    "@midnight": "0 0 * * *",
+    "@weekly": "0 0 * * 0",
+    "@monthly": "0 0 1 * *",
+    "@yearly": "0 0 1 1 *",
+    "@annually": "0 0 1 1 *",
+}
+_CRON_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=")
+_CRON_JOURNAL_CMD_RE = re.compile(r"^\((?P<user>[^)]+)\) CMD \((?P<cmd>.*)\)\s*$")
+
+
+def parse_crontab_text(text: str) -> list[CronJobInfo]:
+    """Parse `crontab -l` output into jobs.
+
+    Labels come from a trailing inline `# comment`, else the nearest full-line
+    comment above (cleared by blank lines), else the command itself. The
+    command keeps its inline comment verbatim because cron logs it that way.
+    """
+    jobs: list[CronJobInfo] = []
+    pending_comment = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            pending_comment = ""
+            continue
+        if line.startswith("#"):
+            pending_comment = line.lstrip("#").strip()
+            continue
+        if _CRON_ENV_RE.match(line):
+            continue
+        if line.startswith("@"):
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            schedule, command = parts[0], parts[1]
+        else:
+            parts = line.split(None, 5)
+            if len(parts) < 6:
+                continue
+            schedule, command = " ".join(parts[:5]), parts[5]
+
+        label = ""
+        if " #" in command:
+            head, _, tail = command.rpartition(" #")
+            if head.strip() and tail.strip():
+                label = tail.strip()
+        if not label:
+            label = pending_comment or command.strip()
+        jobs.append(CronJobInfo(label=label, schedule=schedule, command=command))
+    return jobs
+
+
+def _parse_cron_field(field_text: str, lo: int, hi: int, dow: bool = False) -> set[int]:
+    values: set[int] = set()
+    for part in field_text.split(","):
+        step = 1
+        if "/" in part:
+            part, step_text = part.split("/", 1)
+            step = max(1, int(step_text))
+        if part in ("*", ""):
+            start, end = lo, hi
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a), int(b)
+        else:
+            start = end = int(part)
+        values.update(v for v in range(start, end + 1) if (v - start) % step == 0)
+    if dow:
+        values = {0 if v == 7 else v for v in values}
+    return {v for v in values if lo <= v <= hi}
+
+
+def _parse_cron_schedule(schedule: str):
+    """Return (minutes, hours, doms, months, dows, dom_star, dow_star) or None."""
+    schedule = _CRON_ALIASES.get(schedule, schedule)
+    fields = schedule.split()
+    if len(fields) != 5:
+        return None
+    try:
+        return (
+            _parse_cron_field(fields[0], 0, 59),
+            _parse_cron_field(fields[1], 0, 23),
+            _parse_cron_field(fields[2], 1, 31),
+            _parse_cron_field(fields[3], 1, 12),
+            _parse_cron_field(fields[4], 0, 6, dow=True),
+            fields[2] == "*",
+            fields[4] == "*",
+        )
+    except ValueError:
+        return None
+
+
+def _cron_day_matches(d: date, parsed) -> bool:
+    _, _, doms, months, dows, dom_star, dow_star = parsed
+    if d.month not in months:
+        return False
+    dom_ok = d.day in doms
+    dow_ok = (d.weekday() + 1) % 7 in dows  # cron: Sunday=0
+    if dom_star and dow_star:
+        return True
+    if dom_star:
+        return dow_ok
+    if dow_star:
+        return dom_ok
+    return dom_ok or dow_ok  # standard cron OR semantics when both restricted
+
+
+def cron_next_fire(schedule: str, after: datetime) -> datetime | None:
+    """First scheduled fire strictly after `after` (local time), or None."""
+    parsed = _parse_cron_schedule(schedule)
+    if parsed is None:
+        return None
+    minutes, hours = sorted(parsed[0]), sorted(parsed[1])
+    start = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for offset in range(0, 367):
+        d = (start + timedelta(days=offset)).date() if offset else start.date()
+        if not _cron_day_matches(d, parsed):
+            continue
+        floor = start if d == start.date() else None
+        for h in hours:
+            for m in minutes:
+                candidate = datetime(d.year, d.month, d.day, h, m)
+                if floor is None or candidate >= floor:
+                    return candidate
+    return None
+
+
+def cron_prev_fire(schedule: str, before: datetime) -> datetime | None:
+    """Most recent scheduled fire at or before `before` (local time), or None."""
+    parsed = _parse_cron_schedule(schedule)
+    if parsed is None:
+        return None
+    minutes, hours = sorted(parsed[0], reverse=True), sorted(parsed[1], reverse=True)
+    end = before.replace(second=0, microsecond=0)
+    for offset in range(0, 367):
+        d = (end - timedelta(days=offset)).date()
+        if not _cron_day_matches(d, parsed):
+            continue
+        ceiling = end if d == end.date() else None
+        for h in hours:
+            for m in minutes:
+                candidate = datetime(d.year, d.month, d.day, h, m)
+                if ceiling is None or candidate <= ceiling:
+                    return candidate
+    return None
+
+
+def _parse_cron_journal_line(line: str, user: str) -> tuple[float, str] | None:
+    """Parse one `journalctl -o short-unix` CRON line into (ts, command)."""
+    parts = line.split(None, 3)
+    if len(parts) < 4 or not parts[2].startswith("CRON["):
+        return None
+    try:
+        ts = float(parts[0])
+    except ValueError:
+        return None
+    m = _CRON_JOURNAL_CMD_RE.match(parts[3])
+    if not m or m.group("user") != user:
+        return None
+    return ts, m.group("cmd").strip()
+
+
+def _read_user_crontab() -> str:
+    try:
+        return subprocess.check_output(
+            ["crontab", "-l"], text=True, timeout=5, stderr=subprocess.DEVNULL
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def _read_cron_journal_entries(
+    since_hours: int = CRON_JOURNAL_WINDOW_HOURS,
+) -> list[tuple[float, str]]:
+    try:
+        out = subprocess.check_output(
+            [
+                "journalctl", "_COMM=cron", "--no-pager", "-o", "short-unix",
+                "--since", f"-{since_hours}h", "-q",
+            ],
+            text=True, timeout=15, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    user = getpass.getuser()
+    entries = []
+    for line in out.splitlines():
+        parsed = _parse_cron_journal_line(line, user)
+        if parsed:
+            entries.append(parsed)
+    return entries
+
+
+def _system_boot_ts() -> float:
+    try:
+        with open("/proc/uptime") as f:
+            return time.time() - float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def attach_cron_run_history(
+    jobs: list[CronJobInfo],
+    entries: list[tuple[float, str]],
+    now: float,
+    journal_start: float,
+    boot_ts: float,
+) -> None:
+    """Fill last_run_ts / runs_24h / next_run_ts / status from journal entries."""
+    now_dt = datetime.fromtimestamp(now)
+    for job in jobs:
+        cmd = job.command.strip()
+        runs = [ts for ts, entry_cmd in entries if entry_cmd == cmd]
+        if runs:
+            job.last_run_ts = max(runs)
+            job.runs_24h = sum(1 for ts in runs if ts >= now - 86400)
+
+        if job.schedule == "@reboot":
+            if job.last_run_ts is not None and job.last_run_ts >= boot_ts - CRON_LATE_GRACE_S:
+                job.status = "ok"
+            elif boot_ts >= journal_start:
+                job.status = "late"
+            else:
+                job.status = "unknown"
+            continue
+
+        next_dt = cron_next_fire(job.schedule, now_dt)
+        job.next_run_ts = next_dt.timestamp() if next_dt else None
+        prev_dt = cron_prev_fire(job.schedule, now_dt)
+        if prev_dt is None:
+            job.status = "unknown"
+            continue
+        prev_ts = prev_dt.timestamp()
+        if job.last_run_ts is not None and job.last_run_ts >= prev_ts - CRON_LATE_GRACE_S:
+            job.status = "ok"
+        elif prev_ts >= journal_start:
+            job.status = "late"
+        else:
+            job.status = "unknown"
+
+
+def fetch_cron_jobs() -> list[CronJobInfo]:
+    """Read the user crontab and score each job's health from the journal."""
+    jobs = parse_crontab_text(_read_user_crontab())
+    if not jobs:
+        return []
+    now = time.time()
+    attach_cron_run_history(
+        jobs,
+        _read_cron_journal_entries(),
+        now,
+        now - CRON_JOURNAL_WINDOW_HOURS * 3600,
+        _system_boot_ts(),
+    )
+    return jobs
+
+
+# ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
 
@@ -1171,6 +1475,18 @@ class TaskGroupFetchWorker(QThread):
     def run(self):
         groups = fetch_task_groups()
         self.finished.emit(groups)
+
+
+class CronJobsFetchWorker(QThread):
+    finished = Signal(list)
+
+    def __init__(self, fetcher=None):
+        super().__init__()
+        self._fetcher = fetcher
+
+    def run(self):
+        fetcher = self._fetcher or fetch_cron_jobs
+        self.finished.emit(fetcher())
 
 
 class CodexUsageWorker(QThread):
@@ -2549,6 +2865,123 @@ class TaskGroupWidget(QWidget):
         p.end()
 
 
+class CronJobsWidget(QWidget):
+    """Collapsible row showing user crontab jobs with per-job run health."""
+
+    _HEADER_H = 22
+    _ROW_H = 18
+    _PAD = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._jobs: list[CronJobInfo] = []
+        self._expanded = False
+        self.setFixedHeight(0)
+        self.hide()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, jobs: list[CronJobInfo]):
+        self._jobs = jobs
+        if jobs:
+            self._update_height()
+            self.setToolTip(
+                "\n".join(f"{j.schedule}  {j.command}" for j in jobs)
+            )
+            self.show()
+        else:
+            self.setFixedHeight(0)
+            self.setToolTip("")
+            self.hide()
+        self.update()
+
+    def _update_height(self):
+        if not self._jobs:
+            self.setFixedHeight(0)
+            return
+        if self._expanded:
+            h = self._HEADER_H + self._ROW_H * len(self._jobs) + self._PAD
+        else:
+            h = self._HEADER_H
+        self.setFixedHeight(h)
+
+    def mousePressEvent(self, event):
+        if not self._jobs:
+            return
+        self._expanded = not self._expanded
+        self._update_height()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+        event.accept()
+
+    def _summary_text(self) -> str:
+        late = sum(1 for j in self._jobs if j.status == "late")
+        if late:
+            return f"{len(self._jobs)} jobs · {late} late"
+        return f"{len(self._jobs)} jobs · all ok"
+
+    @staticmethod
+    def _status_color(status: str) -> QColor:
+        if status == "ok":
+            return QColor(34, 197, 94)  # green
+        if status == "late":
+            return QColor(239, 68, 68)  # red
+        return QColor(120, 120, 150)  # gray — unknown/no data
+
+    def paintEvent(self, event):
+        if not self._jobs:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        y = 14
+        arrow = "▾" if self._expanded else "▸"
+        p.setPen(QColor(100, 100, 120))
+        header_text = f"CRON JOBS {arrow}"
+        p.drawText(4, y, header_text)
+
+        if not self._expanded:
+            x = 4 + fm.horizontalAdvance(header_text) + 8
+            late = any(j.status == "late" for j in self._jobs)
+            p.setPen(self._status_color("late" if late else "ok"))
+            p.drawText(x, y, self._summary_text())
+            p.end()
+            return
+
+        for i, job in enumerate(self._jobs):
+            row_y = self._HEADER_H + self._ROW_H * i + 13
+
+            # Right side: last run (health-colored) plus next run (dim)
+            last_str = job.last_run_str()
+            next_str = job.next_run_str()
+            right = last_str if not next_str else f"{last_str} · {next_str}"
+            rw = fm.horizontalAdvance(right)
+            if next_str:
+                nx = w - 4 - fm.horizontalAdvance(f" · {next_str}")
+                p.setPen(QColor(100, 100, 130))
+                p.drawText(nx, row_y, f" · {next_str}")
+            p.setPen(self._status_color(job.status))
+            p.drawText(w - rw - 4, row_y, last_str)
+
+            # Left side: label elided to the remaining space
+            label = fm.elidedText(
+                job.label, Qt.TextElideMode.ElideRight, w - rw - 20
+            )
+            p.setPen(QColor(180, 180, 200))
+            p.drawText(8, row_y, label)
+
+        p.end()
+
+
 class SystemMetricsRow(QWidget):
     """Collapsible row showing CPU, RAM, and GPU system metrics."""
 
@@ -2719,6 +3152,7 @@ class ClaudeWidget(QWidget):
         self._runner_worker: RunnerFetchWorker | None = None
         self._task_loop_worker: TaskLoopFetchWorker | None = None
         self._task_group_worker: TaskGroupFetchWorker | None = None
+        self._cron_worker: CronJobsFetchWorker | None = None
         self._codex_worker: CodexUsageWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
@@ -2746,6 +3180,7 @@ class ClaudeWidget(QWidget):
         self._fetch_runners()
         self._fetch_task_loops()
         self._fetch_task_groups()
+        self._fetch_cron_jobs()
 
         # Initial system metrics read so widget isn't blank
         self._update_system_metrics()
@@ -2927,6 +3362,10 @@ class ClaudeWidget(QWidget):
         self._task_group_row = TaskGroupWidget()
         layout.addWidget(self._task_group_row)
 
+        # Cron job manager row
+        self._cron_row = CronJobsWidget()
+        layout.addWidget(self._cron_row)
+
         # System metrics row
         self._sys_row = SystemMetricsRow()
         layout.addWidget(self._sys_row)
@@ -2991,6 +3430,11 @@ class ClaudeWidget(QWidget):
         self._task_group_timer = QTimer(self)
         self._task_group_timer.timeout.connect(self._fetch_task_groups)
         self._task_group_timer.start(TASK_GROUP_REFRESH_MS)
+
+        # Cron jobs timer - every 5 minutes
+        self._cron_timer = QTimer(self)
+        self._cron_timer.timeout.connect(self._fetch_cron_jobs)
+        self._cron_timer.start(CRON_REFRESH_MS)
 
         # System metrics timer - every 3 seconds
         self._sys_timer = QTimer(self)
@@ -3242,6 +3686,17 @@ class ClaudeWidget(QWidget):
         self._task_group_worker = TaskGroupFetchWorker()
         self._task_group_worker.finished.connect(self._on_task_groups_fetched)
         self._task_group_worker.start()
+
+    def _fetch_cron_jobs(self):
+        if self._cron_worker and self._cron_worker.isRunning():
+            return
+        self._cron_worker = CronJobsFetchWorker()
+        self._cron_worker.finished.connect(self._on_cron_jobs_fetched)
+        self._cron_worker.start()
+
+    def _on_cron_jobs_fetched(self, jobs: list):
+        self._cron_row.set_data(jobs)
+        self.adjustSize()
 
     def _on_task_groups_fetched(self, groups: list):
         self._task_group_row.set_data(groups)
