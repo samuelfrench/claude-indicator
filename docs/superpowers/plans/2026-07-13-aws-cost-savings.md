@@ -17,6 +17,7 @@
 - Create empty Cloudflare Free zones for `mergepdfnow.com`, `image-ocean.com`, `pic-ocean.com`, and `samfrenchprogramming.com` using stored credentials, with no subscription purchase, and change registrar nameservers to the assigned Cloudflare pair before deleting any corresponding Route 53 zone.
 - Do not delete an active Route 53 zone until at least 48 hours after its registrar operation succeeds. The `.com` parent NS TTL is 172800 seconds, so the unchanged Route 53 source zone must continue serving throughout that overlap.
 - Delayed active-zone cleanup must fail closed: if Cloudflare status, registrar/TLD/public nameservers, full record-manifest parity, HTTPS, or mail-sensitive-record checks fail or cannot be completed, leave the Route 53 zone intact.
+- For `mergepdfnow.com` only, while the registrar's verified status remains `clientHold`, parent/TLD and public delegation are intentionally suppressed and Cloudflare may remain `pending`. Before deleting its Route 53 zone, require the registrar to store the exact assigned Cloudflare nameserver pair, require both assigned Cloudflare nameservers to answer the empty zone authoritatively when queried directly, and require parent/public DNS to remain undelegated as expected. If `clientHold` disappears, the registrar still shows AWS nameservers, either assigned Cloudflare nameserver does not answer authoritatively, or unexpected public delegation appears, leave the Route 53 zone intact. Do not apply this exception to any other dead or active domain.
 - Disable auto-renew only for `mergepdfnow.com`, `pic-ocean.com`, `samfrenchprogramming.com`, and `image-ocean.com`.
 - Use test-first development for production Python changes; commit and push all repository changes.
 - Do not request or print credentials. Load existing tokens from `~/.env` without echoing values.
@@ -372,8 +373,16 @@ Using stored credentials, create empty Cloudflare Free zones for exactly
 content records. For each zone, record the assigned Cloudflare nameserver pair,
 change the registrar nameservers to that exact pair, require the registrar
 operation to succeed, and recheck Cloudflare status plus registrar,
-TLD-authoritative, and public nameservers. Do not delete any corresponding
-Route 53 zone before those delegation checks pass. `mycoffeeexplorer.com`
+TLD-authoritative, and public nameservers. Apply the Global Constraints
+`clientHold` exception only to `mergepdfnow.com`: while the verified hold
+remains, require the registrar to store the assigned Cloudflare pair, query
+both assigned Cloudflare nameservers directly and require authoritative
+empty-zone answers, and require parent/public DNS to remain undelegated; a
+`pending` Cloudflare status is acceptable only in that state. Fail closed and
+keep the Route 53 zone if the hold disappears, the registrar still shows AWS
+nameservers, either direct authoritative check fails, or unexpected public
+delegation appears. Do not delete any corresponding Route 53 zone before its
+applicable delegation or `clientHold` gate passes. `mycoffeeexplorer.com`
 requires no new zone because it is already safely authoritative on Cloudflare.
 
 - [ ] **Step 3: Disable four renewals**
@@ -383,7 +392,8 @@ Run `disable-domain-auto-renew` for exactly the four domain names in Global Cons
 - [ ] **Step 4: Delete three hosted zones**
 
 Reconfirm that `mycoffeeexplorer.com` remains authoritative on Cloudflare and
-that the parking gate passed for `mergepdfnow.com` and `image-ocean.com`. For
+that the applicable parking gate passed for `mergepdfnow.com` and
+`image-ocean.com`. For
 each of those three exact zones, delete every non-NS/SOA record in a single
 Route 53 change batch, wait for `INSYNC`, then delete the hosted zone. Verify it
 is absent by both ID and zone-name listing.

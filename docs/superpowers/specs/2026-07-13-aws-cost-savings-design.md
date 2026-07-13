@@ -45,6 +45,19 @@ Reduce recurring AWS spend without stopping the production Lightsail WordPress s
 3. Require the registrar operation to succeed, Cloudflare to recognize the zone, and registrar, TLD-authoritative, and public nameserver checks to return the assigned pair.
 4. Only after those checks pass may any corresponding Route 53 zone be emptied and deleted. `mycoffeeexplorer.com` is already safely authoritative on Cloudflare and requires the same authority recheck before its stale Route 53 zone is deleted.
 
+`mergepdfnow.com` has one narrow exception to step 3 while its verified registrar
+status remains `clientHold`: the hold intentionally suppresses parent/TLD and
+public delegation, and Cloudflare may remain `pending` until the hold is
+removed. Before deleting its Route 53 zone, require the registrar to store the
+exact assigned Cloudflare nameserver pair, require both assigned Cloudflare
+nameservers to answer the empty zone authoritatively when queried directly,
+and require parent/public DNS to remain undelegated as expected. Fail closed
+and leave the Route 53 zone intact if `clientHold` disappears, the registrar
+still shows AWS nameservers, either assigned Cloudflare nameserver does not
+answer authoritatively, or unexpected public delegation appears. This
+exception applies only to `mergepdfnow.com`; it does not weaken the parking
+gate for any other dead domain or any active-domain migration gate.
+
 ### Active DNS cutover
 
 1. Export Route 53 records and capture pre-change public DNS/HTTP evidence.
