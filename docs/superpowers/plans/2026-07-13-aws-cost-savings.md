@@ -4,7 +4,7 @@
 
 **Goal:** Execute the approved Route 53, S3, snapshot, DynamoDB, and domain-renewal savings while preserving production services and proving every resulting state.
 
-**Architecture:** External changes use one-resource-at-a-time preflight, mutation, and authoritative readback. The only source change is isolated in `claude-indicator`: its task-loop row becomes local-config-only and is developed test-first. DNS changes are staged through Cloudflare with proxying disabled and verified before each Route 53 zone is deleted.
+**Architecture:** External changes use one-resource-at-a-time preflight, mutation, and authoritative readback. The only source change is isolated in `claude-indicator`: its task-loop row becomes local-config-only and is developed test-first. Dead registrations are parked on empty Cloudflare Free zones before any corresponding AWS zone is deleted. Active DNS changes are staged through Cloudflare with proxying disabled, verified at cutover, kept in dual-provider overlap for at least 48 hours, and verified again before delayed Route 53 cleanup.
 
 **Tech Stack:** AWS CLI v2, Cloudflare v4 API, Bash/JQ, Python 3.13, PySide6, unittest, Git/GitHub.
 
@@ -14,7 +14,9 @@
 - Keep `FrenchProgrammingBlog-New` running on Lightsail; do not modify its plan, IPs, disk, or DNS target.
 - Never delete S3 payloads. Preserve SSE-S3 and all four public-access-block settings.
 - Cloudflare migrated records must remain DNS-only (`proxied=false`) during cutover.
-- Do not delete an active Route 53 zone until public delegation and representative A/AAAA/CNAME/MX/TXT answers pass through Cloudflare.
+- Create empty Cloudflare Free zones for `mergepdfnow.com`, `image-ocean.com`, `pic-ocean.com`, and `samfrenchprogramming.com` using stored credentials, with no subscription purchase, and change registrar nameservers to the assigned Cloudflare pair before deleting any corresponding Route 53 zone.
+- Do not delete an active Route 53 zone until at least 48 hours after its registrar operation succeeds. The `.com` parent NS TTL is 172800 seconds, so the unchanged Route 53 source zone must continue serving throughout that overlap.
+- Delayed active-zone cleanup must fail closed: if Cloudflare status, registrar/TLD/public nameservers, full record-manifest parity, HTTPS, or mail-sensitive-record checks fail or cannot be completed, leave the Route 53 zone intact.
 - Disable auto-renew only for `mergepdfnow.com`, `pic-ocean.com`, `samfrenchprogramming.com`, and `image-ocean.com`.
 - Use test-first development for production Python changes; commit and push all repository changes.
 - Do not request or print credentials. Load existing tokens from `~/.env` without echoing values.
@@ -348,27 +350,43 @@ aws rds delete-db-snapshot --region us-east-1 --db-snapshot-identifier acloudgur
 
 Poll until neither exact snapshot is returned. Re-read `FrenchProgrammingBlog-New` and require state `running`.
 
-### Task 5: Retire dead domains and their Route 53 zones
+### Task 5: Park and retire dead domains and their Route 53 zones
 
 **Files:**
 - No repository source files
 - Private DNS exports stored under `/home/sam/.codex/artifacts/aws-cost-savings-2026-07-13/`
 
 **Interfaces:**
-- Consumes: live Route 53 Domains state and three stale/retired hosted zones
-- Produces: four domains with auto-renew disabled and three hosted zones absent
+- Consumes: live Route 53 Domains state, existing Cloudflare account state, and three stale/retired hosted zones
+- Produces: four safely parked registrations with auto-renew disabled and three hosted zones absent
 
 - [ ] **Step 1: Export records and re-check public state**
 
-Export the record sets for `mycoffeeexplorer.com`, `mergepdfnow.com`, and `image-ocean.com`. Confirm Coffee is publicly delegated to Cloudflare, Merge has no public delegation, and Image Ocean remains an intentionally retired broken endpoint.
+Export the record sets for `mycoffeeexplorer.com`, `mergepdfnow.com`, and `image-ocean.com`. Confirm Coffee is already publicly delegated to Cloudflare, Merge has no public delegation, and Image Ocean remains an intentionally retired broken endpoint.
 
-- [ ] **Step 2: Disable four renewals**
+- [ ] **Step 2: Park four dead registrations on Cloudflare Free**
+
+Using stored credentials, create empty Cloudflare Free zones for exactly
+`mergepdfnow.com`, `image-ocean.com`, `pic-ocean.com`, and
+`samfrenchprogramming.com`. Do not purchase a subscription and do not add
+content records. For each zone, record the assigned Cloudflare nameserver pair,
+change the registrar nameservers to that exact pair, require the registrar
+operation to succeed, and recheck Cloudflare status plus registrar,
+TLD-authoritative, and public nameservers. Do not delete any corresponding
+Route 53 zone before those delegation checks pass. `mycoffeeexplorer.com`
+requires no new zone because it is already safely authoritative on Cloudflare.
+
+- [ ] **Step 3: Disable four renewals**
 
 Run `disable-domain-auto-renew` for exactly the four domain names in Global Constraints, then require `AutoRenew=false` from `get-domain-detail`.
 
-- [ ] **Step 3: Delete three hosted zones**
+- [ ] **Step 4: Delete three hosted zones**
 
-For each exact zone, delete every non-NS/SOA record in a single Route 53 change batch, wait for `INSYNC`, then delete the hosted zone. Verify it is absent by both ID and zone-name listing.
+Reconfirm that `mycoffeeexplorer.com` remains authoritative on Cloudflare and
+that the parking gate passed for `mergepdfnow.com` and `image-ocean.com`. For
+each of those three exact zones, delete every non-NS/SOA record in a single
+Route 53 change batch, wait for `INSYNC`, then delete the hosted zone. Verify it
+is absent by both ID and zone-name listing.
 
 ### Task 6: Migrate 16 active Route 53 zones to Cloudflare
 
@@ -378,7 +396,7 @@ For each exact zone, delete every non-NS/SOA record in a single Route 53 change 
 
 **Interfaces:**
 - Consumes: Route 53 record sets, existing Cloudflare account, Route 53 Domains registrar control
-- Produces: Cloudflare-authoritative DNS with matching records and no remaining Route 53 hosted zones
+- Produces: Cloudflare-authoritative DNS with matching records, a full 48-hour source-provider overlap, and no remaining Route 53 hosted zones after delayed cleanup
 
 - [ ] **Step 1: Validate Cloudflare zone-creation authorization**
 
@@ -386,7 +404,13 @@ Load `CLOUDFLARE_API_TOKEN` from `~/.env` without printing it and create the fir
 
 - [ ] **Step 2: Migrate one canary zone**
 
-Use `imgstopdf.com` as the simple active canary without mail. Create all non-NS/SOA records with `proxied=false`, compare manifests, update registrar nameservers, verify public delegation and endpoints, then delete its Route 53 zone.
+Use `imgstopdf.com` as the simple active canary without mail. Create all
+non-NS/SOA records with `proxied=false`, compare manifests, update registrar
+nameservers, and record when the registrar operation succeeds. Perform the
+immediate Cloudflare-status, registrar/TLD/public-nameserver, full-manifest,
+HTTPS, and endpoint checks, but do not delete its Route 53 zone. Keep the
+unchanged source zone serving for at least 48 hours from the successful
+registrar operation.
 
 - [ ] **Step 3: Migrate the remaining zones one at a time**
 
@@ -412,11 +436,28 @@ rvappliancefaultcodes.com
 
 Translate Route 53 aliases in `lotsheets.com` and
 `seedgardenexplorer.com` to DNS-only CNAME records and verify Cloudflare
-flattening at the apex.
+flattening at the apex. For each domain, distinguish the immediate cutover
+verification from source-zone cleanup: record the successful registrar
+operation time and leave the unchanged Route 53 zone serving for at least 48
+hours.
 
-- [ ] **Step 4: Verify final DNS state**
+- [ ] **Step 4: Run the delayed source-zone cleanup gate**
 
-Require all migrated public NS answers to be Cloudflare, representative A/AAAA/CNAME/MX/TXT answers to match the exported intent, live HTTP endpoints to retain their pre-change status, and Route 53 hosted-zone count to be zero.
+Only after at least 48 hours have elapsed from each domain's successful
+registrar operation, recheck Cloudflare status, registrar nameservers,
+TLD-authoritative nameservers, public resolver nameservers, full record-manifest
+parity, HTTPS, and all mail-sensitive records. If any check fails or cannot be
+completed, fail closed: leave that Route 53 zone and its records intact and do
+not count the migration as cleaned up. After every gate passes, delete all
+non-NS/SOA records, wait for `INSYNC`, delete the source hosted zone, and verify
+its absence by ID and name.
+
+- [ ] **Step 5: Verify final DNS state**
+
+Require all migrated public NS answers to be Cloudflare, representative
+A/AAAA/CNAME/MX/TXT answers to match the exported intent, live HTTP endpoints
+to retain their pre-change status, and Route 53 hosted-zone count to be zero
+only after all delayed cleanup gates and deletions complete.
 
 ### Task 7: Review, push, restart, and measure
 
