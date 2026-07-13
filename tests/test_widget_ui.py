@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from claude_widget import (
     ClaudeWidget,
@@ -239,8 +239,13 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(widget.model_bars, [])
         self.assertEqual(widget.height(), 130)
 
-    def _make_inert_claude_widget(self):
+    def _make_inert_claude_widget(self, *, tray_available: bool = False):
         patches = [
+            patch.object(
+                QSystemTrayIcon,
+                "isSystemTrayAvailable",
+                return_value=tray_available,
+            ),
             patch.object(ClaudeWidget, "_setup_timers", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_usage", lambda self, force=False: None),
             patch.object(ClaudeWidget, "_fetch_deploys", lambda self: None),
@@ -262,6 +267,7 @@ class WidgetUiTest(unittest.TestCase):
         widget = self._make_inert_claude_widget()
         widget.show()
         widget._usage_limits.set_data(UsageData())
+        widget.adjustSize()
         QApplication.processEvents()
         before = widget.height()
 
@@ -276,21 +282,31 @@ class WidgetUiTest(unittest.TestCase):
                 ]
             )
         )
+        widget.adjustSize()
         QApplication.processEvents()
 
         self.assertGreater(widget.height(), before)
 
-    def test_claude_header_minimize_button_hides_to_tray(self):
-        widget = self._make_inert_claude_widget()
+    def test_claude_header_minimize_button_toggles_from_tray(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
         calls = []
-        widget.hide_to_tray = lambda: calls.append("hide")
+        widget._toggle_from_tray = lambda: calls.append("toggle")
 
         widget._minimize_btn.mousePressEvent(None)
 
-        self.assertEqual(calls, ["hide"])
+        self.assertEqual(calls, ["toggle"])
+
+    def test_claude_header_minimize_button_closes_without_tray(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        calls = []
+        widget.close = lambda: calls.append("close")
+
+        widget._minimize_btn.mousePressEvent(None)
+
+        self.assertEqual(calls, ["close"])
 
     def test_claude_close_event_uses_hide_to_tray(self):
-        widget = self._make_inert_claude_widget()
+        widget = self._make_inert_claude_widget(tray_available=True)
         calls = []
         widget.hide_to_tray = lambda: calls.append("hide")
 
@@ -307,7 +323,7 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(calls, ["hide"])
 
     def test_claude_tray_show_hide_action_toggles_visibility(self):
-        widget = self._make_inert_claude_widget()
+        widget = self._make_inert_claude_widget(tray_available=True)
 
         self.assertEqual(widget._show_hide_action.text(), "Show/Hide")
         widget.show()
