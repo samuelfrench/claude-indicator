@@ -17,7 +17,7 @@
 - Create empty Cloudflare Free zones for `mergepdfnow.com`, `image-ocean.com`, `pic-ocean.com`, and `samfrenchprogramming.com` using stored credentials, with no subscription purchase, and change registrar nameservers to the assigned Cloudflare pair before deleting any corresponding Route 53 zone.
 - Do not delete an active Route 53 zone until at least 48 hours after its registrar operation succeeds. The `.com` parent NS TTL is 172800 seconds, so the unchanged Route 53 source zone must continue serving throughout that overlap.
 - Delayed active-zone cleanup must fail closed: if Cloudflare status, registrar/TLD/public nameservers, full record-manifest parity, HTTPS, or mail-sensitive-record checks fail or cannot be completed, leave the Route 53 zone intact.
-- For `mergepdfnow.com` only, while the registrar's verified status remains `clientHold`, parent/TLD and public delegation are intentionally suppressed and Cloudflare may remain `pending`. Before deleting its Route 53 zone, require the registrar to store the exact assigned Cloudflare nameserver pair, require both assigned Cloudflare nameservers to answer the empty zone authoritatively when queried directly, and require parent/public DNS to remain undelegated as expected. If `clientHold` disappears, the registrar still shows AWS nameservers, either assigned Cloudflare nameserver does not answer authoritatively, or unexpected public delegation appears, leave the Route 53 zone intact. Do not apply this exception to any other dead or active domain.
+- Registrar contact data is immutable by default. The sole executed exception was `mergepdfnow.com`: after proving its existing registrant mailbox domain unreachable, recovery changed exactly the registrant `Email` field to an already-authenticated existing Gmail profile; pre/post hashes verified every other registrant field plus all admin, tech, billing, and privacy fields unchanged. Any comparable recovery must require contact-operation success, reachability completion, and hold removal before retrying nameservers, fail closed on any drift or incomplete gate, and never record the address or other PII. Do not apply this exception loosely to another domain.
 - Disable auto-renew only for `mergepdfnow.com`, `pic-ocean.com`, `samfrenchprogramming.com`, and `image-ocean.com`.
 - Use test-first development for production Python changes; commit and push all repository changes.
 - Do not request or print credentials. Load existing tokens from `~/.env` without echoing values.
@@ -373,17 +373,19 @@ Using stored credentials, create empty Cloudflare Free zones for exactly
 content records. For each zone, record the assigned Cloudflare nameserver pair,
 change the registrar nameservers to that exact pair, require the registrar
 operation to succeed, and recheck Cloudflare status plus registrar,
-TLD-authoritative, and public nameservers. Apply the Global Constraints
-`clientHold` exception only to `mergepdfnow.com`: while the verified hold
-remains, require the registrar to store the assigned Cloudflare pair, query
-both assigned Cloudflare nameservers directly and require authoritative
-empty-zone answers, and require parent/public DNS to remain undelegated; a
-`pending` Cloudflare status is acceptable only in that state. Fail closed and
-keep the Route 53 zone if the hold disappears, the registrar still shows AWS
-nameservers, either direct authoritative check fails, or unexpected public
-delegation appears. Do not delete any corresponding Route 53 zone before its
-applicable delegation or `clientHold` gate passes. `mycoffeeexplorer.com`
-requires no new zone because it is already safely authoritative on Cloudflare.
+TLD-authoritative, and public nameservers. `mergepdfnow.com` began this step on
+`clientHold`; its first nameserver operation failed while contact reachability
+was pending because the existing registrant mailbox domain was unreachable.
+The provisional delete-under-hold path was not used. Apply the Global
+Constraints contact-recovery exception: change only the registrant `Email`
+field to the already-authenticated existing Gmail profile, prove all other
+contact/privacy fields unchanged by hash, and wait for the contact operation,
+reachability, and hold-removal gates before one nameserver retry. Execution
+passed those gates, the retry succeeded, and the normal registrar,
+TLD-authoritative, public, Cloudflare, and direct-authority checks passed. Do
+not delete any corresponding Route 53 zone before its applicable delegation
+gate passes. `mycoffeeexplorer.com` requires no new zone because it is already
+safely authoritative on Cloudflare.
 
 - [ ] **Step 3: Disable four renewals**
 

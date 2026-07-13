@@ -1,6 +1,7 @@
 # Claude Indicator TODO
 
 - [x] Read task-loop status from local configuration only; no longer scan DynamoDB every 60 seconds.
+- [x] Document the controlled `mergepdfnow.com` registrar contact-recovery exception and hash-verified immutable-field rule without storing an address or other PII.
 - [x] Show the Fable-specific usage limit: parse the `/api/oauth/usage` `limits` array (model-scoped `weekly_scoped` entries) and render one `UsageBar` per model cap — currently `Fable (7-Day)` — with legacy `seven_day_opus`/`seven_day_sonnet` fallback and `last_usage.json` round-trip.
 - [x] Add header minimize-to-tray button plus shared tray hide/show behavior.
 - [x] Show Codex usage-limit percentage: `CodexUsageRow` now reads cached `token_count` rate-limit events from `~/.codex/sessions/**/*.jsonl` on a background worker and displays current 5-hour plus 7-day usage percentages.

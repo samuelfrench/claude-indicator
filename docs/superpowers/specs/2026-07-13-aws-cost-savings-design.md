@@ -45,18 +45,27 @@ Reduce recurring AWS spend without stopping the production Lightsail WordPress s
 3. Require the registrar operation to succeed, Cloudflare to recognize the zone, and registrar, TLD-authoritative, and public nameserver checks to return the assigned pair.
 4. Only after those checks pass may any corresponding Route 53 zone be emptied and deleted. `mycoffeeexplorer.com` is already safely authoritative on Cloudflare and requires the same authority recheck before its stale Route 53 zone is deleted.
 
-`mergepdfnow.com` has one narrow exception to step 3 while its verified registrar
-status remains `clientHold`: the hold intentionally suppresses parent/TLD and
-public delegation, and Cloudflare may remain `pending` until the hold is
-removed. Before deleting its Route 53 zone, require the registrar to store the
-exact assigned Cloudflare nameserver pair, require both assigned Cloudflare
-nameservers to answer the empty zone authoritatively when queried directly,
-and require parent/public DNS to remain undelegated as expected. Fail closed
-and leave the Route 53 zone intact if `clientHold` disappears, the registrar
-still shows AWS nameservers, either assigned Cloudflare nameserver does not
-answer authoritatively, or unexpected public delegation appears. This
-exception applies only to `mergepdfnow.com`; it does not weaken the parking
-gate for any other dead domain or any active-domain migration gate.
+`mergepdfnow.com` initially required a provisional exception to step 3 while
+its registrar status was `clientHold`, which suppressed parent/public
+delegation. That delete-under-hold path was not used. The first nameserver
+operation failed while contact reachability was pending because the existing
+registrant mailbox domain was unreachable. As the sole approved exception to
+the default rule that DNS cost work must not change contact data, recovery
+changed exactly the registrant `Email` field to an already-authenticated
+existing Gmail profile. Pre/post hashes proved every other registrant field
+and all admin, tech, billing, and privacy fields remained unchanged. The
+contact operation succeeded, reachability completed, and `clientHold` cleared;
+only then did the nameserver update retry succeed and the normal registrar,
+parent, public, Cloudflare, and direct-authority gates pass before deletion.
+
+Reusable recovery rule: keep registrar contact data immutable by default. A
+contact-reachability exception may change only the registrant `Email` field to
+an already-authenticated existing profile after proving the current mailbox is
+unreachable. Hash the complete contact/privacy state before and after, require
+all non-target fields to match, require contact-operation success,
+reachability completion, and hold removal before retrying DNS changes, and
+fail closed on any drift or incomplete gate. Never store the address or other
+PII in repository documentation or operational reports.
 
 ### Active DNS cutover
 
