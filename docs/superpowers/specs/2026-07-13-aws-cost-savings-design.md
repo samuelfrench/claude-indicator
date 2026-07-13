@@ -6,7 +6,7 @@ Reduce recurring AWS spend without stopping the production Lightsail WordPress s
 
 ## Approved scope
 
-- Migrate 16 active Route 53 zones to Cloudflare using DNS-only records, retaining each Route 53 source zone for at least 48 hours after the registrar operation succeeds before delayed cleanup.
+- Migrate 16 active Route 53 zones to Cloudflare using DNS-only records. Retain every unchanged Route 53 source zone through the hardened delayed-cleanup policy: a global floor of `2026-07-20T15:18:57.201000Z`, a rolling per-domain stale-cache clock, and a one-hour clean resolver window before deletion.
 - Park `mergepdfnow.com`, `image-ocean.com`, `pic-ocean.com`, and `samfrenchprogramming.com` as empty Cloudflare Free zones using stored credentials, without purchasing a subscription, and change registrar nameservers to each assigned Cloudflare pair before deleting any corresponding Route 53 zone.
 - Delete the stale `mycoffeeexplorer.com` Route 53 zone after confirming Cloudflare remains authoritative.
 - Delete the unused `mergepdfnow.com` and retired `image-ocean.com` Route 53 zones only after their Cloudflare parking and delegation gates pass.
@@ -20,7 +20,7 @@ Reduce recurring AWS spend without stopping the production Lightsail WordPress s
 
 ### DNS
 
-1. **Staged Cloudflare API migration, recommended and approved.** Create each zone, copy every non-NS/SOA record with proxying disabled, translate Route 53 aliases to flattened CNAMEs, change registrar nameservers, verify the immediate cutover, keep the AWS source zone serving for at least the 172800-second parent NS TTL, then pass a second verification gate before delayed deletion.
+1. **Staged Cloudflare API migration, recommended and approved.** Create each zone, copy every non-NS/SOA record with proxying disabled, translate Route 53 aliases to flattened CNAMEs, change registrar nameservers, verify the immediate cutover, and keep the AWS source zone serving through the hardened overlap and recursive-cache convergence gates before delayed deletion.
 2. Delete only stale zones. This is lower risk but leaves roughly $9/month of approved savings unrealized.
 3. Transfer registration and DNS simultaneously. This adds registrar-lock and transfer risk and is outside the approved change.
 
@@ -75,9 +75,19 @@ PII in repository documentation or operational reports.
 4. Compare record inventories before delegation.
 5. Replace Route 53 Domains nameservers with the two Cloudflare nameservers.
 6. Record when the registrar operation succeeds and perform immediate cutover verification: Cloudflare status, registrar/TLD/public nameservers, full record-manifest parity, HTTPS, and mail-sensitive records.
-7. Keep the unchanged Route 53 source zone serving for at least 48 hours after that successful registrar operation because the `.com` parent NS TTL is 172800 seconds.
-8. After the full overlap, rerun the Cloudflare-status, registrar/TLD/public-nameserver, full record-manifest, HTTPS, and mail-sensitive-record checks.
-9. Fail closed if any delayed-cleanup check fails or cannot be completed: leave the Route 53 zone and all source records intact. Only after every check passes may non-default records be removed and the old hosted zone deleted.
+7. Keep every unchanged Route 53 source zone serving until at least the global cleanup floor, `2026-07-20T15:18:57.201000Z`, seven days after the last registrar success. The original 48-hour markers are historical only and do not authorize deletion.
+8. Compute each domain's `effective_not_before` as `max(global floor, last old-NS observation + max(observed TTL, 172800 seconds) + 24 hours)`. Any later old-NS answer advances that domain's clock.
+9. Only after that effective timestamp, run 13 rounds at five-minute intervals over one hour. In every round issue eight UDP and one TCP NS query to each of `1.1.1.1` and `8.8.8.8`. Require all 117 observations per resolver and domain to return only `bruce.ns.cloudflare.com` and `chloe.ns.cloudflare.com`; any old, empty, or unexpected answer resets the clean window.
+10. At the first and final rounds, rerun the complete delayed gate: registrar nameservers, all 13 `.com` authorities, Cloudflare active/Free/price-0 state, exact record parity, zero proxying, both direct Cloudflare authorities, HTTPS/TLS or mail behavior, and unchanged Route 53 source hashes and counts.
+11. Fail closed if any delayed-cleanup check fails or cannot be completed: leave the Route 53 zone and all source records intact. Only after the clean window and both complete gates pass may non-default records be removed and the old hosted zone deleted.
+
+The immediate public-resolver checks were point-in-time observations, not proof
+of complete recursive-cache convergence. Review sampling at
+`2026-07-13T15:42:09Z`–`15:42:15Z` still found Route 53 nameserver shards for
+eight domains. Five had quantified stale answers and TTLs; three were observed
+qualitatively earlier. No empty or unrelated answer was seen. Durable private
+state records the evidence and rolling clocks without storing credentials or
+PII.
 
 If the existing Cloudflare credential cannot create zones, no corresponding dead-domain Route 53 zone is deleted and no active Route 53 zone is deleted or redelegated. Independent AWS savings continue while Cloudflare authentication is resolved through existing credentials or an authenticated dashboard session; no API key is requested from the user.
 
@@ -97,7 +107,7 @@ Add a failing test proving `fetch_task_loop_status()` does not access `boto3`, t
 
 ## Verification
 
-- Route 53: immediate active-zone cutovers match Cloudflare while the source zones remain intact; after each 48-hour overlap and delayed cleanup gate, deleted zones are absent; 19 AWS hosted zones eventually fall to zero after all 16 migrations and three deletions.
+- Route 53: immediate active-zone cutovers match Cloudflare while all 16 source zones remain intact. Delayed deletion begins only after the global floor, each rolling stale-cache clock, the 13-round resolver clean window, and both full gates pass; 19 AWS hosted zones eventually fall to zero after all 16 migrations and three completed stale-zone deletions.
 - Domains: the four dead registrations are parked on empty Cloudflare Free zones with their assigned nameservers, and all four requested domains report `AutoRenew=false`.
 - S3: lifecycle configurations contain the exact preserved and new transitions; later storage-class summaries show Glacier/Deep Archive movement.
 - Snapshots: exact Lightsail and RDS identifiers return not found and production Lightsail remains running.
@@ -110,5 +120,5 @@ Add a failing test proving `fetch_task_loop_status()` does not access `boto3`, t
 - No S3 payload deletion.
 - No registrar transfer.
 - No Cloudflare proxy/CDN enablement during DNS migration.
-- No paid Cloudflare subscription and no Route 53 source-zone deletion before its applicable delegation and overlap gates pass.
+- No paid Cloudflare subscription and no Route 53 source-zone deletion before its global floor, rolling stale-cache clock, clean resolver window, and full delayed gates pass.
 - No Savings Plan, Reserved Instance, paid support, or new public mutation endpoint.
