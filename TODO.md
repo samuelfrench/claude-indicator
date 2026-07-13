@@ -1,6 +1,7 @@
 # Claude Indicator TODO
 
 - [x] Read task-loop status from local configuration only; no longer scan DynamoDB every 60 seconds.
+- [ ] Recheck asynchronous S3 lifecycle execution until eligible payloads physically move: at `2026-07-13T16:46Z`, overflow still had `82,492` eligible Standard objects / `150,363,622,267` bytes and `37` eligible Standard-IA objects / `231,025,237,941` bytes with `0` Glacier; both backup payloads remained Glacier (`32` / `289,289,490,120` bytes and `2` / `110,036,590,284` bytes) with `0` Deep Archive. Lifecycle hashes remain exact; no payload mutation is required.
 - [x] Document the controlled `mergepdfnow.com` registrar contact-recovery exception and hash-verified immutable-field rule without storing an address or other PII.
 - [x] Complete and review the immediate Cloudflare cutover for all 16 active Route 53 zones while leaving every source zone intact.
 - [ ] Delete the 16 Route 53 source zones only after `2026-07-20T15:18:57.201000Z`, each rolling stale-cache clock, a 13-round/one-hour resolver clean window, and both full delayed gates pass.
