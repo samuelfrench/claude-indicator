@@ -958,13 +958,10 @@ def fetch_runners_status() -> list[RunnerInfo]:
 
 
 PROJECTS_JSON_PATH = Path.home() / "claude-workspace" / "clawd-bot" / "config" / "projects.json"
-CLAWD_DYNAMO_TABLE = "clawd-bot-tasks"
-CLAWD_DYNAMO_REGION = "us-east-1"
 
 
 def fetch_task_loop_status() -> list[TaskLoopInfo]:
-    """Read projects.json and query DynamoDB for last-completed timestamps."""
-    # Read projects.json
+    """Read configured autonomous task loops without remote service calls."""
     try:
         with open(PROJECTS_JSON_PATH) as f:
             projects_cfg = json.load(f)
@@ -976,51 +973,18 @@ def fetch_task_loop_status() -> list[TaskLoopInfo]:
         for name, cfg in projects_cfg.items()
         if cfg.get("autonomous", {}).get("enabled", False)
     }
-    if not enabled:
-        return []
-
-    # Try to query DynamoDB for last completed task per project
-    last_ts: dict[str, float | None] = {name: None for name in enabled}
-    try:
-        import boto3  # noqa: PLC0415
-        from boto3.dynamodb.conditions import Key  # noqa: PLC0415
-        ddb = boto3.resource("dynamodb", region_name=CLAWD_DYNAMO_REGION)
-        table = ddb.Table(CLAWD_DYNAMO_TABLE)
-        for name in enabled:
-            # Scan with filter — cheap because the table is small
-            resp = table.scan(
-                FilterExpression=Key("project").eq(name),
-                ProjectionExpression="#st, created_at",
-                ExpressionAttributeNames={"#st": "status"},
-            )
-            items = resp.get("Items", [])
-            # Find the most recent completed item
-            completed = [
-                it for it in items
-                if it.get("status") in ("completed", "failed")
-            ]
-            if completed:
-                def _ts(it: dict) -> float:
-                    raw = it.get("created_at", "")
-                    try:
-                        return datetime.fromisoformat(raw).timestamp()
-                    except (ValueError, TypeError):
-                        return 0.0
-                last_ts[name] = max(_ts(it) for it in completed)
-    except Exception:  # noqa: BLE001
-        # No boto3, no creds, network error — degrade gracefully
-        pass
-
     results: list[TaskLoopInfo] = []
     for name, cfg in enabled.items():
         auto = cfg["autonomous"]
-        results.append(TaskLoopInfo(
-            name=name,
-            model=auto.get("model", "unknown"),
-            effort=auto.get("effort", "—"),
-            cooldown_minutes=int(auto.get("cooldown_minutes", 0)),
-            last_task_ts=last_ts.get(name),
-        ))
+        results.append(
+            TaskLoopInfo(
+                name=name,
+                model=auto.get("model", "unknown"),
+                effort=auto.get("effort", "—"),
+                cooldown_minutes=int(auto.get("cooldown_minutes", 0)),
+                last_task_ts=None,
+            )
+        )
     return results
 
 

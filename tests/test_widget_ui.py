@@ -1,14 +1,18 @@
+import json
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import ModuleType
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
+import claude_widget
 from claude_widget import (
     ClaudeWidget,
     ClaudeUsageClient,
@@ -31,6 +35,48 @@ class WidgetUiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_task_loop_status_reads_local_config_without_aws(self):
+        config = {
+            "honey-explorer": {
+                "autonomous": {
+                    "enabled": True,
+                    "model": "claude-opus-4-6",
+                    "effort": "high",
+                    "cooldown_minutes": 10,
+                }
+            },
+            "disabled-project": {"autonomous": {"enabled": False}},
+        }
+        fake_boto3 = ModuleType("boto3")
+        fake_boto3.resource = Mock()
+        fake_dynamodb = ModuleType("boto3.dynamodb")
+        fake_conditions = ModuleType("boto3.dynamodb.conditions")
+        fake_conditions.Key = Mock()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "projects.json"
+            config_path.write_text(json.dumps(config))
+            with (
+                patch.object(claude_widget, "PROJECTS_JSON_PATH", config_path),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "boto3": fake_boto3,
+                        "boto3.dynamodb": fake_dynamodb,
+                        "boto3.dynamodb.conditions": fake_conditions,
+                    },
+                ),
+            ):
+                loops = claude_widget.fetch_task_loop_status()
+
+        self.assertEqual(len(loops), 1)
+        self.assertEqual(loops[0].name, "honey-explorer")
+        self.assertEqual(loops[0].model, "claude-opus-4-6")
+        self.assertEqual(loops[0].effort, "high")
+        self.assertEqual(loops[0].cooldown_minutes, 10)
+        self.assertIsNone(loops[0].last_task_ts)
+        fake_boto3.resource.assert_not_called()
 
     def test_usage_limits_widget_collapses_all_usage_bars_as_one_group(self):
         widget = UsageLimitsWidget()
