@@ -41,7 +41,7 @@ def test_parse_todos_keeps_heading_path_and_only_explicit_due_dates():
 
     assert items[0].heading == "Product > P0 Launch"
     assert items[0].due_date == date(2026, 8, 2)
-    assert items[0].managed_id == "abc"
+    assert items[0].managed_id is None
     assert items[0].text == "Ship live check due: 2026-08-02"
     assert items[1].due_date is None
 
@@ -88,6 +88,41 @@ def test_discovery_deduplicates_resolved_paths(tmp_path):
     assert discovered == (target.resolve(),)
 
 
+def test_scan_rejects_symlink_todos_that_escape_the_workspace_root(tmp_path):
+    root = tmp_path / "workspaces"
+    home_todo = write_todo(tmp_path / "home" / "TODO.md", "# TODO\n")
+    outside = write_todo(
+        tmp_path / "outside" / "TODO.md",
+        "- [ ] Do not read this escaped task\n",
+    )
+    escaped = root / "project" / "TODO.md"
+    escaped.parent.mkdir(parents=True)
+    escaped.symlink_to(outside)
+
+    result = scan_todos(home_todo, (root,), today=TODAY)
+
+    assert result.items == ()
+    assert result.scanned_files == 1
+    assert result.warnings == (f"Skipped symlink TODO file: {escaped}",)
+
+
+def test_scan_warns_for_each_unavailable_workspace_root(tmp_path):
+    home_todo = write_todo(tmp_path / "home" / "TODO.md", "# TODO\n")
+    missing_root = tmp_path / "missing-workspace"
+    non_directory_root = write_todo(tmp_path / "not-a-workspace", "not a directory\n")
+
+    result = scan_todos(
+        home_todo,
+        (missing_root, non_directory_root),
+        today=TODAY,
+    )
+
+    assert result.warnings == (
+        f"Skipped unavailable workspace root: {missing_root}",
+        f"Skipped unavailable workspace root: {non_directory_root}",
+    )
+
+
 def test_scan_skips_oversized_file_without_aborting_and_includes_home_once(tmp_path):
     root = tmp_path / "workspaces"
     home_todo = write_todo(root / "home" / "TODO.md", "- [ ] Overall inbox task\n")
@@ -102,6 +137,42 @@ def test_scan_skips_oversized_file_without_aborting_and_includes_home_once(tmp_p
     assert result.scanned_files == 2
     assert result.warnings == (f"Skipped oversized TODO file: {huge.resolve()}",)
     assert good.resolve() in discover_todo_files((root,))
+
+
+def test_scan_assigns_managed_ownership_only_inside_the_exact_home_inbox(tmp_path):
+    root = tmp_path / "workspaces"
+    home_todo = write_todo(
+        tmp_path / "home" / "TODO.md",
+        (
+            "# TODO\n"
+            "- [ ] Outside home collision <!-- claude-indicator:id=shared-id -->\n"
+            "- [x] Outside home completed <!-- claude-indicator:id=outside-done -->\n"
+            "<!-- claude-indicator:inbox:start -->\n"
+            "## Indicator Inbox\n\n"
+            "- [ ] Owned home task <!-- claude-indicator:id=shared-id -->\n"
+            "- [x] Owned completed task <!-- claude-indicator:id=owned-done -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+    )
+    write_todo(
+        root / "project" / "TODO.md",
+        (
+            "<!-- claude-indicator:inbox:start -->\n"
+            "- [ ] Project collision <!-- claude-indicator:id=shared-id -->\n"
+            "- [x] Project completed <!-- claude-indicator:id=project-done -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+    )
+
+    result = scan_todos(home_todo, (root,), today=TODAY)
+    by_text = {item.text: item for item in result.items}
+
+    assert by_text["Owned home task"].managed_id == "shared-id"
+    assert by_text["Owned completed task"].managed_id == "owned-done"
+    assert by_text["Outside home collision"].managed_id is None
+    assert by_text["Outside home completed"].managed_id is None
+    assert by_text["Project collision"].managed_id is None
+    assert by_text["Project completed"].managed_id is None
 
 
 def make_item(
@@ -190,6 +261,33 @@ def test_rank_item_marks_explicit_and_future_gates_waiting_but_not_same_day_gate
     assert no_earlier.waiting is True
     assert "gated until 2026-08-03" in no_earlier.why_now
     assert same_day.waiting is False
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("blocked-by-owner before deploy", "explicitly waiting or on hold"),
+        ("Only after 2026-08-04 review production", "gated until 2026-08-04"),
+        ("Until 2026-08-05 launch", "gated until 2026-08-05"),
+    ],
+)
+def test_rank_item_recognizes_documented_and_common_waiting_forms(text, reason):
+    ranked = smart_todos.rank_item(make_item(text), TODAY)
+
+    assert ranked.waiting is True
+    assert ranked.urgency == "waiting"
+    assert ranked.tags == ("waiting",)
+    assert reason in ranked.why_now
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Only after 2026-07-31 review production", "Until 2026-07-31 launch"],
+)
+def test_dated_waiting_forms_become_actionable_on_the_gate_date(text):
+    ranked = smart_todos.rank_item(make_item(text), TODAY)
+
+    assert ranked.waiting is False
 
 
 def test_rank_item_scores_due_dates_and_completed_items_without_promoting_completion():
@@ -356,6 +454,28 @@ def test_inbox_add_preserves_the_existing_file_mode(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
+def test_inbox_add_preserves_unrelated_crlf_prefix_and_suffix_byte_for_byte(tmp_path):
+    path = tmp_path / "TODO.md"
+    prefix = b"# Existing\r\n\r\n- [ ] Prefix task\r\n"
+    managed = (
+        b"<!-- claude-indicator:inbox:start -->\r\n"
+        b"## Indicator Inbox\r\n\r\n"
+        b"<!-- claude-indicator:inbox:end -->\r\n"
+    )
+    suffix = b"\r\n## Tail\r\n- [ ] Suffix task\r\n"
+    before = prefix + managed + suffix
+    path.write_bytes(before)
+
+    InboxStore(path).add("CRLF inbox task")
+
+    after = path.read_bytes()
+    start = before.index(b"<!-- claude-indicator:inbox:start -->")
+    end = before.index(b"<!-- claude-indicator:inbox:end -->")
+    after_end = after.index(b"<!-- claude-indicator:inbox:end -->")
+    assert after[:start] == before[:start]
+    assert after[after_end:] == before[end:]
+
+
 def test_complete_changes_only_the_exact_managed_id(tmp_path):
     path = tmp_path / "TODO.md"
     store = InboxStore(path)
@@ -367,6 +487,23 @@ def test_complete_changes_only_the_exact_managed_id(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert f"- [ ] First <!-- claude-indicator:id={first} -->" in text
     assert f"- [x] Second <!-- claude-indicator:id={second} -->" in text
+
+
+def test_complete_preserves_all_other_crlf_bytes(tmp_path):
+    path = tmp_path / "TODO.md"
+    before = (
+        b"# Existing\r\n- [ ] Prefix\r\n"
+        b"<!-- claude-indicator:inbox:start -->\r\n"
+        b"## Indicator Inbox\r\n\r\n"
+        b"- [ ] Managed <!-- claude-indicator:id=managed-1 -->\r\n"
+        b"<!-- claude-indicator:inbox:end -->\r\n"
+        b"## Tail\r\n- [ ] Suffix\r\n"
+    )
+    path.write_bytes(before)
+
+    InboxStore(path).complete("managed-1")
+
+    assert path.read_bytes() == before.replace(b"- [ ] Managed", b"- [x] Managed", 1)
 
 
 def test_complete_rejects_an_id_outside_the_managed_inbox_without_changes(tmp_path):
@@ -396,6 +533,7 @@ def test_complete_rejects_an_id_outside_the_managed_inbox_without_changes(tmp_pa
             "<!-- claude-indicator:inbox:start -->\n"
         ),
         "<!-- claude-indicator:inbox:start -->\n",
+        "<!-- claude-indicator:inbox:end -->\n",
         (
             "<!-- claude-indicator:inbox:start -->\n"
             "<!-- claude-indicator:inbox:start -->\n"
@@ -403,7 +541,7 @@ def test_complete_rejects_an_id_outside_the_managed_inbox_without_changes(tmp_pa
             "<!-- claude-indicator:inbox:end -->\n"
         ),
     ],
-    ids=["duplicate", "reversed", "partial", "nested"],
+    ids=["duplicate", "reversed", "start-only", "end-only", "nested"],
 )
 def test_inbox_rejects_corrupt_marker_boundaries_without_changing_bytes(tmp_path, contents):
     path = write_todo(tmp_path / "TODO.md", contents)

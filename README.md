@@ -55,7 +55,9 @@ or hidden independently.
   `~/TODO.md`, between `<!-- claude-indicator:inbox:start -->` and
   `<!-- claude-indicator:inbox:end -->`. The Indicator owns only that marked
   section and preserves the rest of the file.
-- Only open tasks created in that managed inbox have a **Complete** control.
+- Only open tasks inside the single valid managed section in the exact injected
+  home TODO have a **Complete** control. Matching Indicator IDs in project TODOs
+  or elsewhere in the home file are ignored.
   Project TODO entries are read-only in the command center.
 - **Open source** opens the selected file at its Markdown line when `code`,
   `codium`, or `gedit` is available, and otherwise opens the file with
@@ -66,6 +68,8 @@ or hidden independently.
 - **Focus** shows open, actionable tasks. **All open** also includes waiting
   work. **Waiting** isolates blocked or time-gated items. **Completed inbox**
   shows completed entries owned by the Indicator.
+- Waiting recognition includes `blocked by owner`, `blocked-by-owner`, and
+  future `on or after`, `no earlier than`, `only after`, or `until` dates.
 - Search covers task text, project, heading, tags, and ranking reasons. The
   project filter narrows results to one discovered project; **Reset** restores
   the Focus view across all projects.
@@ -80,7 +84,9 @@ or hidden independently.
 The scanner reads `~/TODO.md` plus `TODO.md` files at bounded depth under
 `~/claude-workspace` and `~/codex_workspace`. It skips hidden, dependency,
 build, cache, coverage, test-output, and nested worktree directories, caps the
-rendered result set, and reports unreadable or oversized files in the dialog.
+rendered result set, and reports unavailable roots, unreadable or oversized
+files, symlinks, and special files in the dialog. Workspace candidates remain
+confined beneath their resolved configured root.
 All scanning, ranking, filtering, persistence, and source navigation stay on
 this computer. Smart TODOs adds no API calls, hosted service, subscription, or
 billable usage.

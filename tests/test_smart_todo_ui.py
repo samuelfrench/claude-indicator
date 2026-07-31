@@ -117,6 +117,35 @@ def test_focus_view_excludes_waiting_and_completed(qapp, tmp_path, dialog_cleanu
     ]
 
 
+def test_focus_view_excludes_hyphenated_owner_block_and_common_future_gates(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": (
+                "- [ ] P0 deploy blocked-by-owner\n"
+                "- [ ] Only after 2026-08-03 verify production\n"
+                "- [ ] Until 2026-08-04 launch\n"
+                "- [ ] Actionable customer work\n"
+            )
+        },
+    )
+
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    assert visible_task_texts(dialog) == ["Actionable customer work"]
+    dialog.view_combo.setCurrentText("Waiting")
+    assert set(visible_task_texts(dialog)) == {
+        "P0 deploy blocked-by-owner",
+        "Only after 2026-08-03 verify production",
+        "Until 2026-08-04 launch",
+    }
+
+
 def test_refresh_emits_full_summary_and_caps_rows(qapp, tmp_path, dialog_cleanup):
     task_lines = "".join(f"- [ ] Routine task {index:03d}\n" for index in range(260))
     dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n", projects={"bulk": task_lines})
@@ -271,6 +300,73 @@ def test_completion_control_exists_only_for_open_managed_rows(
 
     assert "- [x] Managed open task" in dialog.home_todo_path.read_text(encoding="utf-8")
     assert "Managed open task" not in visible_task_texts(dialog)
+
+
+def test_real_widgets_reject_project_home_outside_and_colliding_id_ownership(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "# TODO\n"
+            "- [ ] Outside collision <!-- claude-indicator:id=shared-id -->\n"
+            "- [x] Outside completed <!-- claude-indicator:id=outside-done -->\n"
+            "<!-- claude-indicator:inbox:start -->\n"
+            "## Indicator Inbox\n\n"
+            "- [ ] Owned collision <!-- claude-indicator:id=shared-id -->\n"
+            "- [x] Owned completed <!-- claude-indicator:id=owned-done -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+        projects={
+            "alpha": (
+                "- [ ] Project collision <!-- claude-indicator:id=shared-id -->\n"
+                "- [x] Project completed <!-- claude-indicator:id=project-done -->\n"
+            )
+        },
+    )
+
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    assert task_row(dialog, "Owned collision").complete_button is not None
+    assert task_row(dialog, "Outside collision").complete_button is None
+    assert task_row(dialog, "Project collision").complete_button is None
+
+    dialog.view_combo.setCurrentText("Completed inbox")
+    assert visible_task_texts(dialog) == ["Owned completed"]
+
+
+def test_completion_revalidates_managed_ownership_against_current_home_bytes(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "<!-- claude-indicator:inbox:start -->\n"
+            "## Indicator Inbox\n\n"
+            "- [ ] Initially owned <!-- claude-indicator:id=managed-1 -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    stale_complete_button = task_row(dialog, "Initially owned").complete_button
+    assert stale_complete_button is not None
+
+    current = (
+        "- [ ] Moved outside <!-- claude-indicator:id=managed-1 -->\n"
+        "<!-- claude-indicator:inbox:start -->\n"
+        "## Indicator Inbox\n"
+        "<!-- claude-indicator:inbox:end -->\n"
+    ).encode()
+    dialog.home_todo_path.write_bytes(current)
+
+    stale_complete_button.click()
+
+    assert dialog.home_todo_path.read_bytes() == current
+    assert dialog.status_label.text() == "Task is not managed by the Indicator Inbox."
 
 
 def test_open_source_button_and_double_click_route_item(
@@ -435,32 +531,40 @@ def test_summary_refresh_before_finished_keeps_specific_worker_ownership(
     assert dialog.worker is None
 
 
-def test_shutdown_waits_for_active_worker(qapp, tmp_path, dialog_cleanup):
-    release = threading.Event()
-    reader_connected = threading.Event()
+def test_fifo_todo_is_skipped_promptly_and_shutdown_remains_responsive(
+    qapp, tmp_path, dialog_cleanup
+):
     dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
     fifo_path = tmp_path / "workspace" / "fifo-project" / "TODO.md"
     fifo_path.parent.mkdir(parents=True)
     os.mkfifo(fifo_path)
 
-    def write_when_released():
-        with fifo_path.open("w", encoding="utf-8") as fifo:
-            reader_connected.set()
-            release.wait(timeout=2)
-            fifo.write("- [ ] Task delivered through real FIFO file\n")
+    def release_legacy_blocking_reader():
+        time.sleep(0.3)
+        try:
+            descriptor = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        try:
+            os.write(descriptor, b"- [ ] Legacy FIFO task\n")
+        finally:
+            os.close(descriptor)
 
-    writer = threading.Thread(target=write_when_released)
+    writer = threading.Thread(target=release_legacy_blocking_reader)
     writer.start()
-    dialog.refresh()
-    assert reader_connected.wait(timeout=1)
-    threading.Timer(0.12, release.set).start()
-
     before = time.monotonic()
-    dialog.shutdown()
+    dialog.refresh()
+    wait_for_scan(dialog, qapp, timeout_ms=1500)
     elapsed = time.monotonic() - before
+
+    shutdown_before = time.monotonic()
+    dialog.shutdown()
+    shutdown_elapsed = time.monotonic() - shutdown_before
     writer.join(timeout=1)
 
-    assert elapsed >= 0.1
+    assert elapsed < 0.2
+    assert shutdown_elapsed < 0.2
+    assert f"Skipped special TODO file: {fifo_path.resolve()}" in dialog.warning_label.text()
     assert dialog.worker is None
     assert writer.is_alive() is False
 
@@ -526,3 +630,24 @@ def test_dialog_has_tool_flags_size_accessibility_and_exact_palette(
     assert dialog.search_edit.accessibleName() == "Search tasks"
     for color in ("#14141E", "#20202D", "#D4A574", "#8B5CF6", "#F87171", "#B4B4C8"):
         assert color in dialog.styleSheet()
+
+
+def test_task_row_and_why_now_detail_expose_textual_accessible_urgency_band(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "# P0\n- [ ] Deploy critical customer production fix\n"},
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    row = task_row(dialog, "Deploy critical customer production fix")
+    QTest.mouseClick(row, Qt.MouseButton.LeftButton)
+
+    assert "CRITICAL URGENCY" in row.meta_label.text()
+    assert "critical urgency" in row.accessibleName().lower()
+    assert "Critical urgency" in dialog.why_meta_label.text()
+    assert "critical urgency" in dialog.why_meta_label.accessibleName().lower()

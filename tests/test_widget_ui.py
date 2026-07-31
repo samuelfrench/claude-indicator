@@ -356,6 +356,11 @@ class WidgetUiTest(unittest.TestCase):
         )
         self.assertTrue(actions[2].isSeparator())
 
+    def test_smart_todo_tray_has_exact_initial_tooltip(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+
+        self.assertEqual(widget._tray.toolTip(), "Claude Indicator · Smart TODOs")
+
     def test_smart_todo_action_creates_one_dialog_and_reuses_it(self):
         dialog_factory = Mock(side_effect=self._FakeSmartTodoDialog)
         widget = self._make_inert_claude_widget(

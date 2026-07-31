@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+import errno
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -59,10 +61,24 @@ SIGNALS = (
     (25, r"billing|paid|cost|subscription|charge", "billing or cost exposure"),
     (18, r"verify|validation|test|smoke|production|live|indexing|gsc|ga4", "production verification work"),
 )
-GATE_RE = re.compile(r"\b(?:on or after|no earlier than)\s+(20\d{2}-\d{2}-\d{2})\b", re.I)
-WAITING_RE = re.compile(
-    r"\bwaiting\b|wait for|\bhold\b|blocked by|owner action|\bsam\s*:", re.I
+GATE_RE = re.compile(
+    r"\b(?:on or after|no earlier than|only after|until)\s+"
+    r"(20\d{2}-\d{2}-\d{2})\b",
+    re.I,
 )
+WAITING_RE = re.compile(
+    r"\bwaiting\b|wait for|\bhold\b|blocked(?:[\s-]+)by\b|"
+    r"owner action|\bsam\s*:",
+    re.I,
+)
+
+
+def _safe_read_flags() -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return flags
 
 
 @dataclass(frozen=True)
@@ -148,11 +164,26 @@ class InboxStore:
         self._write_atomically(contents[:start] + updated_managed + contents[end:], mode)
 
     def _read_current(self) -> tuple[str, int]:
+        descriptor: int | None = None
         try:
-            stat_result = self.path.stat()
+            descriptor = os.open(self.path, _safe_read_flags())
         except FileNotFoundError:
             return "# TODO\n", 0o644
-        return self.path.read_text(encoding="utf-8"), stat_result.st_mode & 0o7777
+        try:
+            stat_result = os.fstat(descriptor)
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise ValueError("Indicator Inbox path must be a regular file.")
+            with os.fdopen(
+                descriptor,
+                mode="r",
+                encoding="utf-8",
+                newline="",
+            ) as todo_file:
+                descriptor = None
+                return todo_file.read(), stat_result.st_mode & 0o7777
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     @staticmethod
     def _managed_bounds(contents: str) -> tuple[int | None, int | None]:
@@ -193,6 +224,7 @@ class InboxStore:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
+                newline="",
                 dir=self.path.parent,
                 delete=False,
             ) as temporary_file:
@@ -272,8 +304,6 @@ def parse_todos(
         if not task_match:
             continue
         raw_task = task_match.group(2)
-        managed_match = MANAGED_ID_RE.search(raw_task)
-        managed_id = managed_match.group(1) if managed_match else None
         display_text = _strip_markdown(raw_task)
         items.append(
             TodoItem(
@@ -285,7 +315,6 @@ def parse_todos(
                 heading=" > ".join(title for _, title in headings),
                 project=project,
                 due_date=_parse_due_date(raw_task),
-                managed_id=managed_id,
             )
         )
     return tuple(items)
@@ -295,40 +324,140 @@ def _ignored_directory(name: str) -> bool:
     return name.startswith(".") or name in IGNORED_DIRS
 
 
-def discover_todo_files(workspace_roots: tuple[Path, ...]) -> tuple[Path, ...]:
-    """Return resolved TODO paths below project roots, within the depth limit."""
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _discover_todo_files(
+    workspace_roots: tuple[Path, ...],
+) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    """Discover confined TODO candidates and report paths that were skipped."""
     discovered: set[Path] = set()
+    warnings: list[str] = []
+    seen_roots: set[Path] = set()
     for workspace_root in workspace_roots:
-        root = Path(workspace_root)
-        if not root.is_dir():
+        configured_root = _absolute_path(Path(workspace_root))
+        try:
+            root = configured_root.resolve(strict=True)
+        except OSError:
+            warnings.append(f"Skipped unavailable workspace root: {configured_root}")
             continue
-        for directory, dirnames, filenames in os.walk(root):
+        if (
+            root in seen_roots
+            or not root.is_dir()
+            or not os.access(root, os.R_OK | os.X_OK)
+        ):
+            if root not in seen_roots:
+                warnings.append(f"Skipped unavailable workspace root: {configured_root}")
+            continue
+        seen_roots.add(root)
+
+        def warn_walk_error(error: OSError) -> None:
+            path = _absolute_path(Path(error.filename or root))
+            warnings.append(f"Skipped unreadable workspace path: {path}")
+
+        for directory, dirnames, filenames in os.walk(
+            root,
+            topdown=True,
+            onerror=warn_walk_error,
+            followlinks=False,
+        ):
             directory_path = Path(directory)
             relative = directory_path.relative_to(root)
-            dirnames[:] = [name for name in dirnames if not _ignored_directory(name)]
-            # The first path component is the project root; allow three below it.
-            if len(relative.parts) > MAX_TODO_DEPTH + 1:
+            allowed_directories: list[str] = []
+            for name in sorted(dirnames):
+                if _ignored_directory(name):
+                    continue
+                child = directory_path / name
+                if child.is_symlink():
+                    warnings.append(f"Skipped symlink workspace directory: {child}")
+                    continue
+                allowed_directories.append(name)
+            dirnames[:] = allowed_directories
+
+            # Each root contains project directories. At project + three nested
+            # directories, process this directory but do not enter a fourth.
+            if len(relative.parts) >= MAX_TODO_DEPTH + 1:
                 dirnames[:] = []
-                continue
             if "TODO.md" not in filenames or not relative.parts:
                 continue
             candidate = directory_path / "TODO.md"
-            try:
-                discovered.add(candidate.resolve())
-            except OSError:
+            if candidate.is_symlink():
+                warnings.append(f"Skipped symlink TODO file: {candidate}")
                 continue
-    return tuple(sorted(discovered, key=str))
+            try:
+                resolved_candidate = candidate.resolve(strict=True)
+            except OSError:
+                warnings.append(f"Skipped unreadable TODO file: {candidate}")
+                continue
+            if not resolved_candidate.is_relative_to(root):
+                warnings.append(f"Skipped escaped TODO file: {candidate}")
+                continue
+            discovered.add(resolved_candidate)
+    return tuple(sorted(discovered, key=str)), tuple(warnings)
 
 
-def _read_todo_file(path: Path) -> str | None:
+def discover_todo_files(workspace_roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Return confined TODO paths below project roots, within the depth limit."""
+    paths, _warnings = _discover_todo_files(workspace_roots)
+    return paths
+
+
+def _read_todo_file(path: Path) -> tuple[str | None, str | None]:
+    descriptor: int | None = None
     try:
-        with path.open("rb") as todo_file:
-            data = todo_file.read(MAX_TODO_BYTES + 1)
+        descriptor = os.open(path, _safe_read_flags())
+    except OSError as error:
+        warning_kind = "symlink" if error.errno == errno.ELOOP else "unreadable"
+        return None, f"Skipped {warning_kind} TODO file: {path}"
+    try:
+        stat_result = os.fstat(descriptor)
+        if not stat.S_ISREG(stat_result.st_mode):
+            return None, f"Skipped special TODO file: {path}"
+        if stat_result.st_size > MAX_TODO_BYTES:
+            return None, f"Skipped oversized TODO file: {path}"
+        chunks: list[bytes] = []
+        remaining = MAX_TODO_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
     except OSError:
-        return None
+        return None, f"Skipped unreadable TODO file: {path}"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if len(data) > MAX_TODO_BYTES:
-        return None
-    return data.decode("utf-8", errors="replace")
+        return None, f"Skipped oversized TODO file: {path}"
+    return data.decode("utf-8", errors="replace"), None
+
+
+def _managed_ids_by_line(contents: str) -> dict[int, str]:
+    """Return managed IDs only for checkboxes inside one valid marker pair."""
+    try:
+        start, end = InboxStore._managed_bounds(contents)
+    except ValueError:
+        return {}
+    if start is None or end is None:
+        return {}
+
+    managed_ids: dict[int, str] = {}
+    offset = 0
+    for line_number, raw_line in enumerate(contents.splitlines(keepends=True), start=1):
+        line_start = offset
+        offset += len(raw_line)
+        if line_start < start or line_start >= end:
+            continue
+        task_match = TASK_RE.match(raw_line.rstrip("\r\n"))
+        if not task_match:
+            continue
+        managed_match = MANAGED_ID_RE.search(task_match.group(2))
+        if managed_match:
+            managed_ids[line_number] = managed_match.group(1)
+    return managed_ids
 
 
 def _project_for(path: Path, workspace_roots: tuple[Path, ...]) -> str:
@@ -430,34 +559,30 @@ def scan_todos(
 ) -> ScanResult:
     """Read the injected overall TODO plus bounded project TODO files."""
     current_day = today or date.today()
-    home_path = Path(home_todo_path).resolve()
+    home_path = _absolute_path(Path(home_todo_path))
+    discovered_paths, discovery_warnings = _discover_todo_files(workspace_roots)
     paths: list[Path] = [home_path]
-    paths.extend(path for path in discover_todo_files(workspace_roots) if path != home_path)
+    paths.extend(path for path in discovered_paths if path != home_path)
 
-    warnings: list[str] = []
+    warnings = list(discovery_warnings)
     items: list[TodoItem] = []
     scanned_files = 0
     for path in paths:
-        contents = _read_todo_file(path)
+        contents, warning = _read_todo_file(path)
         if contents is None:
-            try:
-                oversized = path.stat().st_size > MAX_TODO_BYTES
-            except OSError:
-                warnings.append(f"Skipped unreadable TODO file: {path}")
-            else:
-                warning = (
-                    f"Skipped oversized TODO file: {path}"
-                    if oversized
-                    else f"Skipped unreadable TODO file: {path}"
-                )
+            if warning is not None:
                 warnings.append(warning)
             continue
         scanned_files += 1
         project = "Overall" if path == home_path else _project_for(path, workspace_roots)
-        items.extend(
-            rank_item(item, current_day)
-            for item in parse_todos(contents, path, project, current_day)
-        )
+        parsed_items = parse_todos(contents, path, project, current_day)
+        if path == home_path:
+            managed_ids = _managed_ids_by_line(contents)
+            parsed_items = tuple(
+                replace(item, managed_id=managed_ids.get(item.line))
+                for item in parsed_items
+            )
+        items.extend(rank_item(item, current_day) for item in parsed_items)
 
     return ScanResult(
         items=tuple(sorted(items, key=_item_sort_key)),
@@ -667,7 +792,10 @@ class TodoTaskRow(QWidget):
         self.setProperty("urgency", item.urgency)
         self.setProperty("selected", False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(f"Task: {item.text}")
+        self.setAccessibleName(f"Task: {item.text}; {item.urgency} urgency")
+        self.setAccessibleDescription(
+            f"{item.urgency.capitalize()} urgency task from {item.project}"
+        )
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         layout = QHBoxLayout(self)
@@ -683,9 +811,14 @@ class TodoTaskRow(QWidget):
         self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         due_copy = item.due_date.isoformat() if item.due_date else "NO DUE DATE"
         self.meta_label = QLabel(
-            f"SCORE {item.score}  ·  {item.project.upper()}  ·  {due_copy}"
+            f"{item.urgency.upper()} URGENCY  ·  SCORE {item.score}  ·  "
+            f"{item.project.upper()}  ·  {due_copy}"
         )
         self.meta_label.setObjectName("taskMeta")
+        self.meta_label.setAccessibleName(
+            f"{item.urgency} urgency, score {item.score}, "
+            f"project {item.project}, {due_copy.lower()}"
+        )
         self.meta_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         copy_layout.addWidget(self.text_label)
         copy_layout.addWidget(self.meta_label)
@@ -1138,10 +1271,16 @@ class SmartTodoDialog(QDialog):
             row.set_selected(row.item.id == item.id)
         self.why_title_label.setText(item.text)
         due_copy = item.due_date.isoformat() if item.due_date else "No due date"
-        source_copy = f"{item.project} · score {item.score} · {due_copy}"
+        source_copy = (
+            f"{item.urgency.capitalize()} urgency · {item.project} · "
+            f"score {item.score} · {due_copy}"
+        )
         if item.heading:
             source_copy += f"\n{item.heading}"
         self.why_meta_label.setText(source_copy)
+        self.why_meta_label.setAccessibleName(
+            f"{item.urgency} urgency task details"
+        )
         reasons = item.why_now or (
             "Completed inbox item." if item.completed else "Open task needs attention.",
         )
