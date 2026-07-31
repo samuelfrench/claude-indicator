@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 import os
@@ -11,6 +12,25 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+
+from PySide6.QtCore import QDate, QThread, Qt, Signal
+from PySide6.QtGui import QKeyEvent, QMouseEvent
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 MAX_TODO_BYTES = 4 * 1024 * 1024
@@ -445,3 +465,734 @@ def scan_todos(
         scanned_files=scanned_files,
         generated_at=datetime.now(),
     )
+
+
+SMART_TODO_STYLESHEET = """
+QDialog#smartTodoDialog {
+    background: #14141E;
+    color: #B4B4C8;
+}
+QLabel {
+    color: #B4B4C8;
+    font-size: 12px;
+}
+QLabel#dialogTitle {
+    color: #D4A574;
+    font-size: 17px;
+    font-weight: 600;
+}
+QLabel#utilityLabel, QLabel#taskMeta, QLabel#whyEyebrow, QLabel#summaryLabel {
+    color: #B4B4C8;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+}
+QLabel#warningLabel {
+    background: #20202D;
+    border-left: 3px solid #F87171;
+    color: #F87171;
+    padding: 8px 10px;
+}
+QLabel#statusLabel {
+    color: #B4B4C8;
+    font-size: 10px;
+}
+QLineEdit, QDateEdit, QComboBox {
+    background: #20202D;
+    border: 1px solid #B4B4C8;
+    border-radius: 5px;
+    color: #B4B4C8;
+    font-size: 12px;
+    min-height: 30px;
+    padding: 0 8px;
+    selection-background-color: #8B5CF6;
+}
+QLineEdit:focus, QDateEdit:focus, QComboBox:focus, QPushButton:focus,
+QWidget#taskRow:focus {
+    border: 2px solid #D4A574;
+}
+QComboBox QAbstractItemView {
+    background: #20202D;
+    color: #B4B4C8;
+    selection-background-color: #8B5CF6;
+}
+QCheckBox {
+    color: #B4B4C8;
+    font-size: 10px;
+    spacing: 6px;
+}
+QCheckBox::indicator {
+    border: 1px solid #B4B4C8;
+    height: 14px;
+    width: 14px;
+}
+QCheckBox::indicator:checked {
+    background: #8B5CF6;
+}
+QPushButton {
+    background: #20202D;
+    border: 1px solid #8B5CF6;
+    border-radius: 5px;
+    color: #B4B4C8;
+    font-size: 10px;
+    font-weight: 600;
+    min-height: 30px;
+    padding: 0 10px;
+}
+QPushButton:hover {
+    background: #8B5CF6;
+}
+QPushButton:disabled {
+    border-color: #20202D;
+    color: #B4B4C8;
+}
+QPushButton#addButton {
+    background: #D4A574;
+    border-color: #D4A574;
+    color: #14141E;
+}
+QPushButton#completeButton {
+    border-color: #D4A574;
+}
+QScrollArea {
+    background: #14141E;
+    border: 1px solid #20202D;
+    border-radius: 6px;
+}
+QScrollArea > QWidget > QWidget {
+    background: #14141E;
+}
+QWidget#taskRow {
+    background: #20202D;
+    border: 1px solid #20202D;
+    border-left: 3px solid #B4B4C8;
+    border-radius: 5px;
+}
+QWidget#taskRow[urgency="critical"] {
+    border-left-color: #F87171;
+}
+QWidget#taskRow[urgency="high"] {
+    border-left-color: #D4A574;
+}
+QWidget#taskRow[urgency="waiting"] {
+    border-left-color: #B4B4C8;
+}
+QWidget#taskRow[selected="true"] {
+    background: #8B5CF6;
+    border-color: #D4A574;
+}
+QWidget#taskRow[selected="true"] QLabel {
+    color: #14141E;
+}
+QWidget#taskRow[selected="true"] QPushButton {
+    background: #14141E;
+    color: #B4B4C8;
+}
+QLabel#taskText {
+    color: #B4B4C8;
+    font-size: 12px;
+    font-weight: 600;
+}
+QFrame#whyRail {
+    background: #20202D;
+    border: 1px solid #20202D;
+    border-left: 4px solid #D4A574;
+    border-radius: 6px;
+}
+QLabel#whyEyebrow {
+    color: #D4A574;
+}
+QLabel#whyTitle {
+    color: #B4B4C8;
+    font-size: 17px;
+    font-weight: 600;
+}
+QLabel#whyReasons {
+    color: #B4B4C8;
+    font-size: 12px;
+}
+"""
+
+
+class TodoScanWorker(QThread):
+    """Run bounded local TODO discovery without blocking the UI thread."""
+
+    result = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        home_todo_path: Path,
+        workspace_roots: tuple[Path, ...],
+        today: date,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.home_todo_path = Path(home_todo_path)
+        self.workspace_roots = tuple(Path(root) for root in workspace_roots)
+        self.today = today
+
+    def run(self) -> None:
+        try:
+            scan_result = scan_todos(
+                self.home_todo_path,
+                self.workspace_roots,
+                today=self.today,
+            )
+        except Exception as error:  # Keep an unexpected scan failure inside the dialog.
+            self.failed.emit(str(error) or error.__class__.__name__)
+            return
+        self.result.emit(scan_result)
+
+
+class TodoTaskRow(QWidget):
+    """Compact task summary with safe completion and source actions."""
+
+    complete_requested = Signal(str)
+    open_requested = Signal(object)
+    selected = Signal(object)
+
+    def __init__(self, item: TodoItem, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.item = item
+        self.setObjectName("taskRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setProperty("urgency", item.urgency)
+        self.setProperty("selected", False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName(f"Task: {item.text}")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 8, 8)
+        layout.setSpacing(8)
+
+        copy_layout = QVBoxLayout()
+        copy_layout.setContentsMargins(0, 0, 0, 0)
+        copy_layout.setSpacing(3)
+        self.text_label = QLabel(item.text)
+        self.text_label.setObjectName("taskText")
+        self.text_label.setWordWrap(True)
+        self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        due_copy = item.due_date.isoformat() if item.due_date else "NO DUE DATE"
+        self.meta_label = QLabel(
+            f"SCORE {item.score}  ·  {item.project.upper()}  ·  {due_copy}"
+        )
+        self.meta_label.setObjectName("taskMeta")
+        self.meta_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        copy_layout.addWidget(self.text_label)
+        copy_layout.addWidget(self.meta_label)
+        layout.addLayout(copy_layout, 1)
+
+        self.open_button = QPushButton("Open source")
+        self.open_button.setAccessibleName(f"Open source for {item.text}")
+        self.open_button.clicked.connect(lambda: self.open_requested.emit(self.item))
+        layout.addWidget(self.open_button)
+
+        self.complete_button: QPushButton | None = None
+        if item.managed_id is not None and not item.completed:
+            self.complete_button = QPushButton("Complete")
+            self.complete_button.setObjectName("completeButton")
+            self.complete_button.setAccessibleName(f"Complete {item.text}")
+            self.complete_button.clicked.connect(
+                lambda: self.complete_requested.emit(item.managed_id or "")
+            )
+            layout.addWidget(self.complete_button)
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.item)
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.open_requested.emit(self.item)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.open_requested.emit(self.item)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class SmartTodoDialog(QDialog):
+    """Modeless local command center for capturing and ranking TODO items."""
+
+    summary_changed = Signal(int, int)
+
+    def __init__(
+        self,
+        *,
+        home_todo_path: Path = Path.home() / "TODO.md",
+        workspace_roots: tuple[Path, ...] = (
+            Path.home() / "claude-workspace",
+            Path.home() / "codex_workspace",
+        ),
+        today_provider: Callable[[], date] = date.today,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.home_todo_path = Path(home_todo_path)
+        self.workspace_roots = tuple(Path(root) for root in workspace_roots)
+        self.today_provider = today_provider
+        self._all_items: tuple[TodoItem, ...] = ()
+        self._worker: TodoScanWorker | None = None
+        self._refresh_pending = False
+        self._shutting_down = False
+        self._scan_today = self.today_provider()
+        self._selected_item_id: str | None = None
+        self.task_rows: list[TodoTaskRow] = []
+
+        self.setObjectName("smartTodoDialog")
+        self.setWindowTitle("Smart TODOs")
+        self.setMinimumSize(760, 620)
+        self.resize(860, 680)
+        self.setStyleSheet(SMART_TODO_STYLESHEET)
+        self._build_ui()
+        self._set_tab_order()
+
+    @property
+    def worker(self) -> TodoScanWorker | None:
+        return self._worker
+
+    @property
+    def refresh_pending(self) -> bool:
+        return self._refresh_pending
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        header = QHBoxLayout()
+        heading_layout = QVBoxLayout()
+        heading_layout.setSpacing(2)
+        title = QLabel("Smart TODO command center")
+        title.setObjectName("dialogTitle")
+        title.setAccessibleName("Smart TODO command center")
+        subtitle = QLabel("Capture work. Decide what needs attention now.")
+        heading_layout.addWidget(title)
+        heading_layout.addWidget(subtitle)
+        header.addLayout(heading_layout, 1)
+        self.summary_label = QLabel("0 focus  ·  0 overdue  ·  0 urgent  ·  0 waiting  ·  0 open")
+        self.summary_label.setObjectName("summaryLabel")
+        self.summary_label.setAccessibleName("TODO summary")
+        header.addWidget(self.summary_label, 0, Qt.AlignmentFlag.AlignTop)
+        root.addLayout(header)
+
+        capture_label = QLabel("CAPTURE")
+        capture_label.setObjectName("utilityLabel")
+        root.addWidget(capture_label)
+        capture = QHBoxLayout()
+        capture.setSpacing(7)
+        self.task_input = QLineEdit()
+        self.task_input.setPlaceholderText("What needs attention?")
+        self.task_input.setAccessibleName("New task")
+        self.task_input.returnPressed.connect(self._add_task)
+        capture.addWidget(self.task_input, 1)
+        self.due_date_edit = QDateEdit()
+        self.due_date_edit.setCalendarPopup(True)
+        self.due_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.due_date_edit.setDate(QDate(self._scan_today.year, self._scan_today.month, self._scan_today.day))
+        self.due_date_edit.setAccessibleName("Task due date")
+        self.no_due_checkbox = QCheckBox("No due date")
+        self.no_due_checkbox.setChecked(True)
+        self.no_due_checkbox.setAccessibleName("No due date")
+        self.no_due_checkbox.toggled.connect(
+            lambda checked: self.due_date_edit.setDisabled(checked)
+        )
+        self.due_date_edit.setDisabled(True)
+        capture.addWidget(self.due_date_edit)
+        capture.addWidget(self.no_due_checkbox)
+        self.add_button = QPushButton("Add task")
+        self.add_button.setObjectName("addButton")
+        self.add_button.setAccessibleName("Add task")
+        self.add_button.clicked.connect(self._add_task)
+        capture.addWidget(self.add_button)
+        root.addLayout(capture)
+
+        filter_label = QLabel("DECIDE WHAT NEEDS ATTENTION NOW")
+        filter_label.setObjectName("utilityLabel")
+        root.addWidget(filter_label)
+        filters = QHBoxLayout()
+        filters.setSpacing(7)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search task, project, heading, or reason")
+        self.search_edit.setAccessibleName("Search tasks")
+        self.search_edit.textChanged.connect(self._render_items)
+        filters.addWidget(self.search_edit, 1)
+        self.project_combo = QComboBox()
+        self.project_combo.addItem("All projects")
+        self.project_combo.setAccessibleName("Project filter")
+        self.project_combo.currentTextChanged.connect(self._render_items)
+        filters.addWidget(self.project_combo)
+        self.view_combo = QComboBox()
+        self.view_combo.addItems(("Focus", "All open", "Waiting", "Completed inbox"))
+        self.view_combo.setAccessibleName("Task view")
+        self.view_combo.currentTextChanged.connect(self._render_items)
+        filters.addWidget(self.view_combo)
+        self.reset_filters_button = QPushButton("Reset")
+        self.reset_filters_button.setAccessibleName("Reset filters")
+        self.reset_filters_button.clicked.connect(self._reset_filters)
+        filters.addWidget(self.reset_filters_button)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setAccessibleName("Refresh TODO files")
+        self.refresh_button.clicked.connect(self.refresh)
+        filters.addWidget(self.refresh_button)
+        root.addLayout(filters)
+
+        content = QHBoxLayout()
+        content.setSpacing(10)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setAccessibleName("Ranked tasks")
+        self.task_list_widget = QWidget()
+        self.task_list_layout = QVBoxLayout(self.task_list_widget)
+        self.task_list_layout.setContentsMargins(7, 7, 7, 7)
+        self.task_list_layout.setSpacing(6)
+        self.loading_label = QLabel("Loading ranked TODOs…")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_label.setMinimumHeight(56)
+        self.loading_label.hide()
+        self.empty_label = QLabel("No TODO items found. Add one above.")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setMinimumHeight(56)
+        self.empty_label.show()
+        self.render_limit_label = QLabel()
+        self.render_limit_label.setObjectName("utilityLabel")
+        self.render_limit_label.hide()
+        self.task_list_layout.addWidget(self.loading_label)
+        self.task_list_layout.addWidget(self.empty_label)
+        self.task_list_layout.addWidget(self.render_limit_label)
+        self.task_list_layout.addStretch(1)
+        self.scroll_area.setWidget(self.task_list_widget)
+        content.addWidget(self.scroll_area, 1)
+
+        self.why_rail = QFrame()
+        self.why_rail.setObjectName("whyRail")
+        self.why_rail.setMinimumWidth(230)
+        self.why_rail.setMaximumWidth(280)
+        self.why_rail.setAccessibleName("Why now details")
+        why_layout = QVBoxLayout(self.why_rail)
+        why_layout.setContentsMargins(14, 14, 14, 14)
+        why_layout.setSpacing(9)
+        why_eyebrow = QLabel("WHY NOW")
+        why_eyebrow.setObjectName("whyEyebrow")
+        self.why_title_label = QLabel("Select a task")
+        self.why_title_label.setObjectName("whyTitle")
+        self.why_title_label.setWordWrap(True)
+        self.why_meta_label = QLabel("Score and source context appear here.")
+        self.why_meta_label.setObjectName("taskMeta")
+        self.why_meta_label.setWordWrap(True)
+        self.why_reasons_label = QLabel(
+            "The strongest due-date, priority, customer, billing, and verification signals are explained here."
+        )
+        self.why_reasons_label.setObjectName("whyReasons")
+        self.why_reasons_label.setWordWrap(True)
+        self.why_reasons_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        why_layout.addWidget(why_eyebrow)
+        why_layout.addWidget(self.why_title_label)
+        why_layout.addWidget(self.why_meta_label)
+        why_layout.addWidget(self.why_reasons_label, 1)
+        content.addWidget(self.why_rail)
+        root.addLayout(content, 1)
+
+        self.warning_label = QLabel()
+        self.warning_label.setObjectName("warningLabel")
+        self.warning_label.setAccessibleName("Scan warnings")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.hide()
+        root.addWidget(self.warning_label)
+        self.status_label = QLabel("Ready to scan local TODO files.")
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setAccessibleName("TODO status")
+        self.status_label.setWordWrap(True)
+        root.addWidget(self.status_label)
+
+    def _set_tab_order(self) -> None:
+        self.setTabOrder(self.task_input, self.due_date_edit)
+        self.setTabOrder(self.due_date_edit, self.no_due_checkbox)
+        self.setTabOrder(self.no_due_checkbox, self.add_button)
+        self.setTabOrder(self.add_button, self.search_edit)
+        self.setTabOrder(self.search_edit, self.project_combo)
+        self.setTabOrder(self.project_combo, self.view_combo)
+        self.setTabOrder(self.view_combo, self.reset_filters_button)
+        self.setTabOrder(self.reset_filters_button, self.refresh_button)
+
+    def show_and_refresh(self) -> None:
+        self.show()
+        if QApplication.platformName() != "offscreen":
+            self.raise_()
+            self.activateWindow()
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self._shutting_down:
+            return
+        if self._worker is not None and self._worker.isRunning():
+            self._refresh_pending = True
+            return
+        try:
+            self._scan_today = self.today_provider()
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+            return
+        self.refresh_button.setDisabled(True)
+        self.loading_label.show()
+        self.empty_label.hide()
+        self.render_limit_label.hide()
+        self.status_label.setText("Scanning local TODO files…")
+        worker = TodoScanWorker(
+            home_todo_path=self.home_todo_path,
+            workspace_roots=self.workspace_roots,
+            today=self._scan_today,
+            parent=self,
+        )
+        self._worker = worker
+        worker.result.connect(self._on_scan_result)
+        worker.failed.connect(self._on_scan_failed)
+        worker.finished.connect(self._on_worker_finished)
+        worker.start()
+
+    def _on_scan_result(self, scan_result: ScanResult) -> None:
+        if self._shutting_down:
+            return
+        self._all_items = scan_result.items
+        self._update_summary()
+        self._rebuild_project_filter()
+        self.warning_label.setText("\n".join(scan_result.warnings))
+        self.warning_label.setVisible(bool(scan_result.warnings))
+        self.status_label.setText(
+            f"Scanned {scan_result.scanned_files} TODO files · {len(scan_result.items)} tasks."
+        )
+        self._render_items()
+
+    def _on_scan_failed(self, message: str) -> None:
+        if self._shutting_down:
+            return
+        self.loading_label.hide()
+        self.status_label.setText(message)
+        if not self._all_items:
+            self.empty_label.setText("TODO scan failed. Refresh to try again.")
+            self.empty_label.show()
+
+    def _on_worker_finished(self) -> None:
+        worker = self._worker
+        if worker is not None:
+            worker.deleteLater()
+        self._worker = None
+        self.refresh_button.setEnabled(not self._shutting_down)
+        if self._refresh_pending and not self._shutting_down:
+            self._refresh_pending = False
+            self.refresh()
+
+    def _update_summary(self) -> None:
+        open_items = [item for item in self._all_items if not item.completed]
+        focus_count = sum(not item.waiting for item in open_items)
+        overdue_count = sum(
+            item.due_date is not None and item.due_date < self._scan_today
+            for item in open_items
+        )
+        urgent_count = sum(
+            item.urgency in {"critical", "high"} and not item.waiting
+            for item in open_items
+        )
+        waiting_count = sum(item.waiting for item in open_items)
+        self.summary_label.setText(
+            f"{focus_count} focus  ·  {overdue_count} overdue  ·  "
+            f"{urgent_count} urgent  ·  {waiting_count} waiting  ·  {len(open_items)} open"
+        )
+        self.summary_changed.emit(focus_count, overdue_count)
+
+    def _rebuild_project_filter(self) -> None:
+        selected_project = self.project_combo.currentText()
+        projects = sorted({item.project for item in self._all_items}, key=str.casefold)
+        self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+        self.project_combo.addItem("All projects")
+        self.project_combo.addItems(projects)
+        if selected_project in projects:
+            self.project_combo.setCurrentText(selected_project)
+        self.project_combo.blockSignals(False)
+
+    def _filtered_items(self) -> tuple[TodoItem, ...]:
+        view = self.view_combo.currentText()
+        project = self.project_combo.currentText()
+        query = self.search_edit.text().strip().casefold()
+        filtered: list[TodoItem] = []
+        for item in self._all_items:
+            if view == "Focus" and (item.completed or item.waiting):
+                continue
+            if view == "All open" and item.completed:
+                continue
+            if view == "Waiting" and (item.completed or not item.waiting):
+                continue
+            if view == "Completed inbox" and (
+                not item.completed or item.managed_id is None
+            ):
+                continue
+            if project != "All projects" and item.project != project:
+                continue
+            if query:
+                search_values = (
+                    item.text,
+                    item.project,
+                    item.heading,
+                    *item.tags,
+                    *item.why_now,
+                )
+                if query not in " ".join(search_values).casefold():
+                    continue
+            filtered.append(item)
+        return tuple(filtered)
+
+    def _clear_task_rows(self) -> None:
+        for row in self.task_rows:
+            self.task_list_layout.removeWidget(row)
+            row.deleteLater()
+        self.task_rows = []
+
+    def _render_items(self, *_args) -> None:
+        self.loading_label.hide()
+        self._clear_task_rows()
+        filtered = self._filtered_items()
+        visible_items = filtered[:MAX_VISIBLE_ITEMS]
+        for item in visible_items:
+            row = TodoTaskRow(item, self.task_list_widget)
+            row.selected.connect(self._select_item)
+            row.complete_requested.connect(self._complete_task)
+            row.open_requested.connect(self._open_item)
+            self.task_list_layout.insertWidget(self.task_list_layout.count() - 1, row)
+            self.task_rows.append(row)
+
+        if not filtered:
+            message = (
+                "No TODO items found. Add one above."
+                if not self._all_items
+                else "No tasks match this view. Reset filters or choose another view."
+            )
+            self.empty_label.setText(message)
+            self.empty_label.show()
+        else:
+            self.empty_label.hide()
+
+        if len(filtered) > MAX_VISIBLE_ITEMS:
+            self.render_limit_label.setText(
+                f"Showing first {MAX_VISIBLE_ITEMS} of {len(filtered)} matching tasks."
+            )
+            self.render_limit_label.show()
+        else:
+            self.render_limit_label.hide()
+
+        selected = next(
+            (item for item in visible_items if item.id == self._selected_item_id),
+            visible_items[0] if visible_items else None,
+        )
+        if selected is None:
+            self._selected_item_id = None
+            self.why_title_label.setText("No task selected")
+            self.why_meta_label.setText("Choose a populated view to inspect ranking context.")
+            self.why_reasons_label.setText(
+                "Why-now reasons appear here when a task is selected."
+            )
+        else:
+            self._select_item(selected)
+
+    def _select_item(self, item: TodoItem) -> None:
+        self._selected_item_id = item.id
+        for row in self.task_rows:
+            row.set_selected(row.item.id == item.id)
+        self.why_title_label.setText(item.text)
+        due_copy = item.due_date.isoformat() if item.due_date else "No due date"
+        source_copy = f"{item.project} · score {item.score} · {due_copy}"
+        if item.heading:
+            source_copy += f"\n{item.heading}"
+        self.why_meta_label.setText(source_copy)
+        reasons = item.why_now or (
+            "Completed inbox item." if item.completed else "Open task needs attention.",
+        )
+        self.why_reasons_label.setText("\n\n".join(f"— {reason}" for reason in reasons))
+
+    def _reset_filters(self) -> None:
+        self.search_edit.blockSignals(True)
+        self.project_combo.blockSignals(True)
+        self.view_combo.blockSignals(True)
+        self.search_edit.clear()
+        self.project_combo.setCurrentText("All projects")
+        self.view_combo.setCurrentText("Focus")
+        self.search_edit.blockSignals(False)
+        self.project_combo.blockSignals(False)
+        self.view_combo.blockSignals(False)
+        self._render_items()
+
+    def _add_task(self) -> None:
+        due_date = None
+        if not self.no_due_checkbox.isChecked():
+            due_date = self.due_date_edit.date().toPython()
+        try:
+            InboxStore(self.home_todo_path).add(self.task_input.text(), due_date)
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+            return
+        self.task_input.clear()
+        self.status_label.setText("Task added. Refreshing local TODO files…")
+        self.refresh()
+
+    def _complete_task(self, managed_id: str) -> None:
+        item = next(
+            (
+                candidate
+                for candidate in self._all_items
+                if candidate.managed_id == managed_id and not candidate.completed
+            ),
+            None,
+        )
+        if item is None:
+            self.status_label.setText("Only open Indicator Inbox tasks can be completed here.")
+            return
+        try:
+            InboxStore(self.home_todo_path).complete(managed_id)
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+            return
+        self.status_label.setText("Task completed. Refreshing local TODO files…")
+        self.refresh()
+
+    def _open_item(self, item: TodoItem) -> None:
+        try:
+            open_source_item(item)
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+
+    def shutdown(self) -> None:
+        self._shutting_down = True
+        self._refresh_pending = False
+        worker = self._worker
+        if worker is None:
+            return
+        for signal, slot in (
+            (worker.result, self._on_scan_result),
+            (worker.failed, self._on_scan_failed),
+            (worker.finished, self._on_worker_finished),
+        ):
+            try:
+                signal.disconnect(slot)
+            except RuntimeError:
+                pass
+        if worker.isRunning():
+            worker.wait()
+        worker.deleteLater()
+        self._worker = None
