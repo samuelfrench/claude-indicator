@@ -187,9 +187,9 @@ def rank_item(item: TodoItem, today: date) -> TodoItem:
         return replace(item, score=0, urgency="completed", why_now=(), waiting=False)
 
     score = 20
-    reasons: list[tuple[int, int, str]] = []
+    reasons: list[tuple[int, int, str]] = [(0, 0, "open task needs attention")]
     context = f"{item.heading} {item.text}"
-    reason_order = 0
+    reason_order = 1
 
     if item.due_date is not None:
         date_score, date_reason = _date_reason(item.due_date, today)
@@ -224,9 +224,9 @@ def rank_item(item: TodoItem, today: date) -> TodoItem:
     if waiting and "waiting" not in tags:
         tags = (*tags, "waiting")
     if gate_date is not None and gate_date > today:
-        reasons.append((0, reason_order, f"gated until {gate_date.isoformat()}"))
+        reasons.append((100, reason_order, f"gated until {gate_date.isoformat()}"))
     elif waiting:
-        reasons.append((0, reason_order, "explicitly waiting or on hold"))
+        reasons.append((100, reason_order, "explicitly waiting or on hold"))
 
     reasons.sort(key=lambda entry: (-entry[0], entry[1]))
     why_now = tuple(reason for _, _, reason in reasons[:4])
