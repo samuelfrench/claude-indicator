@@ -517,9 +517,15 @@ QComboBox QAbstractItemView {
     selection-background-color: #8B5CF6;
 }
 QCheckBox {
+    border: 2px solid #14141E;
+    border-radius: 3px;
     color: #B4B4C8;
     font-size: 10px;
+    padding: 2px;
     spacing: 6px;
+}
+QCheckBox:focus {
+    border-color: #D4A574;
 }
 QCheckBox::indicator {
     border: 1px solid #B4B4C8;
@@ -749,6 +755,9 @@ class SmartTodoDialog(QDialog):
         self.today_provider = today_provider
         self._all_items: tuple[TodoItem, ...] = ()
         self._worker: TodoScanWorker | None = None
+        self._worker_finished_slots: dict[
+            TodoScanWorker, Callable[[], None]
+        ] = {}
         self._refresh_pending = False
         self._shutting_down = False
         self._scan_today = self.today_provider()
@@ -942,7 +951,7 @@ class SmartTodoDialog(QDialog):
     def refresh(self) -> None:
         if self._shutting_down:
             return
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is not None:
             self._refresh_pending = True
             return
         try:
@@ -964,7 +973,9 @@ class SmartTodoDialog(QDialog):
         self._worker = worker
         worker.result.connect(self._on_scan_result)
         worker.failed.connect(self._on_scan_failed)
-        worker.finished.connect(self._on_worker_finished)
+        finished_slot = lambda worker=worker: self._on_worker_finished(worker)
+        self._worker_finished_slots[worker] = finished_slot
+        worker.finished.connect(finished_slot)
         worker.start()
 
     def _on_scan_result(self, scan_result: ScanResult) -> None:
@@ -989,10 +1000,11 @@ class SmartTodoDialog(QDialog):
             self.empty_label.setText("TODO scan failed. Refresh to try again.")
             self.empty_label.show()
 
-    def _on_worker_finished(self) -> None:
-        worker = self._worker
-        if worker is not None:
-            worker.deleteLater()
+    def _on_worker_finished(self, worker: TodoScanWorker) -> None:
+        self._worker_finished_slots.pop(worker, None)
+        worker.deleteLater()
+        if worker is not self._worker:
+            return
         self._worker = None
         self.refresh_button.setEnabled(not self._shutting_down)
         if self._refresh_pending and not self._shutting_down:
@@ -1186,10 +1198,15 @@ class SmartTodoDialog(QDialog):
         for signal, slot in (
             (worker.result, self._on_scan_result),
             (worker.failed, self._on_scan_failed),
-            (worker.finished, self._on_worker_finished),
         ):
             try:
                 signal.disconnect(slot)
+            except RuntimeError:
+                pass
+        finished_slot = self._worker_finished_slots.pop(worker, None)
+        if finished_slot is not None:
+            try:
+                worker.finished.disconnect(finished_slot)
             except RuntimeError:
                 pass
         if worker.isRunning():

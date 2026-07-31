@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import date
+import os
 from pathlib import Path
 import threading
 import time
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
@@ -93,15 +95,7 @@ def task_row(dialog: SmartTodoDialog, text: str):
     return next(row for row in dialog.task_rows if row.item.text == text)
 
 
-def test_initial_loading_state_disables_refresh(qapp, tmp_path, dialog_cleanup, monkeypatch):
-    release = threading.Event()
-    real_scan = smart_todos.scan_todos
-
-    def blocked_scan(*args, **kwargs):
-        release.wait(timeout=2)
-        return real_scan(*args, **kwargs)
-
-    monkeypatch.setattr(smart_todos, "scan_todos", blocked_scan)
+def test_initial_loading_state_disables_refresh(qapp, tmp_path, dialog_cleanup):
     dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
 
     dialog.show_and_refresh()
@@ -109,7 +103,6 @@ def test_initial_loading_state_disables_refresh(qapp, tmp_path, dialog_cleanup, 
     assert dialog.refresh_button.isEnabled() is False
     assert dialog.status_label.text() == "Scanning local TODO files…"
     assert dialog.loading_label.isVisible()
-    release.set()
     wait_for_scan(dialog, qapp)
 
 
@@ -311,6 +304,25 @@ def test_warning_banner_and_empty_state(qapp, tmp_path, dialog_cleanup):
     assert dialog.empty_label.text() == "No TODO items found. Add one above."
 
 
+def test_real_scanner_failure_is_inline_and_dialog_stays_usable(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="- [ ] Invalid calendar run due: 2026-08-01\n",
+    )
+    dialog.today_provider = object
+
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    assert "unsupported operand type" in dialog.status_label.text()
+    assert dialog.refresh_button.isEnabled()
+    assert dialog.empty_label.text() == "TODO scan failed. Refresh to try again."
+    assert dialog.empty_label.isVisible()
+
+
 def test_oversized_warning_does_not_hide_other_results(qapp, tmp_path, dialog_cleanup):
     workspace = tmp_path / "workspace"
     huge = workspace / "huge" / "TODO.md"
@@ -331,53 +343,154 @@ def test_oversized_warning_does_not_hide_other_results(qapp, tmp_path, dialog_cl
 
 
 def test_repeated_refresh_while_active_coalesces_to_one_follow_up(
-    qapp, tmp_path, dialog_cleanup, monkeypatch
+    qapp, tmp_path, dialog_cleanup
 ):
-    release = threading.Event()
-    calls = []
-    real_scan = smart_todos.scan_todos
-
-    def controlled_scan(*args, **kwargs):
-        calls.append(1)
-        if len(calls) == 1:
-            release.wait(timeout=2)
-        return real_scan(*args, **kwargs)
-
-    monkeypatch.setattr(smart_todos, "scan_todos", controlled_scan)
-    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"bulk": "plain filler line\n" * 200_000},
+    )
+    summaries = []
+    dialog.summary_changed.connect(lambda focus, overdue: summaries.append((focus, overdue)))
     dialog.refresh()
+    first_worker = dialog.worker
+    assert first_worker is not None
+    deadline = time.monotonic() + 1
+    while not first_worker.isRunning() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert first_worker.isRunning()
+
+    dialog.home_todo_path.write_text("- [ ] Captured during scan\n", encoding="utf-8")
     dialog.refresh()
     dialog.refresh()
     assert dialog.refresh_pending is True
 
-    release.set()
     wait_for_scan(dialog, qapp)
 
-    assert len(calls) == 2
+    assert len(summaries) == 2
+    assert summaries[-1] == (1, 0)
+    assert visible_task_texts(dialog) == ["Captured during scan"]
 
 
-def test_shutdown_waits_for_active_worker(qapp, tmp_path, dialog_cleanup, monkeypatch):
-    release = threading.Event()
-    started = threading.Event()
-    real_scan = smart_todos.scan_todos
+def test_summary_refresh_before_finished_keeps_specific_worker_ownership(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="- [ ] First task\n",
+    )
+    summaries = []
 
-    def controlled_scan(*args, **kwargs):
-        started.set()
-        release.wait(timeout=2)
-        return real_scan(*args, **kwargs)
+    def refresh_from_summary(focus, overdue):
+        summaries.append((focus, overdue))
+        if len(summaries) == 1:
+            dialog.home_todo_path.write_text(
+                "- [ ] First task\n- [ ] Second task\n",
+                encoding="utf-8",
+            )
+            dialog.refresh()
 
-    monkeypatch.setattr(smart_todos, "scan_todos", controlled_scan)
-    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    dialog.summary_changed.connect(refresh_from_summary)
     dialog.refresh()
-    assert started.wait(timeout=1)
+    first_worker = dialog.worker
+    assert first_worker is not None
+    first_worker.finished.disconnect()
+    assert first_worker.wait(2000)
+
+    qapp.processEvents()
+    assert dialog.worker is first_worker
+    assert dialog.refresh_pending is True
+
+    dialog._on_worker_finished(first_worker)
+    follow_up_worker = dialog.worker
+    assert follow_up_worker is not None
+    assert follow_up_worker is not first_worker
+    wait_for_scan(dialog, qapp)
+
+    assert summaries == [(1, 0), (2, 0)]
+    assert dialog.worker is None
+    dialog.shutdown()
+    assert dialog.worker is None
+
+
+def test_shutdown_waits_for_active_worker(qapp, tmp_path, dialog_cleanup):
+    release = threading.Event()
+    reader_connected = threading.Event()
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    fifo_path = tmp_path / "workspace" / "fifo-project" / "TODO.md"
+    fifo_path.parent.mkdir(parents=True)
+    os.mkfifo(fifo_path)
+
+    def write_when_released():
+        with fifo_path.open("w", encoding="utf-8") as fifo:
+            reader_connected.set()
+            release.wait(timeout=2)
+            fifo.write("- [ ] Task delivered through real FIFO file\n")
+
+    writer = threading.Thread(target=write_when_released)
+    writer.start()
+    dialog.refresh()
+    assert reader_connected.wait(timeout=1)
     threading.Timer(0.12, release.set).start()
 
     before = time.monotonic()
     dialog.shutdown()
     elapsed = time.monotonic() - before
+    writer.join(timeout=1)
 
     assert elapsed >= 0.1
     assert dialog.worker is None
+    assert writer.is_alive() is False
+
+
+def _perimeter_contains(widget, color: QColor) -> bool:
+    image = widget.grab().toImage()
+    width = image.width()
+    height = image.height()
+    coordinates = (
+        [(x, 0) for x in range(width)]
+        + [(x, height - 1) for x in range(width)]
+        + [(0, y) for y in range(height)]
+        + [(width - 1, y) for y in range(height)]
+    )
+    return any(image.pixelColor(x, y) == color for x, y in coordinates)
+
+
+def test_keyboard_tab_order_has_visible_focus_for_interactive_controls(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    dialog.no_due_checkbox.setChecked(False)
+    dialog.show()
+    qapp.processEvents()
+    dialog.task_input.setFocus(Qt.FocusReason.OtherFocusReason)
+    qapp.processEvents()
+    gold = QColor("#D4A574")
+    focus_order = (
+        dialog.task_input,
+        dialog.due_date_edit,
+        dialog.no_due_checkbox,
+        dialog.add_button,
+        dialog.search_edit,
+        dialog.project_combo,
+        dialog.view_combo,
+        dialog.reset_filters_button,
+        dialog.refresh_button,
+    )
+
+    for index, widget in enumerate(focus_order):
+        assert widget.hasFocus()
+        assert _perimeter_contains(widget, gold)
+        if index == len(focus_order) - 1:
+            break
+        for _ in range(4):
+            QTest.keyClick(widget, Qt.Key.Key_Tab)
+            qapp.processEvents()
+            if not widget.hasFocus():
+                break
+        assert focus_order[index + 1].hasFocus()
 
 
 def test_dialog_has_tool_flags_size_accessibility_and_exact_palette(
