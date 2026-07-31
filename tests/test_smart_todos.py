@@ -1,4 +1,5 @@
 from datetime import date
+import os
 from pathlib import Path
 import stat
 import uuid
@@ -121,6 +122,37 @@ def test_scan_warns_for_each_unavailable_workspace_root(tmp_path):
         f"Skipped unavailable workspace root: {missing_root}",
         f"Skipped unavailable workspace root: {non_directory_root}",
     )
+
+
+def test_scan_skips_symlink_directories_silently_but_keeps_safety_warnings(tmp_path):
+    root = tmp_path / "workspaces"
+    home_todo = write_todo(tmp_path / "home" / "TODO.md", "# TODO\n")
+    external_library = tmp_path / "external-library"
+    write_todo(external_library / "TODO.md", "- [ ] Must not follow library link\n")
+    library_link = root / "project" / "env" / "lib64"
+    library_link.parent.mkdir(parents=True)
+    library_link.symlink_to(external_library, target_is_directory=True)
+
+    external_todo = write_todo(
+        tmp_path / "external-todo" / "TODO.md",
+        "- [ ] Must not follow TODO link\n",
+    )
+    todo_link = root / "linked-project" / "TODO.md"
+    todo_link.parent.mkdir(parents=True)
+    todo_link.symlink_to(external_todo)
+    fifo_todo = root / "fifo-project" / "TODO.md"
+    fifo_todo.parent.mkdir(parents=True)
+    os.mkfifo(fifo_todo)
+    missing_root = tmp_path / "missing-workspace"
+
+    result = scan_todos(home_todo, (root, missing_root), today=TODAY)
+
+    assert result.items == ()
+    assert set(result.warnings) == {
+        f"Skipped symlink TODO file: {todo_link}",
+        f"Skipped special TODO file: {fifo_todo.resolve()}",
+        f"Skipped unavailable workspace root: {missing_root}",
+    }
 
 
 def test_scan_skips_oversized_file_without_aborting_and_includes_home_once(tmp_path):

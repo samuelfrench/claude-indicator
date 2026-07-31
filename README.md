@@ -83,10 +83,10 @@ or hidden independently.
 
 The scanner reads `~/TODO.md` plus `TODO.md` files at bounded depth under
 `~/claude-workspace` and `~/codex_workspace`. It skips hidden, dependency,
-build, cache, coverage, test-output, and nested worktree directories, caps the
-rendered result set, and reports unavailable roots, unreadable or oversized
-files, symlinks, and special files in the dialog. Workspace candidates remain
-confined beneath their resolved configured root.
+build, cache, coverage, test-output, nested worktree, and symlink directories,
+caps the rendered result set, and reports unavailable roots, unreadable or
+oversized files, symlink TODO files, and special files in the dialog. Workspace
+candidates remain confined beneath their resolved configured root.
 All scanning, ranking, filtering, persistence, and source navigation stay on
 this computer. Smart TODOs adds no API calls, hosted service, subscription, or
 billable usage.

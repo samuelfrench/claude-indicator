@@ -215,6 +215,75 @@ def test_selection_updates_why_now_rail(qapp, tmp_path, dialog_cleanup):
     assert "beta" in dialog.why_meta_label.text()
 
 
+def test_860x680_long_real_todos_stay_compact_elided_accessible_and_actionable(
+    qapp, tmp_path, dialog_cleanup, monkeypatch
+):
+    managed_text = "P0 production recovery " + " ".join(["managed detail"] * 130)
+    long_token = "unbroken" * 18
+    project_tasks = (
+        "- [ ] Customer launch " + ("alpha context " * 125) + "\n"
+        "- [ ] Billing follow-up " + long_token + (" beta context " * 120) + "\n"
+        "- [ ] Verify deployment " + ("gamma context " * 210) + "\n"
+    )
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "# TODO\n\n"
+            "<!-- claude-indicator:inbox:start -->\n"
+            "## Indicator Inbox\n\n"
+            f"- [ ] {managed_text} <!-- claude-indicator:id=long-managed -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+        projects={"alpha": project_tasks},
+    )
+    opened = []
+    monkeypatch.setattr(smart_todos, "open_source_item", opened.append)
+    dialog.resize(860, 680)
+
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    qapp.processEvents()
+
+    assert (dialog.width(), dialog.height()) == (860, 680)
+    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+    assert len(dialog.task_rows) == 4
+    assert all(1500 <= len(row.item.text) <= 3000 for row in dialog.task_rows)
+    assert any(long_token in row.item.text for row in dialog.task_rows)
+    # One task-copy line, one metadata line, controls, and margins fit below 90px.
+    assert all(0 < row.height() <= 90 for row in dialog.task_rows)
+    for row in dialog.task_rows:
+        assert row.text_label.text() != row.item.text
+        assert row.text_label.text().endswith("…")
+        assert row.text_label.toolTip() == row.item.text
+        assert row.text_label.accessibleName() == row.item.text
+        assert row.item.text in row.text_label.accessibleDescription()
+        assert row.open_button.isVisible()
+        assert row.open_button.geometry().right() <= row.width()
+
+    managed_row = task_row(dialog, managed_text)
+    QTest.mouseClick(managed_row, Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+    assert dialog.why_title_label.text() != managed_text
+    assert dialog.why_title_label.text().endswith("…")
+    assert dialog.why_title_label.height() <= 40
+    assert dialog.why_title_label.toolTip() == managed_text
+    assert dialog.why_title_label.accessibleName() == managed_text
+    assert managed_text in dialog.why_title_label.accessibleDescription()
+
+    managed_row.open_button.click()
+    assert opened == [managed_row.item]
+    assert managed_row.complete_button is not None
+    assert managed_row.complete_button.isVisible()
+    assert managed_row.complete_button.geometry().right() <= managed_row.width()
+    managed_row.complete_button.click()
+    wait_for_scan(dialog, qapp)
+
+    assert f"- [x] {managed_text}" in dialog.home_todo_path.read_text(encoding="utf-8")
+    assert managed_text not in visible_task_texts(dialog)
+    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+
+
 def test_moving_selection_repolishes_task_copy(qapp, tmp_path, dialog_cleanup):
     dialog = make_dialog_with_fixture(tmp_path, dialog_cleanup)
     dialog.show_and_refresh()

@@ -16,7 +16,7 @@ import tempfile
 import uuid
 
 from PySide6.QtCore import QDate, QThread, Qt, Signal
-from PySide6.QtGui import QKeyEvent, QMouseEvent
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -370,7 +370,6 @@ def _discover_todo_files(
                     continue
                 child = directory_path / name
                 if child.is_symlink():
-                    warnings.append(f"Skipped symlink workspace directory: {child}")
                     continue
                 allowed_directories.append(name)
             dirnames[:] = allowed_directories
@@ -777,6 +776,38 @@ class TodoScanWorker(QThread):
         self.result.emit(scan_result)
 
 
+class ElidedLabel(QLabel):
+    """Render one compact line while preserving the complete accessible copy."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setFullText(text)
+
+    def setFullText(self, text: str) -> None:
+        self._full_text = text
+        self.setToolTip(text)
+        self.setAccessibleName(text)
+        self.setAccessibleDescription(f"Full text: {text}")
+        self._update_elision()
+
+    def _update_elision(self) -> None:
+        available_width = max(1, self.contentsRect().width())
+        super().setText(
+            self.fontMetrics().elidedText(
+                self._full_text,
+                Qt.TextElideMode.ElideRight,
+                available_width,
+            )
+        )
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_elision()
+
+
 class TodoTaskRow(QWidget):
     """Compact task summary with safe completion and source actions."""
 
@@ -805,9 +836,8 @@ class TodoTaskRow(QWidget):
         copy_layout = QVBoxLayout()
         copy_layout.setContentsMargins(0, 0, 0, 0)
         copy_layout.setSpacing(3)
-        self.text_label = QLabel(item.text)
+        self.text_label = ElidedLabel(item.text)
         self.text_label.setObjectName("taskText")
-        self.text_label.setWordWrap(True)
         self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         due_copy = item.due_date.isoformat() if item.due_date else "NO DUE DATE"
         self.meta_label = QLabel(
@@ -815,6 +845,9 @@ class TodoTaskRow(QWidget):
             f"{item.project.upper()}  ·  {due_copy}"
         )
         self.meta_label.setObjectName("taskMeta")
+        self.meta_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         self.meta_label.setAccessibleName(
             f"{item.urgency} urgency, score {item.score}, "
             f"project {item.project}, {due_copy.lower()}"
@@ -1042,9 +1075,8 @@ class SmartTodoDialog(QDialog):
         why_layout.setSpacing(9)
         why_eyebrow = QLabel("WHY NOW")
         why_eyebrow.setObjectName("whyEyebrow")
-        self.why_title_label = QLabel("Select a task")
+        self.why_title_label = ElidedLabel("Select a task")
         self.why_title_label.setObjectName("whyTitle")
-        self.why_title_label.setWordWrap(True)
         self.why_meta_label = QLabel("Score and source context appear here.")
         self.why_meta_label.setObjectName("taskMeta")
         self.why_meta_label.setWordWrap(True)
@@ -1257,7 +1289,7 @@ class SmartTodoDialog(QDialog):
         )
         if selected is None:
             self._selected_item_id = None
-            self.why_title_label.setText("No task selected")
+            self.why_title_label.setFullText("No task selected")
             self.why_meta_label.setText("Choose a populated view to inspect ranking context.")
             self.why_reasons_label.setText(
                 "Why-now reasons appear here when a task is selected."
@@ -1269,7 +1301,7 @@ class SmartTodoDialog(QDialog):
         self._selected_item_id = item.id
         for row in self.task_rows:
             row.set_selected(row.item.id == item.id)
-        self.why_title_label.setText(item.text)
+        self.why_title_label.setFullText(item.text)
         due_copy = item.due_date.isoformat() if item.due_date else "No due date"
         source_copy = (
             f"{item.urgency.capitalize()} urgency · {item.project} · "
