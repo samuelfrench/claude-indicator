@@ -285,7 +285,35 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(widget.model_bars, [])
         self.assertEqual(widget.height(), 130)
 
-    def _make_inert_claude_widget(self, *, tray_available: bool = False):
+    class _FakeSignal:
+        def __init__(self):
+            self.slot = None
+
+        def connect(self, slot):
+            self.slot = slot
+
+        def emit(self, *args):
+            if self.slot is not None:
+                self.slot(*args)
+
+    class _FakeSmartTodoDialog:
+        def __init__(self, *, parent=None):
+            self.parent = parent
+            self.summary_changed = WidgetUiTest._FakeSignal()
+            self.show_and_refresh = Mock()
+            self.raise_ = Mock()
+            self.activateWindow = Mock()
+            self.shutdown = Mock()
+
+    def _make_inert_claude_widget(
+        self,
+        *,
+        tray_available: bool = False,
+        smart_todo_dialog_factory=None,
+    ):
+        dialog_factory = smart_todo_dialog_factory or Mock(
+            side_effect=self._FakeSmartTodoDialog
+        )
         patches = [
             patch.object(
                 QSystemTrayIcon,
@@ -301,6 +329,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_fetch_cron_jobs", lambda self: None),
             patch.object(ClaudeWidget, "_update_system_metrics", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
+            patch.object(claude_widget, "SmartTodoDialog", dialog_factory),
         ]
         for active_patch in patches:
             active_patch.start()
@@ -308,6 +337,78 @@ class WidgetUiTest(unittest.TestCase):
         widget = ClaudeWidget()
         self.addCleanup(widget.deleteLater)
         return widget
+
+    def test_task_compass_icon_renders_common_tray_sizes(self):
+        for size in (16, 32, 64):
+            with self.subTest(size=size):
+                icon = claude_widget.build_task_compass_icon(size)
+                self.assertFalse(icon.isNull())
+                self.assertFalse(icon.pixmap(size, size).isNull())
+
+    def test_claude_tray_menu_places_smart_todos_first(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+
+        actions = widget._tray.contextMenu().actions()
+
+        self.assertEqual(
+            [action.text() for action in actions],
+            ["Smart TODOs…", "Show/Hide", "", "Quit"],
+        )
+        self.assertTrue(actions[2].isSeparator())
+
+    def test_smart_todo_action_creates_one_dialog_and_reuses_it(self):
+        dialog_factory = Mock(side_effect=self._FakeSmartTodoDialog)
+        widget = self._make_inert_claude_widget(
+            tray_available=True,
+            smart_todo_dialog_factory=dialog_factory,
+        )
+
+        widget._smart_todo_action.trigger()
+        dialog = widget._smart_todo_dialog
+        widget._smart_todo_action.trigger()
+
+        dialog_factory.assert_called_once_with(parent=widget)
+        self.assertIsNotNone(dialog)
+        self.assertIs(widget._smart_todo_dialog, dialog)
+        self.assertEqual(dialog.show_and_refresh.call_count, 2)
+        self.assertEqual(dialog.raise_.call_count, 2)
+        self.assertEqual(dialog.activateWindow.call_count, 2)
+
+    def test_smart_todo_summary_updates_tray_tooltip(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        widget._smart_todo_action.trigger()
+
+        widget._smart_todo_dialog.summary_changed.emit(7, 2)
+
+        self.assertEqual(
+            widget._tray.toolTip(),
+            "Claude Indicator · 7 focus · 2 overdue",
+        )
+
+    def test_tray_unavailable_does_not_create_smart_todo_action(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+
+        self.assertIsNone(widget._tray)
+        self.assertIsNone(widget._smart_todo_action)
+        self.assertIsNone(widget._smart_todo_dialog)
+
+    def test_close_and_application_shutdown_stop_dialog_exactly_once(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        dialog = self._FakeSmartTodoDialog(parent=widget)
+        widget._smart_todo_dialog = dialog
+
+        class Event:
+            accepted = False
+
+            def accept(self):
+                self.accepted = True
+
+        event = Event()
+        widget.closeEvent(event)
+        widget.shutdown()
+
+        self.assertTrue(event.accepted)
+        dialog.shutdown.assert_called_once_with()
 
     def test_widget_grows_when_model_limit_bar_appears(self):
         widget = self._make_inert_claude_widget()

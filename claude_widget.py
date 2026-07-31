@@ -36,6 +36,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from smart_todos import SmartTodoDialog
+
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 CODEX_HOME = Path.home() / ".codex"
@@ -67,6 +69,51 @@ CODEX_RATE_LIMIT_TAIL_BYTES = 4 * 1024 * 1024
 # Rate-limit backoff: /api/oauth/usage rate-limits aggressively (GH anthropics/claude-code#31637)
 RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
 RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
+
+
+def build_task_compass_icon(size: int = 64) -> QIcon:
+    """Build the tray's task-compass mark at the requested square size."""
+    px = QPixmap(size, size)
+    px.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(px)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    scale = size / 64.0
+    ring_width = max(1.5, 5.0 * scale)
+    inset = ring_width / 2.0 + max(1.0, 2.0 * scale)
+    field = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
+    painter.setBrush(QColor("#14141E"))
+    painter.setPen(QPen(QColor("#D4A574"), ring_width))
+    painter.drawEllipse(field)
+
+    check = QPainterPath()
+    check.moveTo(17 * scale, 33 * scale)
+    check.lineTo(27 * scale, 43 * scale)
+    check.lineTo(44 * scale, 23 * scale)
+    check_pen = QPen(QColor("#FFFFFF"), max(1.5, 4.5 * scale))
+    check_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    check_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(check_pen)
+    painter.drawPath(check)
+
+    needle_pen = QPen(QColor("#8B5CF6"), max(1.25, 3.5 * scale))
+    needle_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(needle_pen)
+    painter.drawLine(
+        int(38 * scale),
+        int(27 * scale),
+        int(49 * scale),
+        int(16 * scale),
+    )
+    needle = QPainterPath()
+    needle.moveTo(49 * scale, 16 * scale)
+    needle.lineTo(47 * scale, 25 * scale)
+    needle.moveTo(49 * scale, 16 * scale)
+    needle.lineTo(40 * scale, 18 * scale)
+    painter.drawPath(needle)
+    painter.end()
+    return QIcon(px)
 
 
 # ---------------------------------------------------------------------------
@@ -3108,6 +3155,9 @@ class ClaudeWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(340)
         self._tray: QSystemTrayIcon | None = None
+        self._smart_todo_action: QAction | None = None
+        self._smart_todo_dialog: SmartTodoDialog | None = None
+        self._shutdown_started = False
 
         self._drag_pos = QPoint()
         self._usage: UsageData | None = load_last_usage()
@@ -3705,25 +3755,15 @@ class ClaudeWidget(QWidget):
             log_line("system tray unavailable; running without tray controls")
             return
 
-        # Create a simple purple circle icon programmatically
-        px = QPixmap(64, 64)
-        px.fill(QColor(0, 0, 0, 0))
-        p = QPainter(px)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QColor("#8b5cf6"))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(4, 4, 56, 56)
-        p.setPen(QPen(QColor(255, 255, 255), 3))
-        p.setFont(QFont("sans-serif", 28, QFont.Weight.Bold))
-        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "C")
-        p.end()
-
-        icon = QIcon(px)
+        icon = build_task_compass_icon()
         self._tray = QSystemTrayIcon(icon, self)
-        self._tray.setToolTip("Claude Usage Widget")
+        self._tray.setToolTip("Claude Indicator · Smart TODOs")
         self._tray.activated.connect(self._on_tray_activated)
 
         menu = QMenu()
+        self._smart_todo_action = QAction("Smart TODOs…", self)
+        self._smart_todo_action.triggered.connect(self._show_smart_todos)
+        menu.addAction(self._smart_todo_action)
         self._show_hide_action = QAction("Show/Hide", self)
         self._show_hide_action.triggered.connect(self._toggle_from_tray)
         menu.addAction(self._show_hide_action)
@@ -3733,6 +3773,23 @@ class ClaudeWidget(QWidget):
         menu.addAction(quit_action)
         self._tray.setContextMenu(menu)
         self._tray.show()
+
+    def _show_smart_todos(self):
+        if self._smart_todo_dialog is None:
+            self._smart_todo_dialog = SmartTodoDialog(parent=self)
+            self._smart_todo_dialog.summary_changed.connect(
+                self._on_todo_summary_changed
+            )
+        self._smart_todo_dialog.show_and_refresh()
+        self._smart_todo_dialog.raise_()
+        self._smart_todo_dialog.activateWindow()
+
+    def _on_todo_summary_changed(self, focus_count: int, overdue_count: int):
+        if self._tray is not None:
+            self._tray.setToolTip(
+                f"Claude Indicator · {focus_count} focus · "
+                f"{overdue_count} overdue"
+            )
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -3756,11 +3813,19 @@ class ClaudeWidget(QWidget):
         else:
             self._show_from_tray()
 
+    def shutdown(self):
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        if self._smart_todo_dialog is not None:
+            self._smart_todo_dialog.shutdown()
+
     def closeEvent(self, event):
         if self._tray is not None:
             event.ignore()
             self.hide_to_tray()
             return
+        self.shutdown()
         event.accept()
 
     def mousePressEvent(self, event):
@@ -3780,6 +3845,7 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     widget = ClaudeWidget()
+    app.aboutToQuit.connect(widget.shutdown)
     widget.show()
     widget.adjustSize()
     widget.raise_()

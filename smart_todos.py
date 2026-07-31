@@ -708,9 +708,18 @@ class TodoTaskRow(QWidget):
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", selected)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.update()
+        styled_widgets = [
+            self,
+            self.text_label,
+            self.meta_label,
+            self.open_button,
+        ]
+        if self.complete_button is not None:
+            styled_widgets.append(self.complete_button)
+        for widget in styled_widgets:
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:

@@ -9,4 +9,4 @@
 - [x] Show Codex usage-limit percentage: `CodexUsageRow` now reads cached `token_count` rate-limit events from `~/.codex/sessions/**/*.jsonl` on a background worker and displays current 5-hour plus 7-day usage percentages.
 - [x] Keep startup visible and avoid hidden tray-only behavior: force initial sizing/raise and only hide-on-close when tray is available.
 - [ ] Watch for future Codex state schema changes; `read_latest_codex_rate_limit()` intentionally reads cached JSONL events rather than making live network/API calls.
-- [ ] Add the Smart TODO tray command center with global inbox capture, cross-project urgency ranking, safe source navigation, and local-only persistence.
+- [ ] Add the Smart TODO tray command center with global inbox capture, cross-project urgency ranking, safe source navigation, and local-only persistence. Feature-branch implementation and isolated GUI proof are pending controller review, master merge, production restart, and durable memory record.

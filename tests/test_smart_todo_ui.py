@@ -8,7 +8,7 @@ import time
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
@@ -184,6 +184,26 @@ def test_selection_updates_why_now_rail(qapp, tmp_path, dialog_cleanup):
     assert dialog.why_title_label.text() == "P1 customer task"
     assert "revenue or customer impact" in dialog.why_reasons_label.text()
     assert "beta" in dialog.why_meta_label.text()
+
+
+def test_moving_selection_repolishes_task_copy(qapp, tmp_path, dialog_cleanup):
+    dialog = make_dialog_with_fixture(tmp_path, dialog_cleanup)
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = dialog.task_rows[:2]
+
+    QTest.mouseClick(second, Qt.MouseButton.LeftButton)
+
+    assert first.property("selected") is False
+    assert second.property("selected") is True
+    assert (
+        first.text_label.palette().color(QPalette.ColorRole.WindowText).name()
+        == "#b4b4c8"
+    )
+    assert (
+        second.text_label.palette().color(QPalette.ColorRole.WindowText).name()
+        == "#14141e"
+    )
 
 
 def test_add_validation_failure_preserves_input_and_success_refreshes(

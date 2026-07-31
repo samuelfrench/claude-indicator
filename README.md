@@ -12,6 +12,7 @@ A translucent desktop widget for Linux that displays your Claude Code Max subscr
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
 - **Codex limit percentage** — shows current Codex 5-hour usage percentage, 7-day percentage, latest-thread tokens, and lifetime local totals from cached local Codex state
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
+- **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
 - **Live countdown timers** — shows time remaining until each window resets
 - **Always-on-top translucent widget** — frameless, draggable, stays visible over other windows
@@ -39,6 +40,50 @@ The widget displays a dark translucent overlay with:
 - **Per job fields**: label (from inline/full-line comments or fallback to command), schedule, last run age (`just now`, `Xm ago`, `Xh ago`, `Xd ago`), and next run estimate for common 5-field cron patterns
 - **Data source**: `crontab -l` for job definitions and `journalctl _COMM=cron` for command execution history
 - **Refresh interval**: every 5 minutes
+
+## Smart TODO command center
+
+Open the tray menu and select **Smart TODOs…**. The modeless command center is
+created on first use and reused after that, so the main Indicator can stay visible
+or hidden independently.
+
+### Capture and completion
+
+- Enter a task, optionally clear **No due date** and choose a date, then select
+  **Add task**.
+- Captured tasks are written only to the `Indicator Inbox` section of
+  `~/TODO.md`, between `<!-- claude-indicator:inbox:start -->` and
+  `<!-- claude-indicator:inbox:end -->`. The Indicator owns only that marked
+  section and preserves the rest of the file.
+- Only open tasks created in that managed inbox have a **Complete** control.
+  Project TODO entries are read-only in the command center.
+- **Open source** opens the selected file at its Markdown line when `code`,
+  `codium`, or `gedit` is available, and otherwise opens the file with
+  `xdg-open`. No shell command is constructed.
+
+### Views and ranking
+
+- **Focus** shows open, actionable tasks. **All open** also includes waiting
+  work. **Waiting** isolates blocked or time-gated items. **Completed inbox**
+  shows completed entries owned by the Indicator.
+- Search covers task text, project, heading, tags, and ranking reasons. The
+  project filter narrows results to one discovered project; **Reset** restores
+  the Focus view across all projects.
+- Ranking is explainable in the **Why now** rail. Signals include explicit due
+  dates, P0/P1 and urgent language, revenue or customer impact, billing or cost
+  exposure, production verification work, and overall-inbox capture. Explicit
+  waits and future `on or after` / `no earlier than` gates remain outside Focus
+  until actionable.
+
+### Local data boundary
+
+The scanner reads `~/TODO.md` plus `TODO.md` files at bounded depth under
+`~/claude-workspace` and `~/codex_workspace`. It skips hidden, dependency,
+build, cache, coverage, test-output, and nested worktree directories, caps the
+rendered result set, and reports unreadable or oversized files in the dialog.
+All scanning, ranking, filtering, persistence, and source navigation stay on
+this computer. Smart TODOs adds no API calls, hosted service, subscription, or
+billable usage.
 
 ## Prerequisites
 
@@ -99,11 +144,13 @@ LD_LIBRARY_PATH=/path/to/miniconda3/lib python claude_widget.py
 3. **Fetches usage data** from `GET https://api.anthropic.com/api/oauth/usage` with the `anthropic-beta: oauth-2025-04-20` header
 4. **Reads local Codex usage** from `~/.codex/state_*.sqlite` and cached session `token_count` events under `~/.codex/sessions/`
 5. **Builds cron health** from `crontab -l` plus `journalctl` execution logs, using command equality and local-time schedule prediction
-6. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, and collapsible custom rows
+6. **Scans local TODO files** on a background Qt worker and writes only the marked Indicator Inbox section in `~/TODO.md`
+7. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, collapsible custom rows, and a modeless Smart TODO dialog
 
 ### Architecture
 
-The entire application is a single file (`claude_widget.py`) with these components:
+The application uses `claude_widget.py` for the Indicator and `smart_todos.py`
+for the local TODO domain and dialog, with these components:
 
 | Component | Description |
 |---|---|
@@ -114,7 +161,8 @@ The entire application is a single file (`claude_widget.py`) with these componen
 | `CronJobsWidget` | Collapsible row showing per-job cron health, last run age, and next run estimate |
 | `CronJobsFetchWorker`, `CronJobInfo` | Background worker and model used to parse crontab + journal history |
 | `Cron parsing helpers` | Parsers for `crontab -l`, schedule matching, and journal matching |
-| `ClaudeWidget` | Main frameless, translucent, always-on-top widget with drag support |
+| `ClaudeWidget` | Main frameless, translucent, always-on-top widget with drag and tray support |
+| `SmartTodoDialog`, `TodoScanWorker` | Modeless command center and background local TODO scanner from `smart_todos.py` |
 | `UsageData` / `UsageEntry` | Dataclasses modeling the API response |
 
 ### Color Thresholds
