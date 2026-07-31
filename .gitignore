@@ -23,4 +23,5 @@ venv/
 ENV/
 env/
 .env
+.worktrees/
 *.log
