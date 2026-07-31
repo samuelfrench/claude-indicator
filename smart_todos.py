@@ -7,6 +7,10 @@ from datetime import date, datetime
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
+import uuid
 
 
 MAX_TODO_BYTES = 4 * 1024 * 1024
@@ -20,6 +24,12 @@ IGNORED_DIRS = frozenset({
 TASK_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 MANAGED_ID_RE = re.compile(r"<!--\s*claude-indicator:id=([0-9A-Za-z-]+)\s*-->\s*$")
+INBOX_START_MARKER = "<!-- claude-indicator:inbox:start -->"
+INBOX_END_MARKER = "<!-- claude-indicator:inbox:end -->"
+INBOX_MARKER_ERROR = (
+    "Indicator Inbox markers are incomplete or duplicated; no changes were written."
+)
+MAX_TASK_TEXT_LENGTH = 500
 DUE_RE = re.compile(
     r"\b(?:due|by|on|target|date)\s*:?\s*(20\d{2}-\d{2}-\d{2})\b", re.I
 )
@@ -59,6 +69,148 @@ class ScanResult:
     warnings: tuple[str, ...]
     scanned_files: int
     generated_at: datetime
+
+
+def normalize_task_text(text: str) -> str:
+    """Normalize user-entered task copy into one safe Markdown line."""
+    normalized = text.replace("\r", " ").replace("\n", " ")
+    normalized = re.sub(r"<!--.*?-->", "", normalized)
+    normalized = re.sub(r"^\s*(?:[-*+]\s+)?(?:\[[ xX]\]\s*)?", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        raise ValueError("Enter a task before adding it.")
+    if len(normalized) > MAX_TASK_TEXT_LENGTH:
+        raise ValueError("Tasks must be 500 characters or fewer.")
+    return normalized
+
+
+class InboxStore:
+    """Atomically mutate only the delimited local Indicator Inbox section."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def add(self, text: str, due_date: date | None = None) -> str:
+        """Add one normalized task to the managed inbox and return its UUID4 ID."""
+        task_text = normalize_task_text(text)
+        managed_id = str(uuid.uuid4())
+        due_suffix = f" due: {due_date.isoformat()}" if due_date else ""
+        entry = (
+            f"- [ ] {task_text}{due_suffix} "
+            f"<!-- claude-indicator:id={managed_id} -->\n"
+        )
+        contents, mode = self._read_current()
+        start, end = self._managed_bounds(contents)
+        if start is None:
+            updated = self._append_managed_section(contents, entry)
+        else:
+            updated = contents[:end] + entry + contents[end:]
+        self._write_atomically(updated, mode)
+        return managed_id
+
+    def complete(self, managed_id: str) -> None:
+        """Complete exactly one checkbox within the managed inbox section."""
+        contents, mode = self._read_current()
+        start, end = self._managed_bounds(contents)
+        if start is None:
+            raise ValueError("Task is not managed by the Indicator Inbox.")
+
+        managed = contents[start:end]
+        task_pattern = re.compile(
+            r"^(\s*[-*]\s+\[)[ xX](\]\s+.*?<!--\s*claude-indicator:id="
+            + re.escape(managed_id)
+            + r"\s*-->[^\n]*)$",
+            re.MULTILINE,
+        )
+        if len(task_pattern.findall(managed)) != 1:
+            raise ValueError("Task is not managed by the Indicator Inbox.")
+        updated_managed = task_pattern.sub(r"\1x\2", managed, count=1)
+        self._write_atomically(contents[:start] + updated_managed + contents[end:], mode)
+
+    def _read_current(self) -> tuple[str, int]:
+        try:
+            stat_result = self.path.stat()
+        except FileNotFoundError:
+            return "# TODO\n", 0o644
+        return self.path.read_text(encoding="utf-8"), stat_result.st_mode & 0o7777
+
+    @staticmethod
+    def _managed_bounds(contents: str) -> tuple[int | None, int | None]:
+        start_positions = [
+            match.start()
+            for match in re.finditer(re.escape(INBOX_START_MARKER), contents)
+        ]
+        end_positions = [
+            match.start()
+            for match in re.finditer(re.escape(INBOX_END_MARKER), contents)
+        ]
+        if not start_positions and not end_positions:
+            return None, None
+        if (
+            len(start_positions) != 1
+            or len(end_positions) != 1
+            or start_positions[0] >= end_positions[0]
+        ):
+            raise ValueError(INBOX_MARKER_ERROR)
+        return start_positions[0] + len(INBOX_START_MARKER), end_positions[0]
+
+    @staticmethod
+    def _append_managed_section(contents: str, entry: str) -> str:
+        if contents.endswith("\n\n"):
+            boundary = ""
+        elif contents.endswith("\n"):
+            boundary = "\n"
+        else:
+            boundary = "\n\n"
+        return (
+            f"{contents}{boundary}{INBOX_START_MARKER}\n"
+            f"## Indicator Inbox\n\n{entry}{INBOX_END_MARKER}\n"
+        )
+
+    def _write_atomically(self, contents: str, mode: int) -> None:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(contents)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.chmod(temporary_path, mode)
+            os.replace(temporary_path, self.path)
+            temporary_path = None
+        except Exception:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+
+
+def source_open_command(
+    item: TodoItem, which=shutil.which
+) -> list[str]:
+    """Build a local editor command without interpreting task text in a shell."""
+    for name in ("code", "codium", "gedit", "xdg-open"):
+        editor = which(name)
+        if not editor:
+            continue
+        if name in {"code", "codium"}:
+            return [editor, "--goto", f"{item.source_path}:{item.line}"]
+        if name == "gedit":
+            return [editor, f"+{item.line}", str(item.source_path)]
+        return [editor, str(item.source_path)]
+    raise RuntimeError("No local editor or file opener is available.")
+
+
+def open_source_item(item: TodoItem, popen=subprocess.Popen) -> None:
+    """Launch the selected local source viewer without shell execution."""
+    popen(source_open_command(item), start_new_session=True)
 
 
 def _strip_markdown(text: str) -> str:

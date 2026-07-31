@@ -1,14 +1,20 @@
 from datetime import date
 from pathlib import Path
+import stat
+import uuid
 
 import pytest
 
 from smart_todos import (
+    InboxStore,
     MAX_TODO_BYTES,
     TodoItem,
     discover_todo_files,
+    normalize_task_text,
+    open_source_item,
     parse_todos,
     scan_todos,
+    source_open_command,
 )
 import smart_todos
 
@@ -264,3 +270,233 @@ def test_scan_sorts_actionable_before_waiting_and_completed_then_by_score(tmp_pa
         "P0 hold for owner action",
         "P0 done",
     ]
+
+
+def test_inbox_add_initializes_missing_file_with_a_managed_section(tmp_path):
+    path = tmp_path / "TODO.md"
+
+    managed_id = InboxStore(path).add("Capture this task")
+
+    assert path.read_text(encoding="utf-8") == (
+        "# TODO\n\n"
+        "<!-- claude-indicator:inbox:start -->\n"
+        "## Indicator Inbox\n\n"
+        f"- [ ] Capture this task <!-- claude-indicator:id={managed_id} -->\n"
+        "<!-- claude-indicator:inbox:end -->\n"
+    )
+
+
+def test_inbox_add_appends_section_after_the_entire_existing_prefix(tmp_path):
+    path = tmp_path / "TODO.md"
+    original_prefix = "# Existing TODO\n\n- [ ] Preserve this project task\n"
+    path.write_text(original_prefix, encoding="utf-8")
+
+    InboxStore(path).add("Inbox task")
+
+    assert path.read_text(encoding="utf-8").startswith(
+        original_prefix
+        + "\n<!-- claude-indicator:inbox:start -->\n## Indicator Inbox\n\n"
+    )
+
+
+def test_normalize_task_text_flattens_input_and_removes_markdown_control_syntax():
+    assert normalize_task_text(
+        "  - [x]  Finish\r\n  the report <!-- ignored metadata -->  "
+    ) == "Finish the report"
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        (" \n\t ", "Enter a task before adding it."),
+        ("x" * 501, "Tasks must be 500 characters or fewer."),
+    ],
+)
+def test_normalize_task_text_rejects_invalid_task_copy(text, message):
+    with pytest.raises(ValueError, match=message):
+        normalize_task_text(text)
+
+
+def test_inbox_add_serializes_due_date_and_uses_unique_uuid4_ids(tmp_path):
+    path = tmp_path / "TODO.md"
+    store = InboxStore(path)
+
+    first = store.add("First", due_date=date(2026, 8, 2))
+    second = store.add("Second")
+    text = path.read_text(encoding="utf-8")
+
+    assert first != second
+    assert uuid.UUID(first).version == 4
+    assert uuid.UUID(second).version == 4
+    assert f"- [ ] First due: 2026-08-02 <!-- claude-indicator:id={first} -->" in text
+    assert f"- [ ] Second <!-- claude-indicator:id={second} -->" in text
+
+
+def test_inbox_add_rereads_the_current_file_before_mutating(tmp_path):
+    path = tmp_path / "TODO.md"
+    store = InboxStore(path)
+    first = store.add("First")
+    with path.open("a", encoding="utf-8") as todo_file:
+        todo_file.write("\n## External edit\n- [ ] Keep this edit\n")
+
+    second = store.add("Second")
+    text = path.read_text(encoding="utf-8")
+
+    assert f"claude-indicator:id={first}" in text
+    assert f"claude-indicator:id={second}" in text
+    assert text.endswith("\n## External edit\n- [ ] Keep this edit\n")
+
+
+def test_inbox_add_preserves_the_existing_file_mode(tmp_path):
+    path = write_todo(tmp_path / "TODO.md", "# TODO\n")
+    path.chmod(0o640)
+
+    InboxStore(path).add("Keep permissions")
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+def test_complete_changes_only_the_exact_managed_id(tmp_path):
+    path = tmp_path / "TODO.md"
+    store = InboxStore(path)
+    first = store.add("First")
+    second = store.add("Second")
+
+    store.complete(second)
+
+    text = path.read_text(encoding="utf-8")
+    assert f"- [ ] First <!-- claude-indicator:id={first} -->" in text
+    assert f"- [x] Second <!-- claude-indicator:id={second} -->" in text
+
+
+def test_complete_rejects_an_id_outside_the_managed_inbox_without_changes(tmp_path):
+    path = write_todo(
+        tmp_path / "TODO.md",
+        "# TODO\n- [ ] Project task <!-- claude-indicator:id=project-entry -->\n",
+    )
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="Task is not managed by the Indicator Inbox."):
+        InboxStore(path).complete("project-entry")
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        (
+            "<!-- claude-indicator:inbox:start -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+            "<!-- claude-indicator:inbox:start -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+        (
+            "<!-- claude-indicator:inbox:end -->\n"
+            "<!-- claude-indicator:inbox:start -->\n"
+        ),
+        "<!-- claude-indicator:inbox:start -->\n",
+        (
+            "<!-- claude-indicator:inbox:start -->\n"
+            "<!-- claude-indicator:inbox:start -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+    ],
+    ids=["duplicate", "reversed", "partial", "nested"],
+)
+def test_inbox_rejects_corrupt_marker_boundaries_without_changing_bytes(tmp_path, contents):
+    path = write_todo(tmp_path / "TODO.md", contents)
+    before = path.read_bytes()
+
+    with pytest.raises(
+        ValueError,
+        match="Indicator Inbox markers are incomplete or duplicated; no changes were written.",
+    ):
+        InboxStore(path).add("Do not write")
+
+    assert path.read_bytes() == before
+
+
+def test_inbox_add_leaves_the_destination_unchanged_until_os_replace(tmp_path, monkeypatch):
+    path = write_todo(tmp_path / "TODO.md", "# TODO\n")
+    before = path.read_text(encoding="utf-8")
+    original_replace = smart_todos.os.replace
+    observed = []
+
+    def observing_replace(source, destination):
+        observed.append((Path(source), Path(destination), path.read_text(encoding="utf-8")))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(smart_todos.os, "replace", observing_replace)
+
+    InboxStore(path).add("Atomic task")
+
+    assert observed[0][1] == path
+    assert observed[0][2] == before
+    assert "Atomic task" in path.read_text(encoding="utf-8")
+
+
+def source_item(*, completed=False):
+    return TodoItem(
+        id="source",
+        text="Open source",
+        completed=completed,
+        source_path=Path("/tmp/Project TODO with spaces.md"),
+        line=37,
+        heading="",
+        project="Overall",
+    )
+
+
+@pytest.mark.parametrize(
+    ("available", "expected"),
+    [
+        (
+            {"code": "/usr/bin/code", "codium": "/usr/bin/codium"},
+            ["/usr/bin/code", "--goto", "/tmp/Project TODO with spaces.md:37"],
+        ),
+        (
+            {"codium": "/usr/bin/codium"},
+            ["/usr/bin/codium", "--goto", "/tmp/Project TODO with spaces.md:37"],
+        ),
+        (
+            {"gedit": "/usr/bin/gedit"},
+            ["/usr/bin/gedit", "+37", "/tmp/Project TODO with spaces.md"],
+        ),
+        (
+            {"xdg-open": "/usr/bin/xdg-open"},
+            ["/usr/bin/xdg-open", "/tmp/Project TODO with spaces.md"],
+        ),
+    ],
+    ids=["code", "codium", "gedit", "xdg-open"],
+)
+def test_source_open_command_returns_literal_arguments_for_each_available_opener(
+    available, expected
+):
+    assert source_open_command(source_item(), which=available.get) == expected
+
+
+def test_source_open_command_navigates_completed_items_with_the_same_arguments():
+    assert source_open_command(
+        source_item(completed=True),
+        which=lambda name: "/usr/bin/code" if name == "code" else None,
+    ) == ["/usr/bin/code", "--goto", "/tmp/Project TODO with spaces.md:37"]
+
+
+def test_source_open_command_rejects_missing_local_openers():
+    with pytest.raises(RuntimeError, match="No local editor or file opener is available."):
+        source_open_command(source_item(), which=lambda _name: None)
+
+
+def test_open_source_item_passes_a_literal_command_without_shell_options(monkeypatch):
+    command = ["/usr/bin/code", "--goto", "/tmp/Project TODO with spaces.md:37"]
+    calls = []
+    monkeypatch.setattr(smart_todos, "source_open_command", lambda _item: command)
+
+    open_source_item(
+        source_item(),
+        popen=lambda received_command, **kwargs: calls.append((received_command, kwargs)),
+    )
+
+    assert calls == [(command, {"start_new_session": True})]
