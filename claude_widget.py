@@ -60,6 +60,7 @@ RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_GROUP_REFRESH_MS = 60 * 1000  # 60 seconds
 CODEX_REFRESH_MS = 15 * 1000  # 15 seconds
+TRAY_RETRY_INTERVAL_MS = 5 * 1000  # retry while the desktop tray host is absent
 CRON_REFRESH_MS = 5 * 60 * 1000  # 5 minutes — crontab/journal state changes slowly
 CRON_JOURNAL_WINDOW_HOURS = 48
 CRON_LATE_GRACE_S = 180  # allow journal lag before flagging a run as missed
@@ -3158,6 +3159,10 @@ class ClaudeWidget(QWidget):
         self._smart_todo_action: QAction | None = None
         self._smart_todo_dialog: SmartTodoDialog | None = None
         self._shutdown_started = False
+        self._tray_unavailable_logged = False
+        self._tray_retry_timer = QTimer(self)
+        self._tray_retry_timer.setInterval(TRAY_RETRY_INTERVAL_MS)
+        self._tray_retry_timer.timeout.connect(self._setup_tray_icon)
 
         self._drag_pos = QPoint()
         self._usage: UsageData | None = load_last_usage()
@@ -3751,10 +3756,17 @@ class ClaudeWidget(QWidget):
         p.end()
 
     def _setup_tray_icon(self):
+        if self._shutdown_started or self._tray is not None:
+            return
         if not QSystemTrayIcon.isSystemTrayAvailable():
-            log_line("system tray unavailable; running without tray controls")
+            if not self._tray_unavailable_logged:
+                log_line("system tray unavailable; waiting for tray host")
+                self._tray_unavailable_logged = True
+            if not self._tray_retry_timer.isActive():
+                self._tray_retry_timer.start()
             return
 
+        self._tray_retry_timer.stop()
         icon = build_task_compass_icon()
         self._tray = QSystemTrayIcon(icon, self)
         self._tray.setToolTip("Claude Indicator · Smart TODOs")
@@ -3817,6 +3829,7 @@ class ClaudeWidget(QWidget):
         if self._shutdown_started:
             return
         self._shutdown_started = True
+        self._tray_retry_timer.stop()
         if self._smart_todo_dialog is not None:
             self._smart_todo_dialog.shutdown()
 

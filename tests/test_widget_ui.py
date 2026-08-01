@@ -318,7 +318,10 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(
                 QSystemTrayIcon,
                 "isSystemTrayAvailable",
-                return_value=tray_available,
+                side_effect=(
+                    tray_available if callable(tray_available) else None
+                ),
+                return_value=tray_available if not callable(tray_available) else False,
             ),
             patch.object(ClaudeWidget, "_setup_timers", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_usage", lambda self, force=False: None),
@@ -396,6 +399,66 @@ class WidgetUiTest(unittest.TestCase):
         self.assertIsNone(widget._tray)
         self.assertIsNone(widget._smart_todo_action)
         self.assertIsNone(widget._smart_todo_dialog)
+
+    def test_tray_unavailable_retries_and_creates_controls_exactly_once(self):
+        available = [False]
+        widget = self._make_inert_claude_widget(
+            tray_available=lambda: available[0]
+        )
+
+        retry_timer = getattr(widget, "_tray_retry_timer", None)
+        self.assertIsNotNone(retry_timer)
+        self.assertTrue(retry_timer.isActive())
+
+        available[0] = True
+        retry_timer.timeout.emit()
+
+        tray = widget._tray
+        self.assertIsNotNone(tray)
+        self.assertFalse(retry_timer.isActive())
+        self.assertEqual(
+            [action.text() for action in tray.contextMenu().actions()],
+            ["Smart TODOs…", "Show/Hide", "", "Quit"],
+        )
+
+        retry_timer.timeout.emit()
+
+        self.assertIs(widget._tray, tray)
+        self.assertEqual(len(tray.contextMenu().actions()), 4)
+
+    def test_repeated_unavailable_tray_retries_log_only_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "widget.log"
+            with patch.object(claude_widget, "LOG_PATH", log_path):
+                widget = self._make_inert_claude_widget(tray_available=False)
+                retry_timer = getattr(widget, "_tray_retry_timer", None)
+                self.assertIsNotNone(retry_timer)
+                retry_timer.timeout.emit()
+                retry_timer.timeout.emit()
+
+            lines = log_path.read_text().splitlines()
+
+        self.assertEqual(
+            sum("system tray unavailable" in line for line in lines),
+            1,
+        )
+
+    def test_shutdown_stops_tray_retry_and_blocks_late_creation(self):
+        available = [False]
+        widget = self._make_inert_claude_widget(
+            tray_available=lambda: available[0]
+        )
+        retry_timer = getattr(widget, "_tray_retry_timer", None)
+        self.assertIsNotNone(retry_timer)
+        self.assertTrue(retry_timer.isActive())
+
+        widget.shutdown()
+        available[0] = True
+        retry_timer.timeout.emit()
+
+        self.assertFalse(retry_timer.isActive())
+        self.assertIsNone(widget._tray)
+        self.assertIsNone(widget._smart_todo_action)
 
     def test_close_and_application_shutdown_stop_dialog_exactly_once(self):
         widget = self._make_inert_claude_widget(tray_available=False)
