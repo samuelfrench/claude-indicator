@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,7 @@ class ObservedTask:
     unchanged_since: date
     change: str
     action: str = ""
+    legacy_actions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, order=True)
@@ -129,6 +131,7 @@ def _parse_observed(value: object) -> ObservedRecord:
         not _is_content_key(action)
         or type(sequence) is not int
         or sequence < 0
+        or (MANAGED_KEY_RE.fullmatch(str(content)) and action != content)
     ):
         raise ValueError("Workflow state has invalid observation identity.")
     return ObservedRecord(
@@ -324,6 +327,9 @@ class WorkflowStore:
             previous_by_content.setdefault(record.content, []).append(record)
 
         action_matches = self._match_actions(state.observed, current)
+        legacy_aliases = self._legacy_aliases(
+            state.observed, current, action_matches
+        )
         next_records: list[ObservedRecord] = []
         content_counts: dict[str, int] = {}
         for item in current:
@@ -357,7 +363,12 @@ class WorkflowStore:
             )
             next_records.append(record)
             observed_task = ObservedTask(
-                item.location, item.content, unchanged_since, change, action
+                item.location,
+                item.content,
+                unchanged_since,
+                change,
+                action,
+                legacy_aliases.get(sequence, ()),
             )
             tasks[item.location] = observed_task
             if content_counts[item.content] == 1:
@@ -450,6 +461,65 @@ class WorkflowStore:
                 matches[new_index] = record.action
                 used_old.add(old_index)
         return matches
+
+    @staticmethod
+    def _legacy_aliases(
+        previous: tuple[ObservedRecord, ...],
+        current: tuple[TaskObservation, ...],
+        action_matches: dict[int, str],
+    ) -> dict[int, tuple[str, ...]]:
+        """Expose old aliases only when history proves the original row."""
+        if not previous:
+            return {}
+
+        def ordinal_alias(content: str, occurrence: int) -> str:
+            identity = f"selected-row\0{content}\0{occurrence}"
+            return "source:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+        aliases: dict[int, tuple[str, ...]] = {}
+        if all(record.action for record in previous):
+            old = sorted(previous, key=lambda record: record.sequence)
+            old_by_content: dict[str, list[int]] = {}
+            for index, record in enumerate(old):
+                old_by_content.setdefault(record.content, []).append(index)
+            by_action: dict[str, tuple[str, ...]] = {}
+            for content, indices in old_by_content.items():
+                if MANAGED_KEY_RE.fullmatch(content):
+                    continue
+                for occurrence, old_index in enumerate(indices, start=1):
+                    row_aliases = [content]
+                    if len(indices) > 1:
+                        row_aliases.append(ordinal_alias(content, occurrence))
+                    by_action[old[old_index].action] = tuple(row_aliases)
+            for new_index, action in action_matches.items():
+                if action in by_action:
+                    aliases[new_index] = by_action[action]
+            return aliases
+
+        previous_by_content: dict[str, list[ObservedRecord]] = {}
+        current_by_content: dict[str, list[int]] = {}
+        for record in previous:
+            previous_by_content.setdefault(record.content, []).append(record)
+        for index, item in enumerate(current):
+            current_by_content.setdefault(item.content, []).append(index)
+        for content, new_indices in current_by_content.items():
+            if MANAGED_KEY_RE.fullmatch(content):
+                continue
+            old_records = previous_by_content.get(content, [])
+            locations_unchanged = {
+                record.location for record in old_records
+            } == {current[index].location for index in new_indices}
+            unique_move = len(old_records) == len(new_indices) == 1
+            if len(old_records) != len(new_indices) or not (
+                locations_unchanged or unique_move
+            ):
+                continue
+            for occurrence, new_index in enumerate(new_indices, start=1):
+                row_aliases = [content]
+                if len(new_indices) > 1:
+                    row_aliases.append(ordinal_alias(content, occurrence))
+                aliases[new_index] = tuple(row_aliases)
+        return aliases
 
     @staticmethod
     def _content_contexts(

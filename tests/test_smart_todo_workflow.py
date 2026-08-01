@@ -88,6 +88,7 @@ def test_workflow_store_writes_sorted_unique_records_without_task_text(tmp_path)
         b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01","action":"bad","sequence":0}]}',
         b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01","action":"source:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":true}]}',
         b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01","action":"source:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":0,"extra":1}]}',
+        b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"managed:inbox-a","content":"managed:inbox-a","unchanged_since":"2026-07-01","action":"source:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":0}]}',
     ],
 )
 def test_workflow_store_rejects_noncanonical_or_invalid_state_without_mutation(

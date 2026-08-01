@@ -1001,13 +1001,25 @@ def test_enrich_workflow_maps_state_without_changing_rank_and_groups_exact_dupli
     )
     observed = {
         first_key: smart_todo_workflow.ObservedTask(
-            "location:" + "a" * 64, first_key, date(2026, 7, 2), "changed"
+            "location:" + "a" * 64,
+            first_key,
+            date(2026, 7, 2),
+            "changed",
+            legacy_actions=(first_key,),
         ),
         second_key: smart_todo_workflow.ObservedTask(
-            "location:" + "b" * 64, second_key, date(2026, 7, 4), "new"
+            "location:" + "b" * 64,
+            second_key,
+            date(2026, 7, 4),
+            "new",
+            legacy_actions=(second_key,),
         ),
         finished_key: smart_todo_workflow.ObservedTask(
-            "location:" + "c" * 64, finished_key, date(2026, 7, 5), "new"
+            "location:" + "c" * 64,
+            finished_key,
+            date(2026, 7, 5),
+            "new",
+            legacy_actions=(finished_key,),
         ),
     }
 

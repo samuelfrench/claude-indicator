@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -112,6 +113,24 @@ def task_row_at_line(dialog: SmartTodoDialog, line: int):
 
 def selected_action_names(dialog: SmartTodoDialog):
     return [button.accessibleName() for button in dialog.workflow_action_buttons]
+
+
+def legacy_ordinal_key(item, occurrence: int) -> str:
+    identity = f"selected-row\0{smart_todos.todo_finished_key(item)}\0{occurrence}"
+    return "source:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def downgrade_workflow_observations_to_legacy(path: Path) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["observed"] = [
+        {
+            "location": record["location"],
+            "content": record["content"],
+            "unchanged_since": record["unchanged_since"],
+        }
+        for record in payload["observed"]
+    ]
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
 
 def make_workflow_item(
@@ -1758,6 +1777,7 @@ def test_same_source_duplicate_legacy_base_keys_expand_before_selected_mutation(
     legacy_key = smart_todos.todo_finished_key(first)
 
     smart_todos.WorkflowStore(workflow_path).pin(legacy_key)
+    downgrade_workflow_observations_to_legacy(workflow_path)
     dialog.refresh()
     wait_for_scan(dialog, qapp)
     assert all(item.pinned_today for item in dialog._all_items)
@@ -1813,9 +1833,10 @@ def test_same_source_duplicate_legacy_ordinal_keys_read_and_migrate_selected_onl
     dialog.show_and_refresh()
     wait_for_scan(dialog, qapp)
     first, second = sorted(dialog._all_items, key=lambda item: item.line)
-    legacy_ordinal = second.legacy_action_keys[0]
+    legacy_ordinal = legacy_ordinal_key(second, 2)
 
     smart_todos.WorkflowStore(workflow_path).pin(legacy_ordinal)
+    downgrade_workflow_observations_to_legacy(workflow_path)
     dialog.refresh()
     wait_for_scan(dialog, qapp)
     assert {item.line: item.pinned_today for item in dialog._all_items} == {
@@ -1839,6 +1860,58 @@ def test_same_source_duplicate_legacy_ordinal_keys_read_and_migrate_selected_onl
     dialog.restore_button.click()
     assert legacy_ordinal not in smart_todos.FinishedStore(finished_path).read()
     assert not any(item.finished for item in dialog._all_items)
+
+
+@pytest.mark.parametrize("legacy_kind", ["pin", "snooze", "finished", "base-pin"])
+def test_legacy_duplicate_choices_orphan_after_ambiguous_peer_insertion(
+    qapp, tmp_path, dialog_cleanup, legacy_kind
+):
+    workflow_path = tmp_path / f"workflow-{legacy_kind}.json"
+    finished_path = tmp_path / f"finished-{legacy_kind}.json"
+    dialog = make_dialog(
+        tmp_path / legacy_kind,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "# Queue\n- [ ] Upgrade duplicate\n- [ ] Upgrade duplicate\n"},
+        workflow_store_path=workflow_path,
+        finished_store_path=finished_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = sorted(dialog._all_items, key=lambda item: item.line)
+    legacy_key = (
+        smart_todos.todo_finished_key(second)
+        if legacy_kind == "base-pin"
+        else legacy_ordinal_key(second, 2)
+    )
+    if legacy_kind in {"pin", "base-pin"}:
+        smart_todos.WorkflowStore(workflow_path).pin(legacy_key)
+    elif legacy_kind == "snooze":
+        smart_todos.WorkflowStore(workflow_path).snooze(
+            legacy_key, TODAY + timedelta(days=5)
+        )
+    else:
+        finished_path.write_text(
+            json.dumps({"version": 1, "finished": [legacy_key]}), encoding="utf-8"
+        )
+    downgrade_workflow_observations_to_legacy(workflow_path)
+
+    write_todo(
+        tmp_path / legacy_kind / "workspace" / "alpha" / "TODO.md",
+        "# Queue\n- [ ] Upgrade duplicate\n- [ ] Upgrade duplicate\n- [ ] Upgrade duplicate\n",
+    )
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+
+    assert not any(item.pinned_today for item in dialog._all_items)
+    assert not any(item.snoozed_until for item in dialog._all_items)
+    assert not any(item.finished for item in dialog._all_items)
+    if legacy_kind == "finished":
+        assert legacy_key in smart_todos.FinishedStore(finished_path).read()
+    else:
+        state = smart_todos.WorkflowStore(workflow_path).read()
+        persisted = set(state.pinned_today) | {record.key for record in state.snoozed}
+        assert legacy_key in persisted
 
 
 def test_failed_workflow_and_restore_writes_preserve_rows_counts_and_selection(

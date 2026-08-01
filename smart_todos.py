@@ -190,7 +190,7 @@ def assign_task_action_keys(
     items: tuple[TodoItem, ...],
     observed: dict[str, ObservedTask] | None = None,
 ) -> tuple[TodoItem, ...]:
-    """Attach persisted opaque identities and legacy ordinal read aliases."""
+    """Attach persisted opaque identities and history-proven legacy aliases."""
     groups: dict[str, list[TodoItem]] = {}
     for item in items:
         groups.setdefault(todo_finished_key(item), []).append(item)
@@ -207,13 +207,13 @@ def assign_task_action_keys(
                 item.id,
             ),
         )
-        for occurrence, item in enumerate(ordered, start=1):
-            legacy_identity = f"selected-row\0{base_key}\0{occurrence}"
-            legacy_key = (
-                f"source:{hashlib.sha256(legacy_identity.encode('utf-8')).hexdigest()}"
+        for item in ordered:
+            observed_item = (observed or {}).get(_workflow_location_key(item)) or (
+                observed or {}
+            ).get(base_key)
+            legacy_keys[item.id] = (
+                observed_item.legacy_actions if observed_item is not None else ()
             )
-            legacy_keys[item.id] = (legacy_key,) if len(group) > 1 else ()
-            observed_item = (observed or {}).get(_workflow_location_key(item))
             if observed_item is not None and observed_item.action:
                 action_keys[item.id] = observed_item.action
             elif item.managed_id is not None:
@@ -891,7 +891,7 @@ def enrich_workflow(
         observed_item = observed.get(_workflow_location_key(item)) or observed.get(
             content_key
         )
-        snoozed_until = snoozes.get(action_key, snoozes.get(content_key))
+        snoozed_until = snoozes.get(action_key)
         if snoozed_until is None:
             snoozed_until = next(
                 (snoozes[key] for key in item.legacy_action_keys if key in snoozes),
@@ -915,7 +915,6 @@ def enrich_workflow(
                 and snoozed_until is None
                 and (
                     action_key in state.pinned_today
-                    or content_key in state.pinned_today
                     or any(key in state.pinned_today for key in item.legacy_action_keys)
                 )
             ),
@@ -1943,7 +1942,6 @@ class SmartTodoDialog(QDialog):
                     item,
                     finished=(
                         todo_action_key(item) in finished_keys
-                        or todo_finished_key(item) in finished_keys
                         or any(key in finished_keys for key in item.legacy_action_keys)
                     ),
                 )
@@ -1959,7 +1957,6 @@ class SmartTodoDialog(QDialog):
                     item,
                     finished=(
                         todo_action_key(item) in finished_keys
-                        or todo_finished_key(item) in finished_keys
                         or any(key in finished_keys for key in item.legacy_action_keys)
                     ),
                 )
@@ -1987,6 +1984,7 @@ class SmartTodoDialog(QDialog):
                 item.unchanged_since or self._scan_today,
                 item.change_status,
                 item.action_key,
+                item.legacy_action_keys,
             )
             observed[location_key] = observed_item
             observed.setdefault(content_key, observed_item)
@@ -2043,17 +2041,27 @@ class SmartTodoDialog(QDialog):
             return action_key, None, ()
         if persisted_keys is not None:
             legacy_action_key = next(
-                (key for key in item.legacy_action_keys if key in persisted_keys),
+                (
+                    key
+                    for key in item.legacy_action_keys
+                    if key != base_key and key in persisted_keys
+                ),
                 None,
             )
             if legacy_action_key is not None:
                 return action_key, legacy_action_key, (action_key,)
-            if base_key not in persisted_keys:
+            if (
+                base_key not in persisted_keys
+                or base_key not in item.legacy_action_keys
+            ):
                 return action_key, None, ()
         replacement_keys = tuple(sorted({
             todo_action_key(candidate)
             for candidate in self._all_items
-            if todo_finished_key(candidate) == base_key
+            if (
+                todo_finished_key(candidate) == base_key
+                and base_key in candidate.legacy_action_keys
+            )
         }))
         return action_key, base_key, replacement_keys
 
