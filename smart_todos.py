@@ -161,6 +161,14 @@ class FinishedStore:
         updated_keys = frozenset((*keys, todo_finished_key(item)))
         self._write_atomically(updated_keys, 0o600 if mode is None else mode)
 
+    def restore(self, item: TodoItem) -> None:
+        """Remove one locally finished task key without touching its TODO source."""
+        keys, mode = self._read_current()
+        key = todo_finished_key(item)
+        if key not in keys:
+            raise ValueError("Task is not finished.")
+        self._write_atomically(keys - {key}, 0o600 if mode is None else mode)
+
     def _read_current(self) -> tuple[frozenset[str], int | None]:
         descriptor: int | None = None
         try:

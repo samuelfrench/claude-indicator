@@ -840,6 +840,30 @@ def test_finished_store_rejects_symlink_and_non_regular_paths_without_mutation(t
         smart_todos.FinishedStore(fifo_path).finish(finished_item(managed_id="blocked"))
 
 
+def test_finished_store_restore_removes_exact_key_and_writes_canonical_state(tmp_path):
+    path = tmp_path / "finished.json"
+    store = smart_todos.FinishedStore(path)
+    first = finished_item(managed_id="first")
+    second = finished_item(managed_id="second")
+    store.finish(first)
+    store.finish(second)
+
+    store.restore(first)
+
+    assert path.read_bytes() == b'{"version":1,"finished":["managed:second"]}'
+
+
+def test_finished_store_restore_rejects_unknown_key_without_byte_change(tmp_path):
+    path = tmp_path / "finished.json"
+    before = b'{"version":1,"finished":["managed:known"]}'
+    path.write_bytes(before)
+
+    with pytest.raises(ValueError, match="not finished"):
+        smart_todos.FinishedStore(path).restore(finished_item(managed_id="unknown"))
+
+    assert path.read_bytes() == before
+
+
 def source_item(*, completed=False):
     return TodoItem(
         id="source",
