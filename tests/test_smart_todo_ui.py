@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 import os
 from pathlib import Path
 import threading
 import time
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDate, QTimer, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QPushButton
 
 import smart_todos
 from smart_todos import MAX_TODO_BYTES, SmartTodoDialog
@@ -47,6 +47,7 @@ def make_dialog(
     home_text: str,
     projects=None,
     finished_store_path: Path | None = None,
+    workflow_store_path: Path | None = None,
 ):
     home_todo = write_todo(tmp_path / "home" / "TODO.md", home_text)
     workspace = tmp_path / "workspace"
@@ -57,6 +58,7 @@ def make_dialog(
         workspace_roots=(workspace,),
         today_provider=lambda: TODAY,
         finished_store_path=finished_store_path or tmp_path / "finished.json",
+        workflow_store_path=workflow_store_path or tmp_path / "workflow.json",
     )
     dialog_cleanup.append(dialog)
     return dialog
@@ -101,6 +103,20 @@ def visible_task_texts(dialog: SmartTodoDialog):
 
 def task_row(dialog: SmartTodoDialog, text: str):
     return next(row for row in dialog.task_rows if row.item.text == text)
+
+
+def selected_action_names(dialog: SmartTodoDialog):
+    return [button.accessibleName() for button in dialog.workflow_action_buttons]
+
+
+def accept_next_snooze_dialog(qapp, selected_date: date):
+    def accept_dialog():
+        dialog = qapp.activeModalWidget()
+        assert isinstance(dialog, smart_todos.SnoozeUntilDialog)
+        dialog.date_edit.setDate(QDate(selected_date.year, selected_date.month, selected_date.day))
+        dialog.snooze_button.click()
+
+    QTimer.singleShot(0, accept_dialog)
 
 
 def test_initial_loading_state_disables_refresh(qapp, tmp_path, dialog_cleanup):
@@ -756,6 +772,217 @@ def test_oversized_warning_does_not_hide_other_results(qapp, tmp_path, dialog_cl
 
     assert visible_task_texts(dialog) == ["Visible overall task"]
     assert str(huge.resolve()) in dialog.warning_label.text()
+
+
+def test_action_rail_hides_without_selection_and_has_exact_accessible_actions(
+    qapp, tmp_path, dialog_cleanup
+):
+    empty = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    empty.show_and_refresh()
+    wait_for_scan(empty, qapp)
+
+    assert empty.workflow_action_rail.isHidden()
+
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "- [ ] Active customer work\n"},
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    assert selected_action_names(dialog) == [
+        "Pin today",
+        "Snooze task",
+        "Copy task context",
+    ]
+    assert dialog.refresh_button.nextInFocusChain() is dialog.pin_button
+    assert dialog.pin_button.nextInFocusChain() is dialog.snooze_button
+    assert dialog.snooze_button.nextInFocusChain() is dialog.copy_context_button
+
+
+def test_action_rail_projects_pinned_snoozed_finished_and_completed_states(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "<!-- claude-indicator:inbox:start -->\n"
+            "- [x] Completed inbox task <!-- claude-indicator:id=done -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+        projects={"alpha": "- [ ] Active workflow task\n"},
+        workflow_store_path=workflow_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    dialog.pin_button.click()
+    assert selected_action_names(dialog) == [
+        "Unpin today",
+        "Snooze task",
+        "Copy task context",
+    ]
+
+    accept_next_snooze_dialog(qapp, TODAY + timedelta(days=1))
+    dialog.snooze_button.click()
+    dialog.view_combo.setCurrentText("All open")
+    QTest.mouseClick(task_row(dialog, "Active workflow task"), Qt.MouseButton.LeftButton)
+    assert selected_action_names(dialog) == ["Wake task now", "Copy task context"]
+
+    dialog.view_combo.setCurrentText("Completed inbox")
+    QTest.mouseClick(task_row(dialog, "Completed inbox task"), Qt.MouseButton.LeftButton)
+    assert selected_action_names(dialog) == ["Copy task context"]
+
+    dialog.view_combo.setCurrentText("All open")
+    dialog.wake_button.click()
+    task_row(dialog, "Active workflow task").dismiss_button.click()
+    dialog.view_combo.setCurrentText("Finished")
+    QTest.mouseClick(task_row(dialog, "Active workflow task"), Qt.MouseButton.LeftButton)
+    assert selected_action_names(dialog) == [
+        "Restore finished task",
+        "Copy task context",
+    ]
+    dialog.restore_button.click()
+    assert not smart_todos.FinishedStore(dialog.finished_store_path).read()
+    assert all(not item.finished for item in dialog._all_items)
+
+
+def test_snooze_until_dialog_defaults_shortcuts_validates_and_cancels(qapp):
+    dialog = smart_todos.SnoozeUntilDialog(TODAY + timedelta(days=1), TODAY)
+
+    assert dialog.date_edit.date().toPython() == TODAY + timedelta(days=1)
+    assert dialog.tomorrow_button.accessibleName() == "Snooze until tomorrow"
+    assert dialog.next_week_button.accessibleName() == "Snooze until next week"
+    dialog.tomorrow_button.click()
+    assert dialog.date_edit.date().toPython() == TODAY + timedelta(days=1)
+    dialog.next_week_button.click()
+    assert dialog.date_edit.date().toPython() == TODAY + timedelta(days=7)
+    dialog.date_edit.setDate(QDate(TODAY.year, TODAY.month, TODAY.day))
+    dialog.snooze_button.click()
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert dialog.error_label.text() == "Choose a date after today."
+    dialog.cancel_button.click()
+    assert dialog.result() == QDialog.DialogCode.Rejected
+
+    exact = smart_todos.SnoozeUntilDialog(TODAY + timedelta(days=1), TODAY)
+    exact.date_edit.setDate(QDate(2026, 8, 3))
+    exact.snooze_button.click()
+    assert exact.result() == QDialog.DialogCode.Accepted
+    assert exact.selected_date == date(2026, 8, 3)
+
+
+def test_workflow_actions_persist_and_project_same_key_immediately(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "# Queue\n- [ ] Duplicate workflow item\n- [ ] Duplicate workflow item\n"},
+        workflow_store_path=workflow_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    dialog.pin_button.click()
+    assert all(item.pinned_today for item in dialog._all_items)
+    assert smart_todos.WorkflowStore(workflow_path).read().pinned_today
+    dialog.unpin_button.click()
+    assert not any(item.pinned_today for item in dialog._all_items)
+
+    accept_next_snooze_dialog(qapp, TODAY + timedelta(days=7))
+    dialog.snooze_button.click()
+    assert {item.snoozed_until for item in dialog._all_items} == {TODAY + timedelta(days=7)}
+    assert "0 focus" in dialog.summary_label.text()
+
+    dialog.view_combo.setCurrentText("All open")
+    QTest.mouseClick(dialog.task_rows[0], Qt.MouseButton.LeftButton)
+    dialog.wake_button.click()
+    assert all(item.snoozed_until is None for item in dialog._all_items)
+    assert "2 focus" in dialog.summary_label.text()
+
+
+def test_failed_workflow_and_restore_writes_preserve_rows_counts_and_selection(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    workflow_path.write_text("{malformed", encoding="utf-8")
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "- [ ] Keep workflow item\n"},
+        workflow_store_path=workflow_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    before_summary = dialog.summary_label.text()
+    selected_id = dialog._selected_item_id
+
+    dialog.pin_button.click()
+
+    assert dialog.status_label.text().startswith("Workflow state")
+    assert visible_task_texts(dialog) == ["Keep workflow item"]
+    assert dialog.summary_label.text() == before_summary
+    assert dialog._selected_item_id == selected_id
+
+    finished_path = tmp_path / "finished.json"
+    finished_path.write_text("{malformed", encoding="utf-8")
+    failed_restore = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "- [ ] Cannot restore\n"},
+        finished_store_path=finished_path,
+    )
+    failed_restore.show_and_refresh()
+    wait_for_scan(failed_restore, qapp)
+    item = failed_restore._all_items[0]
+    failed_restore._all_items = (smart_todos.replace(item, finished=True),)
+    failed_restore.view_combo.setCurrentText("Finished")
+    failed_restore._render_items()
+    before_summary = failed_restore.summary_label.text()
+    failed_restore.restore_button.click()
+
+    assert failed_restore.status_label.text().startswith("Finished state")
+    assert failed_restore._all_items[0].finished is True
+    assert failed_restore.summary_label.text() == before_summary
+
+
+def test_copy_context_writes_exact_plaintext_without_process_execution(
+    qapp, tmp_path, dialog_cleanup, monkeypatch
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "# Delivery\n- [ ] P1 customer deploy due: 2026-08-02\n"},
+    )
+    monkeypatch.setattr(smart_todos.subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("must not spawn"))
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    item = dialog._all_items[0]
+
+    dialog.copy_context_button.click()
+
+    assert qapp.clipboard().text() == (
+        "Task: P1 customer deploy due: 2026-08-02\n"
+        "Project: alpha\n"
+        f"Source: {item.source_path.resolve()}:{item.line}\n"
+        "Heading: Delivery\n"
+        "Due: 2026-08-02\n"
+        f"Urgency: {item.urgency} (score {item.score})\n"
+        "Why now:\n"
+        "- critical priority signal\n"
+        "- revenue or customer impact\n"
+        "- production verification work\n"
+        "- due in 2 days"
+    )
 
 
 def test_repeated_refresh_while_active_coalesces_to_one_follow_up(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import errno
 import hashlib
 import json
@@ -35,7 +35,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from smart_todo_workflow import ObservedTask, WorkflowState
+from smart_todo_workflow import (
+    ObservedTask,
+    TaskObservation,
+    WorkflowState,
+    WorkflowStore,
+)
 
 
 MAX_TODO_BYTES = 4 * 1024 * 1024
@@ -157,6 +162,36 @@ def todo_finished_key(item: TodoItem) -> str:
     display_text = re.sub(r"\s+", " ", item.text).strip()
     identity = "\0".join((str(_absolute_path(item.source_path)), item.heading, display_text))
     return f"source:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def _workflow_location_key(item: TodoItem) -> str:
+    """Return the stable scan-location key without persisting task text."""
+    content_key = todo_finished_key(item)
+    if item.managed_id is not None:
+        return content_key
+    identity = "\0".join((
+        str(_absolute_path(item.source_path)), item.heading, str(item.line),
+    ))
+    return f"location:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def format_task_context(item: TodoItem) -> str:
+    """Format a selected task as plain clipboard data for a local prompt."""
+    due_copy = item.due_date.isoformat() if item.due_date else "None"
+    heading_copy = item.heading or "None"
+    reasons = item.why_now or (
+        "Completed inbox item." if item.completed else "Open task needs attention.",
+    )
+    return "\n".join((
+        f"Task: {item.text}",
+        f"Project: {item.project}",
+        f"Source: {_absolute_path(item.source_path)}:{item.line}",
+        f"Heading: {heading_copy}",
+        f"Due: {due_copy}",
+        f"Urgency: {item.urgency} (score {item.score})",
+        "Why now:",
+        *(f"- {reason}" for reason in reasons),
+    ))
 
 
 def _finished_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1118,6 +1153,77 @@ class ElidedLabel(QLabel):
         self._update_elision()
 
 
+class SnoozeUntilDialog(QDialog):
+    """Small native date picker for a future-only workflow snooze."""
+
+    def __init__(
+        self, selected_date: date, today: date, parent: QWidget | None = None
+    ):
+        super().__init__(parent)
+        if not isinstance(selected_date, date) or not isinstance(today, date):
+            raise ValueError("Snooze dates must be calendar dates.")
+        self.today = today
+        self.selected_date: date | None = None
+        self.setWindowTitle("Snooze task")
+        self.setAccessibleName("Snooze task until a date")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("Snooze until"))
+        shortcuts = QHBoxLayout()
+        self.tomorrow_button = QPushButton("Tomorrow")
+        self.tomorrow_button.setAccessibleName("Snooze until tomorrow")
+        self.tomorrow_button.clicked.connect(
+            lambda: self._set_date(self.today + timedelta(days=1))
+        )
+        shortcuts.addWidget(self.tomorrow_button)
+        self.next_week_button = QPushButton("Next week")
+        self.next_week_button.setAccessibleName("Snooze until next week")
+        self.next_week_button.clicked.connect(
+            lambda: self._set_date(self.today + timedelta(days=7))
+        )
+        shortcuts.addWidget(self.next_week_button)
+        layout.addLayout(shortcuts)
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setAccessibleName("Snooze until date")
+        self._set_date(selected_date)
+        layout.addWidget(self.date_edit)
+        self.error_label = QLabel()
+        self.error_label.setAccessibleName("Snooze validation error")
+        self.error_label.setObjectName("statusLabel")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+        actions = QHBoxLayout()
+        self.snooze_button = QPushButton("Snooze")
+        self.snooze_button.setAccessibleName("Confirm snooze")
+        self.snooze_button.clicked.connect(self._accept_if_future)
+        actions.addWidget(self.snooze_button)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setAccessibleName("Cancel snooze")
+        self.cancel_button.clicked.connect(self.reject)
+        actions.addWidget(self.cancel_button)
+        layout.addLayout(actions)
+        self.setTabOrder(self.tomorrow_button, self.next_week_button)
+        self.setTabOrder(self.next_week_button, self.date_edit)
+        self.setTabOrder(self.date_edit, self.snooze_button)
+        self.setTabOrder(self.snooze_button, self.cancel_button)
+
+    def _set_date(self, value: date) -> None:
+        self.date_edit.setDate(QDate(value.year, value.month, value.day))
+
+    def _accept_if_future(self) -> None:
+        chosen = self.date_edit.date().toPython()
+        if chosen <= self.today:
+            self.error_label.setText("Choose a date after today.")
+            return
+        self.selected_date = chosen
+        self.accept()
+
+
 class TodoTaskRow(QWidget):
     """Compact task summary with safe completion and source actions."""
 
@@ -1246,6 +1352,7 @@ class SmartTodoDialog(QDialog):
         ),
         today_provider: Callable[[], date] = date.today,
         finished_store_path: Path = Path.home() / ".claude" / "smart_todos_finished.json",
+        workflow_store_path: Path = Path.home() / ".claude" / "smart_todos_workflow.json",
         parent: QWidget | None = None,
     ):
         super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
@@ -1253,6 +1360,7 @@ class SmartTodoDialog(QDialog):
         self.workspace_roots = tuple(Path(root) for root in workspace_roots)
         self.today_provider = today_provider
         self.finished_store_path = Path(finished_store_path)
+        self.workflow_store_path = Path(workflow_store_path)
         self._all_items: tuple[TodoItem, ...] = ()
         self._worker: TodoScanWorker | None = None
         self._worker_finished_slots: dict[
@@ -1263,6 +1371,13 @@ class SmartTodoDialog(QDialog):
         self._scan_today = self.today_provider()
         self._selected_item_id: str | None = None
         self.task_rows: list[TodoTaskRow] = []
+        self.workflow_action_buttons: list[QPushButton] = []
+        self.pin_button: QPushButton | None = None
+        self.unpin_button: QPushButton | None = None
+        self.snooze_button: QPushButton | None = None
+        self.wake_button: QPushButton | None = None
+        self.copy_context_button: QPushButton | None = None
+        self.restore_button: QPushButton | None = None
 
         self.setObjectName("smartTodoDialog")
         self.setWindowTitle("Smart TODOs")
@@ -1415,6 +1530,14 @@ class SmartTodoDialog(QDialog):
         why_layout.addWidget(self.why_title_label)
         why_layout.addWidget(self.why_meta_label)
         why_layout.addWidget(self.why_reasons_label, 1)
+        self.workflow_action_rail = QFrame()
+        self.workflow_action_rail.setObjectName("workflowActionRail")
+        self.workflow_action_rail.setAccessibleName("Selected task actions")
+        self.workflow_action_layout = QVBoxLayout(self.workflow_action_rail)
+        self.workflow_action_layout.setContentsMargins(0, 4, 0, 0)
+        self.workflow_action_layout.setSpacing(6)
+        self.workflow_action_rail.hide()
+        why_layout.addWidget(self.workflow_action_rail)
         content.addWidget(self.why_rail)
         root.addLayout(content, 1)
 
@@ -1486,10 +1609,28 @@ class SmartTodoDialog(QDialog):
         except Exception as error:
             finished_keys = frozenset()
             warnings.append(str(error) or error.__class__.__name__)
-        self._all_items = tuple(
+        scanned_items = tuple(
             replace(item, finished=todo_finished_key(item) in finished_keys)
             for item in scan_result.items
         )
+        try:
+            workflow_state, observed = WorkflowStore(self.workflow_store_path).reconcile(
+                tuple(
+                    TaskObservation(
+                        _workflow_location_key(item),
+                        todo_finished_key(item),
+                        item.source_modified_on or self._scan_today,
+                    )
+                    for item in scanned_items
+                ),
+                self._scan_today,
+            )
+            self._all_items = enrich_workflow(
+                scanned_items, workflow_state, observed, self._scan_today
+            )
+        except Exception as error:
+            self._all_items = scanned_items
+            warnings.append(str(error) or error.__class__.__name__)
         self._update_summary()
         self._rebuild_project_filter()
         self.warning_label.setText("\n".join(warnings))
@@ -1498,6 +1639,50 @@ class SmartTodoDialog(QDialog):
             f"Scanned {scan_result.scanned_files} TODO files · {len(scan_result.items)} tasks."
         )
         self._render_items()
+
+    def _apply_workflow_state(self, state: WorkflowState) -> None:
+        """Project a successfully persisted workflow state into current rows."""
+        observed = {
+            todo_finished_key(item): ObservedTask(
+                "",
+                todo_finished_key(item),
+                item.unchanged_since or self._scan_today,
+                item.change_status,
+            )
+            for item in self._all_items
+        }
+        self._all_items = enrich_workflow(
+            self._all_items, state, observed, self._scan_today
+        )
+        self._update_summary()
+        self._render_items()
+
+    def _mutate_workflow(self, item: TodoItem, operation: str, until: date | None = None) -> None:
+        current_item = next(
+            (candidate for candidate in self._all_items if candidate.id == item.id), None
+        )
+        if current_item is None or current_item.completed or current_item.finished:
+            self.status_label.setText("Only active tasks can change workflow state here.")
+            return
+        try:
+            store = WorkflowStore(self.workflow_store_path)
+            key = todo_finished_key(current_item)
+            if operation == "pin":
+                store.pin(key)
+            elif operation == "unpin":
+                store.unpin(key)
+            elif operation == "snooze" and until is not None:
+                store.snooze(key, until)
+            elif operation == "wake":
+                store.wake(key)
+            else:
+                raise ValueError("Workflow action is invalid.")
+            state = store.read()
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+            return
+        self._apply_workflow_state(state)
+        self.status_label.setText("Workflow state updated locally.")
 
     def _on_scan_failed(self, message: str) -> None:
         if self._shutting_down:
@@ -1523,13 +1708,19 @@ class SmartTodoDialog(QDialog):
         open_items = [
             item for item in self._all_items if not item.completed and not item.finished
         ]
-        focus_count = sum(not item.waiting for item in open_items)
+        focus_count = sum(
+            not item.waiting
+            and not (item.snoozed_until is not None and item.snoozed_until > self._scan_today)
+            for item in open_items
+        )
         overdue_count = sum(
             item.due_date is not None and item.due_date < self._scan_today
             for item in open_items
         )
         urgent_count = sum(
-            item.urgency in {"critical", "high"} and not item.waiting
+            item.urgency in {"critical", "high"}
+            and not item.waiting
+            and not (item.snoozed_until is not None and item.snoozed_until > self._scan_today)
             for item in open_items
         )
         waiting_count = sum(item.waiting for item in open_items)
@@ -1556,7 +1747,12 @@ class SmartTodoDialog(QDialog):
         query = self.search_edit.text().strip().casefold()
         filtered: list[TodoItem] = []
         for item in self._all_items:
-            if view == "Focus" and (item.completed or item.finished or item.waiting):
+            if view == "Focus" and (
+                item.completed
+                or item.finished
+                or item.waiting
+                or (item.snoozed_until is not None and item.snoozed_until > self._scan_today)
+            ):
                 continue
             if view == "All open" and (item.completed or item.finished):
                 continue
@@ -1633,6 +1829,7 @@ class SmartTodoDialog(QDialog):
             self.why_reasons_label.setText(
                 "Why-now reasons appear here when a task is selected."
             )
+            self._render_workflow_actions(None)
         else:
             self._select_item(selected)
 
@@ -1659,6 +1856,103 @@ class SmartTodoDialog(QDialog):
             or ("Completed inbox item." if item.completed else "Open task needs attention.",)
         )
         self.why_reasons_label.setText("\n\n".join(f"— {reason}" for reason in reasons))
+        self._render_workflow_actions(item)
+
+    def _clear_workflow_actions(self) -> None:
+        while self.workflow_action_layout.count():
+            child = self.workflow_action_layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.deleteLater()
+            nested = child.layout()
+            if nested is not None:
+                while nested.count():
+                    nested_child = nested.takeAt(0)
+                    nested_widget = nested_child.widget()
+                    if nested_widget is not None:
+                        nested_widget.deleteLater()
+        self.workflow_action_buttons = []
+        self.pin_button = None
+        self.unpin_button = None
+        self.snooze_button = None
+        self.wake_button = None
+        self.copy_context_button = None
+        self.restore_button = None
+
+    def _render_workflow_actions(self, item: TodoItem | None) -> None:
+        self._clear_workflow_actions()
+        if item is None:
+            self.workflow_action_rail.hide()
+            return
+
+        actions: list[tuple[str, str, Callable[[], None], str]] = []
+        if item.finished:
+            actions.append(("Restore", "Restore finished task", lambda: self._restore_task(item), "restore_button"))
+        elif not item.completed and item.snoozed_until is not None and item.snoozed_until > self._scan_today:
+            actions.append(("Wake now", "Wake task now", lambda: self._mutate_workflow(item, "wake"), "wake_button"))
+        elif not item.completed and not item.waiting:
+            if item.pinned_today:
+                actions.append(("Unpin", "Unpin today", lambda: self._mutate_workflow(item, "unpin"), "unpin_button"))
+            else:
+                actions.append(("Pin today", "Pin today", lambda: self._mutate_workflow(item, "pin"), "pin_button"))
+            actions.append(("Snooze…", "Snooze task", lambda: self._snooze_task(item), "snooze_button"))
+        actions.append(("Copy context", "Copy task context", lambda: self._copy_context(item), "copy_context_button"))
+
+        for start in range(0, len(actions), 2):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            for label, accessible_name, callback, attribute in actions[start:start + 2]:
+                button = QPushButton(label)
+                button.setAccessibleName(accessible_name)
+                button.clicked.connect(callback)
+                setattr(self, attribute, button)
+                self.workflow_action_buttons.append(button)
+                row.addWidget(button)
+            if len(actions[start:start + 2]) == 1:
+                row.addStretch(1)
+            self.workflow_action_layout.addLayout(row)
+        self.workflow_action_rail.show()
+        self.setTabOrder(self.refresh_button, self.workflow_action_buttons[0])
+        for before, after in zip(
+            self.workflow_action_buttons, self.workflow_action_buttons[1:]
+        ):
+            self.setTabOrder(before, after)
+
+    def _snooze_task(self, item: TodoItem) -> None:
+        dialog = SnoozeUntilDialog(self._scan_today + timedelta(days=1), self._scan_today, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_date is not None:
+            self._mutate_workflow(item, "snooze", dialog.selected_date)
+
+    def _restore_task(self, item: TodoItem) -> None:
+        current_item = next(
+            (candidate for candidate in self._all_items if candidate.id == item.id), None
+        )
+        if current_item is None or not current_item.finished or current_item.completed:
+            self.status_label.setText("Only finished tasks can be restored here.")
+            return
+        try:
+            finished_key = todo_finished_key(current_item)
+            FinishedStore(self.finished_store_path).restore(current_item)
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+            return
+        self._all_items = tuple(
+            replace(candidate, finished=False)
+            if todo_finished_key(candidate) == finished_key
+            else candidate
+            for candidate in self._all_items
+        )
+        self._update_summary()
+        self.status_label.setText("Task restored in command center. Source TODO unchanged.")
+        self._render_items()
+
+    def _copy_context(self, item: TodoItem) -> None:
+        try:
+            QApplication.clipboard().setText(format_task_context(item))
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+            return
+        self.status_label.setText("Task context copied to clipboard.")
 
     def _reset_filters(self) -> None:
         self.search_edit.blockSignals(True)
