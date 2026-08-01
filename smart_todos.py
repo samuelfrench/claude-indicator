@@ -739,14 +739,20 @@ def enrich_workflow(
             duplicate_count = 1
         enriched.append(replace(
             item,
-            change_status="" if observed_item is None else observed_item.change,
+            change_status=(
+                "" if item.finished or observed_item is None else observed_item.change
+            ),
             unchanged_since=(
                 item.unchanged_since
                 if observed_item is None
                 else observed_item.unchanged_since
             ),
             snoozed_until=None if item.finished else snoozed_until,
-            pinned_today=(not item.finished and content_key in state.pinned_today),
+            pinned_today=(
+                not item.finished
+                and snoozed_until is None
+                and content_key in state.pinned_today
+            ),
             duplicate_key=duplicate_key,
             duplicate_count=duplicate_count,
         ))
@@ -817,7 +823,9 @@ def project_summaries(
         focus_items = tuple(
             item for item in active_items if _is_actionable_on(item, today)
         )
-        top_item = min(focus_items or active_items, key=_item_sort_key)
+        top_item = min(
+            enumerate(active_items), key=lambda entry: (-entry[1].score, entry[0])
+        )[1]
         summaries.append(ProjectSummary(
             project=project,
             top_item=top_item,
@@ -840,7 +848,7 @@ def project_summaries(
         ))
     return tuple(sorted(
         summaries,
-        key=lambda summary: (_item_sort_key(summary.top_item), summary.project.casefold()),
+        key=lambda summary: (-summary.top_item.score, summary.project.casefold()),
     ))
 
 

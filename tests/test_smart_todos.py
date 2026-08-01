@@ -992,7 +992,7 @@ def test_enrich_workflow_maps_state_without_changing_rank_and_groups_exact_dupli
     second_key = smart_todos.todo_finished_key(second)
     finished_key = smart_todos.todo_finished_key(finished)
     state = smart_todo_workflow.WorkflowState(
-        frozenset({first_key, finished_key}),
+        frozenset({first_key, second_key, finished_key}),
         (
             smart_todo_workflow.SnoozeRecord(second_key, date(2026, 8, 2)),
             smart_todo_workflow.SnoozeRecord(finished_key, TODAY),
@@ -1006,6 +1006,9 @@ def test_enrich_workflow_maps_state_without_changing_rank_and_groups_exact_dupli
         second_key: smart_todo_workflow.ObservedTask(
             "location:" + "b" * 64, second_key, date(2026, 7, 4), "new"
         ),
+        finished_key: smart_todo_workflow.ObservedTask(
+            "location:" + "c" * 64, finished_key, date(2026, 7, 5), "new"
+        ),
     }
 
     enriched = smart_todos.enrich_workflow(
@@ -1018,9 +1021,12 @@ def test_enrich_workflow_maps_state_without_changing_rank_and_groups_exact_dupli
     assert by_text[first.text].change_status == "changed"
     assert by_text[first.text].unchanged_since == date(2026, 7, 2)
     assert by_text[second.text].snoozed_until == date(2026, 8, 2)
+    assert by_text[second.text].pinned_today is False
     assert by_text[second.text].change_status == "new"
     assert by_text[finished.text].finished is True
+    assert by_text[finished.text].pinned_today is False
     assert by_text[finished.text].snoozed_until is None
+    assert by_text[finished.text].change_status == ""
     assert by_text[first.text].duplicate_count == 2
     assert by_text[second.text].duplicate_count == 2
     assert by_text[finished.text].duplicate_count == 1
@@ -1105,7 +1111,7 @@ def test_project_summary_reports_exact_counts_top_item_and_ranked_project_order(
 
     assert [summary.project for summary in summaries] == ["alpha", "beta"]
     alpha, beta = summaries
-    assert alpha.top_item is items[0]
+    assert alpha.top_item is items[3]
     assert (
         alpha.active,
         alpha.focus,
