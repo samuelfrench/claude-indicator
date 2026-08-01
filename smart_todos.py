@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from smart_todo_workflow import ObservedTask, WorkflowState
 
 
 MAX_TODO_BYTES = 4 * 1024 * 1024
@@ -102,6 +103,27 @@ class TodoItem:
     why_now: tuple[str, ...] = ()
     waiting: bool = False
     finished: bool = False
+    source_modified_on: date | None = None
+    change_status: str = ""
+    unchanged_since: date | None = None
+    snoozed_until: date | None = None
+    pinned_today: bool = False
+    duplicate_key: str = ""
+    duplicate_count: int = 1
+
+
+@dataclass(frozen=True)
+class ProjectSummary:
+    project: str
+    top_item: TodoItem | None
+    active: int
+    focus: int
+    waiting: int
+    snoozed: int
+    overdue: int
+    new_changed: int
+    duplicates: int
+    stale_30: int
 
 
 @dataclass(frozen=True)
@@ -529,19 +551,19 @@ def discover_todo_files(workspace_roots: tuple[Path, ...]) -> tuple[Path, ...]:
     return paths
 
 
-def _read_todo_file(path: Path) -> tuple[str | None, str | None]:
+def _read_todo_file(path: Path) -> tuple[str | None, str | None, date | None]:
     descriptor: int | None = None
     try:
         descriptor = os.open(path, _safe_read_flags())
     except OSError as error:
         warning_kind = "symlink" if error.errno == errno.ELOOP else "unreadable"
-        return None, f"Skipped {warning_kind} TODO file: {path}"
+        return None, f"Skipped {warning_kind} TODO file: {path}", None
     try:
         stat_result = os.fstat(descriptor)
         if not stat.S_ISREG(stat_result.st_mode):
-            return None, f"Skipped special TODO file: {path}"
+            return None, f"Skipped special TODO file: {path}", None
         if stat_result.st_size > MAX_TODO_BYTES:
-            return None, f"Skipped oversized TODO file: {path}"
+            return None, f"Skipped oversized TODO file: {path}", None
         chunks: list[bytes] = []
         remaining = MAX_TODO_BYTES + 1
         while remaining:
@@ -552,13 +574,15 @@ def _read_todo_file(path: Path) -> tuple[str | None, str | None]:
             remaining -= len(chunk)
         data = b"".join(chunks)
     except OSError:
-        return None, f"Skipped unreadable TODO file: {path}"
+        return None, f"Skipped unreadable TODO file: {path}", None
     finally:
         if descriptor is not None:
             os.close(descriptor)
     if len(data) > MAX_TODO_BYTES:
-        return None, f"Skipped oversized TODO file: {path}"
-    return data.decode("utf-8", errors="replace"), None
+        return None, f"Skipped oversized TODO file: {path}", None
+    return data.decode("utf-8", errors="replace"), None, datetime.fromtimestamp(
+        stat_result.st_mtime
+    ).date()
 
 
 def _managed_ids_by_line(contents: str) -> dict[int, str]:
@@ -680,6 +704,146 @@ def _item_sort_key(item: TodoItem) -> tuple[object, ...]:
     )
 
 
+def _duplicate_key(item: TodoItem) -> str:
+    return re.sub(r"\s+", " ", item.text).strip().casefold()
+
+
+def enrich_workflow(
+    items: tuple[TodoItem, ...],
+    state: WorkflowState,
+    observed: dict[str, ObservedTask],
+    today: date,
+) -> tuple[TodoItem, ...]:
+    """Apply scan-history and local workflow choices without reranking tasks."""
+    snoozes = {record.key: record.until for record in state.snoozed}
+    enriched: list[TodoItem] = []
+    duplicate_counts: dict[str, int] = {}
+    for item in items:
+        if not item.completed and not item.finished:
+            key = _duplicate_key(item)
+            duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+
+    for item in items:
+        content_key = todo_finished_key(item)
+        observed_item = observed.get(content_key)
+        snoozed_until = snoozes.get(content_key)
+        if snoozed_until is not None and snoozed_until <= today:
+            snoozed_until = None
+        duplicate_key = _duplicate_key(item)
+        duplicate_count = (
+            duplicate_counts.get(duplicate_key, 1)
+            if not item.completed and not item.finished
+            else 1
+        )
+        if duplicate_count < 2:
+            duplicate_count = 1
+        enriched.append(replace(
+            item,
+            change_status="" if observed_item is None else observed_item.change,
+            unchanged_since=(
+                item.unchanged_since
+                if observed_item is None
+                else observed_item.unchanged_since
+            ),
+            snoozed_until=None if item.finished else snoozed_until,
+            pinned_today=(not item.finished and content_key in state.pinned_today),
+            duplicate_key=duplicate_key,
+            duplicate_count=duplicate_count,
+        ))
+    return tuple(enriched)
+
+
+def _is_actionable(item: TodoItem) -> bool:
+    return (
+        not item.completed
+        and not item.finished
+        and not item.waiting
+        and item.snoozed_until is None
+    )
+
+
+def _is_actionable_on(item: TodoItem, today: date) -> bool:
+    return (
+        not item.completed
+        and not item.finished
+        and not item.waiting
+        and (item.snoozed_until is None or item.snoozed_until <= today)
+    )
+
+
+def today_items(items: tuple[TodoItem, ...], limit: int = 7) -> tuple[TodoItem, ...]:
+    """Return active pins first, then the existing rank order up to ``limit``."""
+    if limit < 0:
+        raise ValueError("Today limit must not be negative.")
+    ranked = tuple(
+        item for _index, item in sorted(
+            enumerate(items), key=lambda entry: (_item_sort_key(entry[1]), entry[0])
+        )
+        if _is_actionable(item)
+    )
+    pinned = tuple(item for item in ranked if item.pinned_today)
+    unpinned = tuple(item for item in ranked if not item.pinned_today)
+    return pinned + unpinned[:max(0, limit - len(pinned))]
+
+
+def stale_items(
+    items: tuple[TodoItem, ...], today: date, threshold: int
+) -> tuple[TodoItem, ...]:
+    """Return conservatively stale, undated actionable tasks in rank order."""
+    if threshold < 0:
+        raise ValueError("Stale threshold must not be negative.")
+    return tuple(
+        item
+        for item in items
+        if _is_actionable_on(item, today)
+        and item.due_date is None
+        and item.unchanged_since is not None
+        and (today - item.unchanged_since).days >= threshold
+    )
+
+
+def project_summaries(
+    items: tuple[TodoItem, ...], today: date
+) -> tuple[ProjectSummary, ...]:
+    """Summarize each project from immutable workflow-enriched task items."""
+    by_project: dict[str, list[TodoItem]] = {}
+    for item in items:
+        if not item.completed and not item.finished:
+            by_project.setdefault(item.project, []).append(item)
+
+    summaries: list[ProjectSummary] = []
+    for project, project_items in by_project.items():
+        active_items = tuple(project_items)
+        focus_items = tuple(
+            item for item in active_items if _is_actionable_on(item, today)
+        )
+        top_item = min(focus_items or active_items, key=_item_sort_key)
+        summaries.append(ProjectSummary(
+            project=project,
+            top_item=top_item,
+            active=len(active_items),
+            focus=len(focus_items),
+            waiting=sum(item.waiting for item in active_items),
+            snoozed=sum(
+                item.snoozed_until is not None and item.snoozed_until > today
+                for item in active_items
+            ),
+            overdue=sum(
+                item.due_date is not None and item.due_date < today
+                for item in active_items
+            ),
+            new_changed=sum(
+                item.change_status in {"new", "changed"} for item in active_items
+            ),
+            duplicates=sum(item.duplicate_count > 1 for item in active_items),
+            stale_30=len(stale_items(active_items, today, 30)),
+        ))
+    return tuple(sorted(
+        summaries,
+        key=lambda summary: (_item_sort_key(summary.top_item), summary.project.casefold()),
+    ))
+
+
 def scan_todos(
     home_todo_path: Path, workspace_roots: tuple[Path, ...], today: date | None = None
 ) -> ScanResult:
@@ -694,7 +858,7 @@ def scan_todos(
     items: list[TodoItem] = []
     scanned_files = 0
     for path in paths:
-        contents, warning = _read_todo_file(path)
+        contents, warning, source_modified_on = _read_todo_file(path)
         if contents is None:
             if warning is not None:
                 warnings.append(warning)
@@ -702,6 +866,17 @@ def scan_todos(
         scanned_files += 1
         project = "Overall" if path == home_path else _project_for(path, workspace_roots)
         parsed_items = parse_todos(contents, path, project, current_day)
+        parsed_items = tuple(
+            replace(
+                item,
+                source_modified_on=(
+                    min(source_modified_on, current_day)
+                    if isinstance(current_day, date)
+                    else source_modified_on
+                ),
+            )
+            for item in parsed_items
+        )
         if path == home_path:
             managed_ids = _managed_ids_by_line(contents)
             parsed_items = tuple(

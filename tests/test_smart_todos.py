@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import date, datetime
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import uuid
 
 import pytest
 
+import smart_todo_workflow
 from smart_todos import (
     InboxStore,
     MAX_TODO_BYTES,
@@ -927,3 +929,201 @@ def test_open_source_item_passes_a_literal_command_without_shell_options(monkeyp
     )
 
     assert calls == [(command, {"start_new_session": True})]
+
+
+def workflow_item(
+    text: str,
+    *,
+    project: str = "alpha",
+    score: int = 20,
+    due_date: date | None = None,
+    completed: bool = False,
+    finished: bool = False,
+    waiting: bool = False,
+    source_modified_on: date | None = None,
+    unchanged_since: date | None = None,
+    change_status: str = "",
+    snoozed_until: date | None = None,
+    pinned_today: bool = False,
+    duplicate_key: str = "",
+    duplicate_count: int = 1,
+) -> TodoItem:
+    """Build a ranked item with literal workflow fields for derivation tests."""
+    return replace(
+        make_item(text, project=project, due_date=due_date, completed=completed),
+        score=score,
+        urgency="high" if score >= 65 else "normal",
+        finished=finished,
+        waiting=waiting,
+        source_modified_on=source_modified_on,
+        unchanged_since=unchanged_since,
+        change_status=change_status,
+        snoozed_until=snoozed_until,
+        pinned_today=pinned_today,
+        duplicate_key=duplicate_key,
+        duplicate_count=duplicate_count,
+    )
+
+
+def test_scan_records_opened_regular_file_modified_date_capped_at_today(tmp_path):
+    root = tmp_path / "workspaces"
+    home_todo = write_todo(root / "home" / "TODO.md", "- [ ] Future file date\n")
+    project_todo = write_todo(
+        root / "alpha" / "TODO.md", "- [ ] Past file date\n"
+    )
+    future_timestamp = datetime(2026, 8, 3, 12, 0).timestamp()
+    past_timestamp = datetime(2026, 7, 15, 12, 0).timestamp()
+    os.utime(home_todo, (future_timestamp, future_timestamp))
+    os.utime(project_todo, (past_timestamp, past_timestamp))
+
+    result = scan_todos(home_todo, (root,), today=TODAY)
+    by_text = {item.text: item for item in result.items}
+
+    assert by_text["Future file date"].source_modified_on == TODAY
+    assert by_text["Past file date"].source_modified_on == date(2026, 7, 15)
+
+
+def test_enrich_workflow_maps_state_without_changing_rank_and_groups_exact_duplicates():
+    first = workflow_item("  Ship   release  ", score=91)
+    second = workflow_item("ship RELEASE", score=42)
+    unique = workflow_item("Unique task", score=35)
+    finished = workflow_item("ship release", score=80, finished=True)
+    first_key = smart_todos.todo_finished_key(first)
+    second_key = smart_todos.todo_finished_key(second)
+    finished_key = smart_todos.todo_finished_key(finished)
+    state = smart_todo_workflow.WorkflowState(
+        frozenset({first_key, finished_key}),
+        (
+            smart_todo_workflow.SnoozeRecord(second_key, date(2026, 8, 2)),
+            smart_todo_workflow.SnoozeRecord(finished_key, TODAY),
+        ),
+        (),
+    )
+    observed = {
+        first_key: smart_todo_workflow.ObservedTask(
+            "location:" + "a" * 64, first_key, date(2026, 7, 2), "changed"
+        ),
+        second_key: smart_todo_workflow.ObservedTask(
+            "location:" + "b" * 64, second_key, date(2026, 7, 4), "new"
+        ),
+    }
+
+    enriched = smart_todos.enrich_workflow(
+        (first, second, unique, finished), state, observed, TODAY
+    )
+    by_text = {item.text: item for item in enriched}
+
+    assert [item.score for item in enriched] == [91, 42, 35, 80]
+    assert by_text[first.text].pinned_today is True
+    assert by_text[first.text].change_status == "changed"
+    assert by_text[first.text].unchanged_since == date(2026, 7, 2)
+    assert by_text[second.text].snoozed_until == date(2026, 8, 2)
+    assert by_text[second.text].change_status == "new"
+    assert by_text[finished.text].finished is True
+    assert by_text[finished.text].snoozed_until is None
+    assert by_text[first.text].duplicate_count == 2
+    assert by_text[second.text].duplicate_count == 2
+    assert by_text[finished.text].duplicate_count == 1
+    assert by_text["Unique task"].duplicate_count == 1
+    assert by_text[first.text].duplicate_key == "ship release"
+
+
+def test_today_items_keeps_active_pins_first_fills_to_limit_and_retains_pin_overage():
+    items = (
+        workflow_item("third", score=70),
+        workflow_item("pinned lower", score=30, pinned_today=True),
+        workflow_item("first", score=90),
+        workflow_item("pinned higher", score=80, pinned_today=True),
+        workflow_item("second", score=80),
+        workflow_item("waiting", score=99, waiting=True, pinned_today=True),
+        workflow_item("snoozed", score=98, snoozed_until=date(2026, 8, 2), pinned_today=True),
+        workflow_item("completed", score=97, completed=True, pinned_today=True),
+        workflow_item("finished", score=96, finished=True, pinned_today=True),
+    )
+
+    selected = smart_todos.today_items(items, limit=3)
+
+    assert [item.text for item in selected] == [
+        "pinned higher",
+        "pinned lower",
+        "first",
+    ]
+
+    overage = tuple(
+        workflow_item(f"pin {index}", score=100 - index, pinned_today=True)
+        for index in range(4)
+    )
+    assert [item.text for item in smart_todos.today_items(overage, limit=3)] == [
+        "pin 0",
+        "pin 1",
+        "pin 2",
+        "pin 3",
+    ]
+
+
+def test_today_items_uses_existing_sort_tie_breaking_for_automatic_fill():
+    beta = workflow_item("same score", project="beta", score=50)
+    alpha = workflow_item("same score", project="alpha", score=50)
+
+    assert smart_todos.today_items((beta, alpha), limit=2) == (alpha, beta)
+
+
+def test_stale_items_are_undated_actionable_and_include_exact_threshold_boundaries():
+    items = (
+        workflow_item("thirty", unchanged_since=date(2026, 7, 1)),
+        workflow_item("sixty", unchanged_since=date(2026, 6, 1)),
+        workflow_item("ninety", unchanged_since=date(2026, 5, 2)),
+        workflow_item("dated", unchanged_since=date(2026, 5, 1), due_date=TODAY),
+        workflow_item("waiting", unchanged_since=date(2026, 5, 1), waiting=True),
+        workflow_item("snoozed", unchanged_since=date(2026, 5, 1), snoozed_until=date(2026, 8, 1)),
+        workflow_item("completed", unchanged_since=date(2026, 5, 1), completed=True),
+        workflow_item("finished", unchanged_since=date(2026, 5, 1), finished=True),
+    )
+
+    assert [item.text for item in smart_todos.stale_items(items, TODAY, 30)] == [
+        "thirty", "sixty", "ninety"
+    ]
+    assert [item.text for item in smart_todos.stale_items(items, TODAY, 60)] == [
+        "sixty", "ninety"
+    ]
+    assert [item.text for item in smart_todos.stale_items(items, TODAY, 90)] == ["ninety"]
+
+
+def test_project_summary_reports_exact_counts_top_item_and_ranked_project_order():
+    items = (
+        workflow_item("Alpha top", project="alpha", score=95, unchanged_since=date(2026, 6, 1)),
+        workflow_item("Alpha duplicate", project="alpha", score=40, duplicate_count=2),
+        workflow_item("Alpha duplicate copy", project="alpha", score=39, duplicate_count=2),
+        workflow_item("Alpha waiting", project="alpha", score=99, waiting=True),
+        workflow_item("Alpha snoozed", project="alpha", score=98, snoozed_until=date(2026, 8, 1)),
+        workflow_item("Alpha overdue changed", project="alpha", score=50, due_date=date(2026, 7, 30), change_status="changed"),
+        workflow_item("Alpha completed", project="alpha", score=0, completed=True),
+        workflow_item("Beta top new", project="beta", score=70, change_status="new"),
+    )
+
+    summaries = smart_todos.project_summaries(items, TODAY)
+
+    assert [summary.project for summary in summaries] == ["alpha", "beta"]
+    alpha, beta = summaries
+    assert alpha.top_item is items[0]
+    assert (
+        alpha.active,
+        alpha.focus,
+        alpha.waiting,
+        alpha.snoozed,
+        alpha.overdue,
+        alpha.new_changed,
+        alpha.duplicates,
+        alpha.stale_30,
+    ) == (6, 4, 1, 1, 1, 1, 2, 1)
+    assert beta.top_item is items[-1]
+    assert (
+        beta.active,
+        beta.focus,
+        beta.waiting,
+        beta.snoozed,
+        beta.overdue,
+        beta.new_changed,
+        beta.duplicates,
+        beta.stale_30,
+    ) == (1, 1, 0, 0, 0, 1, 0, 0)
