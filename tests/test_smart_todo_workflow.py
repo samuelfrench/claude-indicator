@@ -128,6 +128,37 @@ def test_workflow_store_rejects_two_observed_records_for_one_location(tmp_path):
     assert path.read_bytes() == contents
 
 
+@pytest.mark.parametrize(
+    "replacement_keys",
+    [
+        (SOURCE_A, SOURCE_A),
+        (SOURCE_B, SOURCE_A),
+    ],
+    ids=["duplicate", "unsorted"],
+)
+def test_legacy_expansion_rejects_noncanonical_replacement_keys_before_write(
+    tmp_path, replacement_keys
+):
+    path = tmp_path / "workflow.json"
+    before = (
+        '{"version":1,"pinned_today":[],"snoozed":['
+        '{"key":"managed:inbox-a","until":"2026-08-07"}],"observed":[]}'
+    ).encode("utf-8")
+    path.write_bytes(before)
+    store = smart_todo_workflow.WorkflowStore(path)
+    readable_before = store.read()
+
+    with pytest.raises(ValueError, match="legacy-key expansion"):
+        store.pin(
+            SOURCE_A,
+            legacy_key=MANAGED_A,
+            replacement_keys=replacement_keys,
+        )
+
+    assert path.read_bytes() == before
+    assert store.read() == readable_before
+
+
 def test_workflow_store_rejects_symlink_and_fifo_paths(tmp_path):
     target = tmp_path / "target.json"
     target.write_bytes(b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[]}')

@@ -1542,6 +1542,56 @@ def test_same_source_duplicate_dismiss_restore_stays_selected_only_across_refres
     assert not any(item.finished for item in dialog._all_items)
 
 
+def test_same_source_duplicate_dismiss_restore_recomputes_view_metadata_immediately(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": "# Queue\n- [ ] Identical task\n- [ ] Identical task\n"
+        },
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = dialog._all_items
+    source_before = first.source_path.read_bytes()
+    dialog.view_combo.setCurrentText("Duplicates")
+    assert [row.meta_label.text().split("  ·  ", 1)[0] for row in dialog.task_rows] == [
+        "copy 1 of 2",
+        "copy 2 of 2",
+    ]
+    selected = task_row_at_line(dialog, second.line)
+    QTest.mouseClick(selected, Qt.MouseButton.LeftButton)
+
+    selected.dismiss_button.click()
+
+    assert dialog._selected_item_id is None
+    assert visible_task_texts(dialog) == []
+    assert all(item.duplicate_count == 1 for item in dialog._all_items)
+    assert first.source_path.read_bytes() == source_before
+
+    dialog.view_combo.setCurrentText("Finished")
+    assert [row.item.line for row in dialog.task_rows] == [second.line]
+    dialog.restore_button.click()
+    assert all(item.duplicate_count == 2 for item in dialog._all_items)
+    assert first.source_path.read_bytes() == source_before
+
+    dialog.view_combo.setCurrentText("Duplicates")
+    assert [row.item.line for row in dialog.task_rows] == [first.line, second.line]
+    assert [row.meta_label.text().split("  ·  ", 1)[0] for row in dialog.task_rows] == [
+        "copy 1 of 2",
+        "copy 2 of 2",
+    ]
+    assert dialog._selected_item_id == first.id
+    assert selected_action_names(dialog) == [
+        "Pin today",
+        "Snooze task",
+        "Copy task context",
+    ]
+
+
 def test_same_source_duplicate_legacy_base_keys_expand_before_selected_mutation(
     qapp, tmp_path, dialog_cleanup
 ):

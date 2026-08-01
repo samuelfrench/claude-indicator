@@ -252,6 +252,11 @@ class WorkflowStore:
             raise ValueError("Workflow legacy-key expansion is invalid.")
         for key in replacement_keys:
             cls._require_content_key(key)
+        if (
+            not isinstance(replacement_keys, tuple)
+            or replacement_keys != tuple(sorted(set(replacement_keys)))
+        ):
+            raise ValueError("Workflow legacy-key expansion is invalid.")
 
     @staticmethod
     def _expand_legacy_key(

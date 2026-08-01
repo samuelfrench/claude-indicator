@@ -827,6 +827,31 @@ def _duplicate_key(item: TodoItem) -> str:
     return re.sub(r"\s+", " ", item.text).strip().casefold()
 
 
+def recompute_duplicate_metadata(
+    items: tuple[TodoItem, ...],
+) -> tuple[TodoItem, ...]:
+    """Recompute exact open-group membership after an in-memory state change."""
+    duplicate_counts: dict[str, int] = {}
+    for item in items:
+        if not item.completed and not item.finished:
+            key = _duplicate_key(item)
+            duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+    updated: list[TodoItem] = []
+    for item in items:
+        duplicate_key = _duplicate_key(item)
+        duplicate_count = (
+            duplicate_counts.get(duplicate_key, 1)
+            if not item.completed and not item.finished
+            else 1
+        )
+        updated.append(replace(
+            item,
+            duplicate_key=duplicate_key,
+            duplicate_count=duplicate_count if duplicate_count >= 2 else 1,
+        ))
+    return tuple(updated)
+
+
 def enrich_workflow(
     items: tuple[TodoItem, ...],
     state: WorkflowState,
@@ -837,11 +862,6 @@ def enrich_workflow(
     items = assign_task_action_keys(items)
     snoozes = {record.key: record.until for record in state.snoozed}
     enriched: list[TodoItem] = []
-    duplicate_counts: dict[str, int] = {}
-    for item in items:
-        if not item.completed and not item.finished:
-            key = _duplicate_key(item)
-            duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
 
     for item in items:
         content_key = todo_finished_key(item)
@@ -852,14 +872,6 @@ def enrich_workflow(
         snoozed_until = snoozes.get(action_key, snoozes.get(content_key))
         if snoozed_until is not None and snoozed_until <= today:
             snoozed_until = None
-        duplicate_key = _duplicate_key(item)
-        duplicate_count = (
-            duplicate_counts.get(duplicate_key, 1)
-            if not item.completed and not item.finished
-            else 1
-        )
-        if duplicate_count < 2:
-            duplicate_count = 1
         enriched.append(replace(
             item,
             change_status=(
@@ -879,10 +891,8 @@ def enrich_workflow(
                     or content_key in state.pinned_today
                 )
             ),
-            duplicate_key=duplicate_key,
-            duplicate_count=duplicate_count,
         ))
-    return tuple(enriched)
+    return recompute_duplicate_metadata(tuple(enriched))
 
 
 def _is_actionable(item: TodoItem) -> bool:
@@ -2423,12 +2433,12 @@ class SmartTodoDialog(QDialog):
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
             return
-        self._all_items = tuple(
+        self._all_items = recompute_duplicate_metadata(tuple(
             replace(candidate, finished=False)
             if candidate.id == current_item.id
             else candidate
             for candidate in self._all_items
-        )
+        ))
         self._update_summary()
         self.status_label.setText("Task restored in command center. Source TODO unchanged.")
         self._render_items()
@@ -2507,12 +2517,12 @@ class SmartTodoDialog(QDialog):
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
             return
-        self._all_items = tuple(
+        self._all_items = recompute_duplicate_metadata(tuple(
             replace(candidate, finished=True)
             if candidate.id == current_item.id
             else candidate
             for candidate in self._all_items
-        )
+        ))
         self._update_summary()
         self.status_label.setText("Task finished in command center. Source TODO unchanged.")
         self._render_items()
