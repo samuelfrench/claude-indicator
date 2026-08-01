@@ -754,6 +754,38 @@ def test_finished_store_rejects_invalid_state_without_mutation(tmp_path, content
     assert state_path.read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        b'{"version": 1, "finished": ["managed:managed-a", "managed:managed-a"]}',
+        b'{"version": 1, "finished": ["source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "managed:managed-a"]}',
+        b'{"version": 1, "finished": ["Private task text"]}',
+        b'{"version": 1, "finished": ["managed:"]}',
+        b'{"version": 1, "finished": ["managed:contains space"]}',
+        b'{"version": 1, "finished": ["source:abc"]}',
+        b'{"version": 1, "finished": ["source:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"]}',
+    ],
+    ids=[
+        "duplicate-key",
+        "unsorted-keys",
+        "plaintext-key",
+        "empty-managed-id",
+        "managed-id-with-space",
+        "short-source-sha256",
+        "nonhex-source-sha256",
+    ],
+)
+def test_finished_store_read_rejects_noncanonical_keys_without_mutation(tmp_path, contents):
+    state_path = tmp_path / "finished.json"
+    state_path.write_bytes(contents)
+    before = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="Finished state"):
+        smart_todos.FinishedStore(state_path).read()
+
+    assert state_path.read_bytes() == before
+
+
 def test_finished_store_rejects_symlink_and_non_regular_paths_without_mutation(tmp_path):
     target = tmp_path / "target.json"
     target.write_text('{"version": 1, "finished": []}', encoding="utf-8")

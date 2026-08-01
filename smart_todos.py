@@ -48,6 +48,8 @@ IGNORED_DIRS = frozenset({
 TASK_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 MANAGED_ID_RE = re.compile(r"<!--\s*claude-indicator:id=([0-9A-Za-z-]+)\s*-->\s*$")
+FINISHED_MANAGED_KEY_RE = re.compile(r"managed:[0-9A-Za-z-]+$")
+FINISHED_SOURCE_KEY_RE = re.compile(r"source:[0-9a-f]{64}$")
 INBOX_START_MARKER = "<!-- claude-indicator:inbox:start -->"
 INBOX_END_MARKER = "<!-- claude-indicator:inbox:end -->"
 INBOX_MARKER_ERROR = (
@@ -180,7 +182,17 @@ class FinishedStore:
             or not all(isinstance(key, str) for key in payload["finished"])
         ):
             raise ValueError("Finished state has an unsupported schema.")
-        return frozenset(payload["finished"]), stat_result.st_mode & 0o7777
+        finished_keys = payload["finished"]
+        if (
+            finished_keys != sorted(set(finished_keys))
+            or not all(
+                FINISHED_MANAGED_KEY_RE.fullmatch(key)
+                or FINISHED_SOURCE_KEY_RE.fullmatch(key)
+                for key in finished_keys
+            )
+        ):
+            raise ValueError("Finished state has noncanonical keys.")
+        return frozenset(finished_keys), stat_result.st_mode & 0o7777
 
     def _write_atomically(self, keys: frozenset[str], mode: int) -> None:
         temporary_path: Path | None = None
