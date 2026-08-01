@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import json
 import os
 from pathlib import Path
 import threading
@@ -103,6 +104,10 @@ def visible_task_texts(dialog: SmartTodoDialog):
 
 def task_row(dialog: SmartTodoDialog, text: str):
     return next(row for row in dialog.task_rows if row.item.text == text)
+
+
+def task_row_at_line(dialog: SmartTodoDialog, line: int):
+    return next(row for row in dialog.task_rows if row.item.line == line)
 
 
 def selected_action_names(dialog: SmartTodoDialog):
@@ -391,6 +396,32 @@ def test_workflow_views_have_exact_labels_membership_order_and_metadata(
     assert dialog.search_edit.text() == ""
     assert dialog.project_combo.currentText() == "All projects"
     assert dialog.view_combo.currentText() == "Today"
+
+
+def test_selected_new_changed_metadata_keeps_effective_fresh_mint_color(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    item = make_workflow_item(
+        tmp_path,
+        "Changed selected task",
+        project="alpha",
+        line=1,
+        score=100,
+        change_status="changed",
+    )
+    install_workflow_fixture(dialog, (item,), qapp)
+
+    dialog.view_combo.setCurrentText("New / changed")
+    qapp.processEvents()
+
+    row = dialog.task_rows[0]
+    assert row.property("selected") is True
+    assert row.meta_label.property("fresh") is True
+    assert (
+        row.meta_label.palette().color(QPalette.ColorRole.WindowText).name()
+        == "#6fd0b0"
+    )
 
 
 def test_today_docket_keeps_all_active_pins_when_more_than_seven(
@@ -910,7 +941,7 @@ def test_dismiss_preserves_source_bytes_writes_state_and_moves_to_finished(
     assert smart_todos.FinishedStore(dialog.finished_store_path).read()
 
 
-def test_dismiss_immediately_finishes_every_row_with_the_same_source_key(
+def test_dismiss_immediately_finishes_only_selected_row_with_same_source_base_key(
     qapp, tmp_path, dialog_cleanup
 ):
     dialog = make_dialog(
@@ -934,16 +965,13 @@ def test_dismiss_immediately_finishes_every_row_with_the_same_source_key(
 
     dialog.task_rows[0].dismiss_button.click()
 
-    assert visible_task_texts(dialog) == []
-    assert "0 open" in dialog.summary_label.text()
+    assert visible_task_texts(dialog) == ["Duplicate source task"]
+    assert "1 open" in dialog.summary_label.text()
     dialog.view_combo.setCurrentText("Finished")
-    assert visible_task_texts(dialog) == [
-        "Duplicate source task",
-        "Duplicate source task",
-    ]
+    assert visible_task_texts(dialog) == ["Duplicate source task"]
 
 
-def test_dismiss_immediately_finishes_every_row_with_the_same_managed_id(
+def test_dismiss_immediately_finishes_only_selected_row_with_same_managed_id(
     qapp, tmp_path, dialog_cleanup
 ):
     dialog = make_dialog(
@@ -961,13 +989,10 @@ def test_dismiss_immediately_finishes_every_row_with_the_same_managed_id(
 
     task_row(dialog, "First managed copy").dismiss_button.click()
 
-    assert visible_task_texts(dialog) == []
-    assert "0 open" in dialog.summary_label.text()
+    assert visible_task_texts(dialog) == ["Second managed copy"]
+    assert "1 open" in dialog.summary_label.text()
     dialog.view_combo.setCurrentText("Finished")
-    assert visible_task_texts(dialog) == [
-        "First managed copy",
-        "Second managed copy",
-    ]
+    assert visible_task_texts(dialog) == ["First managed copy"]
 
 
 def test_dismiss_write_failure_keeps_active_row_and_reports_inline_error(
@@ -1135,6 +1160,44 @@ def test_open_source_button_and_double_click_route_item(
     QTest.mouseDClick(row, Qt.MouseButton.LeftButton)
 
     assert opened == [row.item, row.item]
+
+
+def test_space_selects_nonfirst_task_and_retargets_actions_while_enter_opens_source(
+    qapp, tmp_path, dialog_cleanup, monkeypatch
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": "- [ ] P0 first task\n- [ ] Second task\n"
+        },
+        workflow_store_path=tmp_path / "workflow.json",
+    )
+    opened = []
+    monkeypatch.setattr(smart_todos, "open_source_item", opened.append)
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = dialog._all_items
+    assert dialog._selected_item_id == first.id
+    second_row = task_row_at_line(dialog, second.line)
+    second_row.setFocus()
+
+    QTest.keyClick(second_row, Qt.Key.Key_Space)
+
+    assert opened == []
+    assert dialog._selected_item_id == second.id
+    assert dialog.why_title_label.toolTip() == second.text
+    dialog.pin_button.click()
+    assert {item.line: item.pinned_today for item in dialog._all_items} == {
+        first.line: False,
+        second.line: True,
+    }
+
+    selected_second_row = task_row_at_line(dialog, second.line)
+    selected_second_row.setFocus()
+    QTest.keyClick(selected_second_row, Qt.Key.Key_Return)
+    assert [item.id for item in opened] == [second.id]
 
 
 def test_open_source_failure_is_inline_and_dialog_stays_usable(
@@ -1341,7 +1404,7 @@ def test_snooze_until_dialog_defaults_shortcuts_validates_and_cancels(qapp):
     assert exact.selected_date == date(2026, 8, 3)
 
 
-def test_workflow_actions_persist_and_project_same_key_immediately(
+def test_workflow_actions_persist_and_project_selected_duplicate_immediately(
     qapp, tmp_path, dialog_cleanup
 ):
     workflow_path = tmp_path / "workflow.json"
@@ -1354,23 +1417,189 @@ def test_workflow_actions_persist_and_project_same_key_immediately(
     )
     dialog.show_and_refresh()
     wait_for_scan(dialog, qapp)
+    first, second = dialog._all_items
 
     dialog.pin_button.click()
-    assert all(item.pinned_today for item in dialog._all_items)
+    assert {item.line: item.pinned_today for item in dialog._all_items} == {
+        first.line: True,
+        second.line: False,
+    }
     assert smart_todos.WorkflowStore(workflow_path).read().pinned_today
     dialog.unpin_button.click()
     assert not any(item.pinned_today for item in dialog._all_items)
 
     accept_next_snooze_dialog(qapp, TODAY + timedelta(days=7))
     dialog.snooze_button.click()
-    assert {item.snoozed_until for item in dialog._all_items} == {TODAY + timedelta(days=7)}
-    assert "0 focus" in dialog.summary_label.text()
+    assert {item.line: item.snoozed_until for item in dialog._all_items} == {
+        first.line: TODAY + timedelta(days=7),
+        second.line: None,
+    }
+    assert "1 focus" in dialog.summary_label.text()
 
     dialog.view_combo.setCurrentText("All open")
     QTest.mouseClick(dialog.task_rows[0], Qt.MouseButton.LeftButton)
     dialog.wake_button.click()
     assert all(item.snoozed_until is None for item in dialog._all_items)
     assert "2 focus" in dialog.summary_label.text()
+
+
+def test_same_source_duplicate_pin_and_snooze_mutate_only_selected_identity(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": "# Queue\n- [ ] Identical task\n- [ ] Identical task\n"
+        },
+        workflow_store_path=workflow_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = dialog._all_items
+    assert (first.source_path, first.heading, first.text) == (
+        second.source_path, second.heading, second.text
+    )
+    base_key = smart_todos.todo_finished_key(first)
+
+    QTest.mouseClick(task_row_at_line(dialog, second.line), Qt.MouseButton.LeftButton)
+    dialog.pin_button.click()
+
+    assert {item.line: item.pinned_today for item in dialog._all_items} == {
+        first.line: False,
+        second.line: True,
+    }
+    state = smart_todos.WorkflowStore(workflow_path).read()
+    assert len(state.pinned_today) == 1
+    assert base_key not in state.pinned_today
+
+    accept_next_snooze_dialog(qapp, TODAY + timedelta(days=3))
+    dialog.snooze_button.click()
+    assert {item.line: item.snoozed_until for item in dialog._all_items} == {
+        first.line: None,
+        second.line: TODAY + timedelta(days=3),
+    }
+    state = smart_todos.WorkflowStore(workflow_path).read()
+    assert len(state.snoozed) == 1
+    assert state.snoozed[0].key != base_key
+
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert {item.line: item.pinned_today for item in dialog._all_items} == {
+        first.line: False,
+        second.line: False,
+    }
+    assert {item.line: item.snoozed_until for item in dialog._all_items} == {
+        first.line: None,
+        second.line: TODAY + timedelta(days=3),
+    }
+
+
+def test_same_source_duplicate_dismiss_restore_stays_selected_only_across_refresh(
+    qapp, tmp_path, dialog_cleanup
+):
+    finished_path = tmp_path / "finished.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": "# Queue\n- [ ] Identical task\n- [ ] Identical task\n"
+        },
+        finished_store_path=finished_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = dialog._all_items
+    base_key = smart_todos.todo_finished_key(first)
+
+    task_row_at_line(dialog, second.line).dismiss_button.click()
+
+    assert {item.line: item.finished for item in dialog._all_items} == {
+        first.line: False,
+        second.line: True,
+    }
+    persisted = smart_todos.FinishedStore(finished_path).read()
+    assert len(persisted) == 1
+    assert base_key not in persisted
+
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert {item.line: item.finished for item in dialog._all_items} == {
+        first.line: False,
+        second.line: True,
+    }
+    dialog.view_combo.setCurrentText("Finished")
+    assert [row.item.line for row in dialog.task_rows] == [second.line]
+    dialog.restore_button.click()
+    assert not smart_todos.FinishedStore(finished_path).read()
+    assert not any(item.finished for item in dialog._all_items)
+
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert not any(item.finished for item in dialog._all_items)
+
+
+def test_same_source_duplicate_legacy_base_keys_expand_before_selected_mutation(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    finished_path = tmp_path / "finished.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": "# Queue\n- [ ] Identical task\n- [ ] Identical task\n"
+        },
+        workflow_store_path=workflow_path,
+        finished_store_path=finished_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = dialog._all_items
+    legacy_key = smart_todos.todo_finished_key(first)
+
+    smart_todos.WorkflowStore(workflow_path).pin(legacy_key)
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert all(item.pinned_today for item in dialog._all_items)
+    QTest.mouseClick(task_row_at_line(dialog, second.line), Qt.MouseButton.LeftButton)
+    dialog.unpin_button.click()
+    assert {item.line: item.pinned_today for item in dialog._all_items} == {
+        first.line: True,
+        second.line: False,
+    }
+    state = smart_todos.WorkflowStore(workflow_path).read()
+    assert legacy_key not in state.pinned_today
+    assert len(state.pinned_today) == 1
+
+    finished_path.write_text(
+        json.dumps({"version": 1, "finished": [legacy_key]}),
+        encoding="utf-8",
+    )
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert all(item.finished for item in dialog._all_items)
+    dialog.view_combo.setCurrentText("Finished")
+    QTest.mouseClick(task_row_at_line(dialog, second.line), Qt.MouseButton.LeftButton)
+    dialog.restore_button.click()
+    assert {item.line: item.finished for item in dialog._all_items} == {
+        first.line: True,
+        second.line: False,
+    }
+    persisted = smart_todos.FinishedStore(finished_path).read()
+    assert legacy_key not in persisted
+    assert len(persisted) == 1
+
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert {item.line: item.finished for item in dialog._all_items} == {
+        first.line: True,
+        second.line: False,
+    }
 
 
 def test_failed_workflow_and_restore_writes_preserve_rows_counts_and_selection(

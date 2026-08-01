@@ -14,6 +14,7 @@ SOURCE_A = "source:" + "a" * 64
 SOURCE_B = "source:" + "b" * 64
 LOCATION_A = "location:" + "a" * 64
 LOCATION_B = "location:" + "b" * 64
+LOCATION_C = "location:" + "c" * 64
 MANAGED_A = "managed:inbox-a"
 
 
@@ -204,6 +205,34 @@ def test_reconcile_recognizes_moved_content_with_oldest_matching_date(tmp_path):
     _state, tasks = store.reconcile((observation(LOCATION_B, SOURCE_A),), date(2026, 8, 1))
 
     assert tasks[SOURCE_A] == smart_todo_workflow.ObservedTask(LOCATION_B, SOURCE_A, date(2026, 7, 9), "")
+
+
+def test_reconcile_preserves_each_location_when_identical_content_has_two_copies(
+    tmp_path,
+):
+    store = smart_todo_workflow.WorkflowStore(tmp_path / "workflow.json")
+    store.reconcile(
+        (
+            observation(LOCATION_A, SOURCE_A, date(2026, 7, 1)),
+            observation(LOCATION_B, SOURCE_A, date(2026, 7, 5)),
+        ),
+        TODAY,
+    )
+
+    _state, tasks = store.reconcile(
+        (
+            observation(LOCATION_C, SOURCE_A, TODAY),
+            observation(LOCATION_B, SOURCE_A, TODAY),
+        ),
+        TODAY,
+    )
+
+    assert tasks[LOCATION_C] == smart_todo_workflow.ObservedTask(
+        LOCATION_C, SOURCE_A, date(2026, 7, 1), ""
+    )
+    assert tasks[LOCATION_B] == smart_todo_workflow.ObservedTask(
+        LOCATION_B, SOURCE_A, date(2026, 7, 5), ""
+    )
 
 
 def test_reconcile_marks_same_location_edit_and_unseen_content_new_for_one_scan(tmp_path):

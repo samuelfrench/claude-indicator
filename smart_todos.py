@@ -130,6 +130,7 @@ class TodoItem:
     pinned_today: bool = False
     duplicate_key: str = ""
     duplicate_count: int = 1
+    action_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,39 @@ def todo_finished_key(item: TodoItem) -> str:
     display_text = re.sub(r"\s+", " ", item.text).strip()
     identity = "\0".join((str(_absolute_path(item.source_path)), item.heading, display_text))
     return f"source:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def todo_action_key(item: TodoItem) -> str:
+    """Return the selected-row workflow key, falling back to the v1 base key."""
+    return item.action_key or todo_finished_key(item)
+
+
+def assign_task_action_keys(items: tuple[TodoItem, ...]) -> tuple[TodoItem, ...]:
+    """Disambiguate colliding v1 base keys without changing the persisted schema."""
+    groups: dict[str, list[TodoItem]] = {}
+    for item in items:
+        groups.setdefault(todo_finished_key(item), []).append(item)
+
+    action_keys: dict[str, str] = {}
+    for base_key, group in groups.items():
+        if len(group) == 1:
+            action_keys[group[0].id] = base_key
+            continue
+        ordered = sorted(
+            group,
+            key=lambda item: (
+                str(_absolute_path(item.source_path)),
+                item.heading,
+                item.line,
+                item.id,
+            ),
+        )
+        for occurrence, item in enumerate(ordered, start=1):
+            identity = f"selected-row\0{base_key}\0{occurrence}"
+            action_keys[item.id] = (
+                f"source:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+            )
+    return tuple(replace(item, action_key=action_keys[item.id]) for item in items)
 
 
 def _workflow_location_key(item: TodoItem) -> str:
@@ -228,18 +262,53 @@ class FinishedStore:
         keys, _mode = self._read_current()
         return keys
 
-    def finish(self, item: TodoItem) -> None:
+    def finish(
+        self,
+        item: TodoItem,
+        *,
+        legacy_key: str | None = None,
+        replacement_keys: tuple[str, ...] = (),
+    ) -> None:
         keys, mode = self._read_current()
-        updated_keys = frozenset((*keys, todo_finished_key(item)))
+        keys = self._expand_legacy_key(keys, legacy_key, replacement_keys)
+        updated_keys = frozenset((*keys, todo_action_key(item)))
         self._write_atomically(updated_keys, 0o600 if mode is None else mode)
 
-    def restore(self, item: TodoItem) -> None:
+    def restore(
+        self,
+        item: TodoItem,
+        *,
+        legacy_key: str | None = None,
+        replacement_keys: tuple[str, ...] = (),
+    ) -> None:
         """Remove one locally finished task key without touching its TODO source."""
         keys, mode = self._read_current()
-        key = todo_finished_key(item)
+        keys = self._expand_legacy_key(keys, legacy_key, replacement_keys)
+        key = todo_action_key(item)
         if key not in keys:
             raise ValueError("Task is not finished.")
         self._write_atomically(keys - {key}, 0o600 if mode is None else mode)
+
+    @staticmethod
+    def _expand_legacy_key(
+        keys: frozenset[str],
+        legacy_key: str | None,
+        replacement_keys: tuple[str, ...],
+    ) -> frozenset[str]:
+        if legacy_key is None:
+            return keys
+        if not (
+            FINISHED_MANAGED_KEY_RE.fullmatch(legacy_key)
+            or FINISHED_SOURCE_KEY_RE.fullmatch(legacy_key)
+        ) or not replacement_keys or not all(
+            FINISHED_MANAGED_KEY_RE.fullmatch(key)
+            or FINISHED_SOURCE_KEY_RE.fullmatch(key)
+            for key in replacement_keys
+        ):
+            raise ValueError("Finished task keys are invalid.")
+        if legacy_key not in keys:
+            return keys
+        return frozenset((keys - {legacy_key}) | set(replacement_keys))
 
     def _read_current(self) -> tuple[frozenset[str], int | None]:
         descriptor: int | None = None
@@ -765,6 +834,7 @@ def enrich_workflow(
     today: date,
 ) -> tuple[TodoItem, ...]:
     """Apply scan-history and local workflow choices without reranking tasks."""
+    items = assign_task_action_keys(items)
     snoozes = {record.key: record.until for record in state.snoozed}
     enriched: list[TodoItem] = []
     duplicate_counts: dict[str, int] = {}
@@ -775,8 +845,11 @@ def enrich_workflow(
 
     for item in items:
         content_key = todo_finished_key(item)
-        observed_item = observed.get(content_key)
-        snoozed_until = snoozes.get(content_key)
+        action_key = todo_action_key(item)
+        observed_item = observed.get(_workflow_location_key(item)) or observed.get(
+            content_key
+        )
+        snoozed_until = snoozes.get(action_key, snoozes.get(content_key))
         if snoozed_until is not None and snoozed_until <= today:
             snoozed_until = None
         duplicate_key = _duplicate_key(item)
@@ -801,7 +874,10 @@ def enrich_workflow(
             pinned_today=(
                 not item.finished
                 and snoozed_until is None
-                and content_key in state.pinned_today
+                and (
+                    action_key in state.pinned_today
+                    or content_key in state.pinned_today
+                )
             ),
             duplicate_key=duplicate_key,
             duplicate_count=duplicate_count,
@@ -1114,6 +1190,9 @@ QWidget#taskRow[selected="true"] QLabel#docketNumber {
     color: #D4A574;
 }
 QLabel#taskMeta[fresh="true"] {
+    color: #6FD0B0;
+}
+QWidget#taskRow[selected="true"] QLabel#taskMeta[fresh="true"] {
     color: #6FD0B0;
 }
 QFrame#whyRail {
@@ -1429,6 +1508,10 @@ class TodoTaskRow(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Space:
+            self.selected.emit(self.item)
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.open_requested.emit(self.item)
             event.accept()
@@ -1796,9 +1879,16 @@ class SmartTodoDialog(QDialog):
         except Exception as error:
             finished_keys = frozenset()
             warnings.append(str(error) or error.__class__.__name__)
+        identified_items = assign_task_action_keys(scan_result.items)
         scanned_items = tuple(
-            replace(item, finished=todo_finished_key(item) in finished_keys)
-            for item in scan_result.items
+            replace(
+                item,
+                finished=(
+                    todo_action_key(item) in finished_keys
+                    or todo_finished_key(item) in finished_keys
+                ),
+            )
+            for item in identified_items
         )
         try:
             workflow_state, observed = WorkflowStore(self.workflow_store_path).reconcile(
@@ -1829,15 +1919,18 @@ class SmartTodoDialog(QDialog):
 
     def _apply_workflow_state(self, state: WorkflowState) -> None:
         """Project a successfully persisted workflow state into current rows."""
-        observed = {
-            todo_finished_key(item): ObservedTask(
-                "",
-                todo_finished_key(item),
+        observed: dict[str, ObservedTask] = {}
+        for item in self._all_items:
+            content_key = todo_finished_key(item)
+            location_key = _workflow_location_key(item)
+            observed_item = ObservedTask(
+                location_key,
+                content_key,
                 item.unchanged_since or self._scan_today,
                 item.change_status,
             )
-            for item in self._all_items
-        }
+            observed[location_key] = observed_item
+            observed.setdefault(content_key, observed_item)
         self._all_items = enrich_workflow(
             self._all_items, state, observed, self._scan_today
         )
@@ -1853,15 +1946,20 @@ class SmartTodoDialog(QDialog):
             return
         try:
             store = WorkflowStore(self.workflow_store_path)
-            key = todo_finished_key(current_item)
+            key, legacy_key, replacement_keys = self._action_key_context(current_item)
+            migration = (
+                {"legacy_key": legacy_key, "replacement_keys": replacement_keys}
+                if legacy_key is not None
+                else {}
+            )
             if operation == "pin":
-                store.pin(key)
+                store.pin(key, **migration)
             elif operation == "unpin":
-                store.unpin(key)
+                store.unpin(key, **migration)
             elif operation == "snooze" and until is not None:
-                store.snooze(key, until)
+                store.snooze(key, until, **migration)
             elif operation == "wake":
-                store.wake(key)
+                store.wake(key, **migration)
             else:
                 raise ValueError("Workflow action is invalid.")
             state = store.read()
@@ -1870,6 +1968,20 @@ class SmartTodoDialog(QDialog):
             return
         self._apply_workflow_state(state)
         self.status_label.setText("Workflow state updated locally.")
+
+    def _action_key_context(
+        self, item: TodoItem
+    ) -> tuple[str, str | None, tuple[str, ...]]:
+        base_key = todo_finished_key(item)
+        action_key = todo_action_key(item)
+        if action_key == base_key:
+            return action_key, None, ()
+        replacement_keys = tuple(sorted({
+            todo_action_key(candidate)
+            for candidate in self._all_items
+            if todo_finished_key(candidate) == base_key
+        }))
+        return action_key, base_key, replacement_keys
 
     def _on_scan_failed(self, message: str) -> None:
         if self._shutting_down:
@@ -2299,14 +2411,21 @@ class SmartTodoDialog(QDialog):
             self.status_label.setText("Only finished tasks can be restored here.")
             return
         try:
-            finished_key = todo_finished_key(current_item)
-            FinishedStore(self.finished_store_path).restore(current_item)
+            _key, legacy_key, replacement_keys = self._action_key_context(current_item)
+            migration = (
+                {"legacy_key": legacy_key, "replacement_keys": replacement_keys}
+                if legacy_key is not None
+                else {}
+            )
+            FinishedStore(self.finished_store_path).restore(
+                current_item, **migration
+            )
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
             return
         self._all_items = tuple(
             replace(candidate, finished=False)
-            if todo_finished_key(candidate) == finished_key
+            if candidate.id == current_item.id
             else candidate
             for candidate in self._all_items
         )
@@ -2376,14 +2495,21 @@ class SmartTodoDialog(QDialog):
             self.status_label.setText("Only active tasks can be dismissed here.")
             return
         try:
-            finished_key = todo_finished_key(current_item)
-            FinishedStore(self.finished_store_path).finish(current_item)
+            _key, legacy_key, replacement_keys = self._action_key_context(current_item)
+            migration = (
+                {"legacy_key": legacy_key, "replacement_keys": replacement_keys}
+                if legacy_key is not None
+                else {}
+            )
+            FinishedStore(self.finished_store_path).finish(
+                current_item, **migration
+            )
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
             return
         self._all_items = tuple(
             replace(candidate, finished=True)
-            if todo_finished_key(candidate) == finished_key
+            if candidate.id == current_item.id
             else candidate
             for candidate in self._all_items
         )

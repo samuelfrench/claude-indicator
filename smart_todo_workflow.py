@@ -153,38 +153,130 @@ class WorkflowStore:
     def read(self) -> WorkflowState:
         return self._read_current()[0]
 
-    def pin(self, key: str) -> None:
+    def pin(
+        self,
+        key: str,
+        *,
+        legacy_key: str | None = None,
+        replacement_keys: tuple[str, ...] = (),
+    ) -> None:
         self._require_content_key(key)
-        self._mutate(lambda state: WorkflowState(
-            state.pinned_today | {key}, state.snoozed, state.observed
+        self._validate_legacy_expansion(legacy_key, replacement_keys)
+        self._mutate(lambda state: self._pin(
+            self._expand_legacy_key(state, legacy_key, replacement_keys), key
         ))
 
-    def unpin(self, key: str) -> None:
+    def unpin(
+        self,
+        key: str,
+        *,
+        legacy_key: str | None = None,
+        replacement_keys: tuple[str, ...] = (),
+    ) -> None:
         self._require_content_key(key)
-        self._mutate(lambda state: WorkflowState(
-            state.pinned_today - {key}, state.snoozed, state.observed
+        self._validate_legacy_expansion(legacy_key, replacement_keys)
+        self._mutate(lambda state: self._unpin(
+            self._expand_legacy_key(state, legacy_key, replacement_keys), key
         ))
 
-    def snooze(self, key: str, until: date) -> None:
+    def snooze(
+        self,
+        key: str,
+        until: date,
+        *,
+        legacy_key: str | None = None,
+        replacement_keys: tuple[str, ...] = (),
+    ) -> None:
         self._require_content_key(key)
         if not isinstance(until, date) or until <= date.today():
             raise ValueError("Workflow snoozes must be for a future date.")
-        self._mutate(lambda state: WorkflowState(
+        self._validate_legacy_expansion(legacy_key, replacement_keys)
+        self._mutate(lambda state: self._snooze(
+            self._expand_legacy_key(state, legacy_key, replacement_keys), key, until
+        ))
+
+    def wake(
+        self,
+        key: str,
+        *,
+        legacy_key: str | None = None,
+        replacement_keys: tuple[str, ...] = (),
+    ) -> None:
+        self._require_content_key(key)
+        self._validate_legacy_expansion(legacy_key, replacement_keys)
+        self._mutate(lambda state: self._wake(
+            self._expand_legacy_key(state, legacy_key, replacement_keys), key
+        ))
+
+    @staticmethod
+    def _pin(state: WorkflowState, key: str) -> WorkflowState:
+        return WorkflowState(
+            state.pinned_today | {key}, state.snoozed, state.observed
+        )
+
+    @staticmethod
+    def _unpin(state: WorkflowState, key: str) -> WorkflowState:
+        return WorkflowState(
+            state.pinned_today - {key}, state.snoozed, state.observed
+        )
+
+    @staticmethod
+    def _snooze(state: WorkflowState, key: str, until: date) -> WorkflowState:
+        return WorkflowState(
             state.pinned_today,
             tuple(sorted(
                 {record for record in state.snoozed if record.key != key}
                 | {SnoozeRecord(key, until)}
             )),
             state.observed,
-        ))
+        )
 
-    def wake(self, key: str) -> None:
-        self._require_content_key(key)
-        self._mutate(lambda state: WorkflowState(
+    @staticmethod
+    def _wake(state: WorkflowState, key: str) -> WorkflowState:
+        return WorkflowState(
             state.pinned_today,
             tuple(record for record in state.snoozed if record.key != key),
             state.observed,
-        ))
+        )
+
+    @classmethod
+    def _validate_legacy_expansion(
+        cls, legacy_key: str | None, replacement_keys: tuple[str, ...]
+    ) -> None:
+        if legacy_key is None:
+            if replacement_keys:
+                raise ValueError("Workflow legacy-key expansion is invalid.")
+            return
+        cls._require_content_key(legacy_key)
+        if not replacement_keys:
+            raise ValueError("Workflow legacy-key expansion is invalid.")
+        for key in replacement_keys:
+            cls._require_content_key(key)
+
+    @staticmethod
+    def _expand_legacy_key(
+        state: WorkflowState,
+        legacy_key: str | None,
+        replacement_keys: tuple[str, ...],
+    ) -> WorkflowState:
+        if legacy_key is None:
+            return state
+        pins = state.pinned_today
+        if legacy_key in pins:
+            pins = frozenset((pins - {legacy_key}) | set(replacement_keys))
+        snoozes = state.snoozed
+        legacy_snooze = next(
+            (record for record in snoozes if record.key == legacy_key), None
+        )
+        if legacy_snooze is not None:
+            snoozes = tuple(sorted(
+                tuple(record for record in snoozes if record.key != legacy_key)
+                + tuple(
+                    SnoozeRecord(key, legacy_snooze.until)
+                    for key in replacement_keys
+                )
+            ))
+        return WorkflowState(pins, snoozes, state.observed)
 
     def reconcile(
         self, observations: tuple[TaskObservation, ...], today: date
@@ -201,6 +293,9 @@ class WorkflowStore:
             previous_by_content.setdefault(record.content, []).append(record)
 
         next_records: list[ObservedRecord] = []
+        content_counts: dict[str, int] = {}
+        for item in current:
+            content_counts[item.content] = content_counts.get(item.content, 0) + 1
         tasks: dict[str, ObservedTask] = {}
         for item in current:
             same_location = previous_by_location.get(item.location)
@@ -222,9 +317,12 @@ class WorkflowStore:
                 change = "new"
             record = ObservedRecord(item.location, item.content, unchanged_since)
             next_records.append(record)
-            tasks[item.content] = ObservedTask(
+            observed_task = ObservedTask(
                 item.location, item.content, unchanged_since, change
             )
+            tasks[item.location] = observed_task
+            if content_counts[item.content] == 1:
+                tasks[item.content] = observed_task
 
         next_state = WorkflowState(
             state.pinned_today,
