@@ -851,6 +851,36 @@ def test_action_rail_projects_pinned_snoozed_finished_and_completed_states(
     assert all(not item.finished for item in dialog._all_items)
 
 
+def test_completed_finished_task_shows_only_copy_context(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "<!-- claude-indicator:inbox:start -->\n"
+            "- [x] Completed and finished <!-- claude-indicator:id=done-finished -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    smart_todos.FinishedStore(dialog.finished_store_path).finish(dialog._all_items[0])
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    dialog.view_combo.setCurrentText("Completed inbox")
+    QTest.mouseClick(
+        task_row(dialog, "Completed and finished"), Qt.MouseButton.LeftButton
+    )
+
+    assert selected_action_names(dialog) == ["Copy task context"]
+    assert dialog.restore_button is None
+    assert dialog.pin_button is None
+    assert dialog.snooze_button is None
+    assert dialog.wake_button is None
+    assert dialog.copy_context_button is not None
+
+
 def test_snooze_until_dialog_defaults_shortcuts_validates_and_cancels(qapp):
     dialog = smart_todos.SnoozeUntilDialog(TODAY + timedelta(days=1), TODAY)
 

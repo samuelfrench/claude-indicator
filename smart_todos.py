@@ -1886,7 +1886,9 @@ class SmartTodoDialog(QDialog):
             return
 
         actions: list[tuple[str, str, Callable[[], None], str]] = []
-        if item.finished:
+        if item.completed:
+            pass
+        elif item.finished:
             actions.append(("Restore", "Restore finished task", lambda: self._restore_task(item), "restore_button"))
         elif not item.completed and item.snoozed_until is not None and item.snoozed_until > self._scan_today:
             actions.append(("Wake now", "Wake task now", lambda: self._mutate_workflow(item, "wake"), "wake_button"))
