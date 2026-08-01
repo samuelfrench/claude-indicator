@@ -18,7 +18,7 @@ import tempfile
 import uuid
 
 from PySide6.QtCore import QDate, QThread, Qt, Signal
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QResizeEvent
+from PySide6.QtGui import QColor, QFontDatabase, QKeyEvent, QMouseEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -46,6 +46,21 @@ from smart_todo_workflow import (
 MAX_TODO_BYTES = 4 * 1024 * 1024
 MAX_TODO_DEPTH = 3
 MAX_VISIBLE_ITEMS = 250
+SMART_TODO_VIEWS = (
+    "Today",
+    "Focus",
+    "All open",
+    "Waiting",
+    "Snoozed",
+    "New / changed",
+    "Duplicates",
+    "Projects",
+    "Stale 30+",
+    "Stale 60+",
+    "Stale 90+",
+    "Completed inbox",
+    "Finished",
+)
 IGNORED_DIRS = frozenset({
     ".git", ".worktrees", ".next", ".pytest_cache", ".venv", ".wrangler",
     "__pycache__", "build", "coverage", "dist", "node_modules",
@@ -1063,10 +1078,43 @@ QWidget#taskRow[selected="true"] QPushButton {
     background: #14141E;
     color: #B4B4C8;
 }
+QWidget#projectSummaryRow {
+    background: #20202D;
+    border: 1px solid #20202D;
+    border-left: 3px solid #D4A574;
+    border-radius: 5px;
+}
+QWidget#projectSummaryRow[selected="true"] {
+    background: #8B5CF6;
+    border-color: #D4A574;
+}
+QWidget#projectSummaryRow[selected="true"] QLabel {
+    color: #14141E;
+}
+QWidget#projectSummaryRow[selected="true"] QPushButton {
+    background: #14141E;
+    color: #B4B4C8;
+}
+QLabel#projectName {
+    color: #D4A574;
+    font-size: 12px;
+    font-weight: 700;
+}
 QLabel#taskText {
     color: #B4B4C8;
     font-size: 12px;
     font-weight: 600;
+}
+QLabel#docketNumber {
+    color: #D4A574;
+    font-size: 13px;
+    font-weight: 700;
+}
+QWidget#taskRow[selected="true"] QLabel#docketNumber {
+    color: #D4A574;
+}
+QLabel#taskMeta[fresh="true"] {
+    color: #6FD0B0;
 }
 QFrame#whyRail {
     background: #20202D;
@@ -1232,7 +1280,15 @@ class TodoTaskRow(QWidget):
     open_requested = Signal(object)
     selected = Signal(object)
 
-    def __init__(self, item: TodoItem, parent: QWidget | None = None):
+    def __init__(
+        self,
+        item: TodoItem,
+        parent: QWidget | None = None,
+        *,
+        docket_number: int | None = None,
+        show_change_status: bool = False,
+        duplicate_position: tuple[int, int] | None = None,
+    ):
         super().__init__(parent)
         self.item = item
         self.setObjectName("taskRow")
@@ -1240,7 +1296,10 @@ class TodoTaskRow(QWidget):
         self.setProperty("urgency", item.urgency)
         self.setProperty("selected", False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(f"Task: {item.text}; {item.urgency} urgency")
+        docket_copy = f"Docket {docket_number:02d}; " if docket_number is not None else ""
+        self.setAccessibleName(
+            f"{docket_copy}Task: {item.text}; {item.urgency} urgency"
+        )
         self.setAccessibleDescription(
             f"{item.urgency.capitalize()} urgency task from {item.project}"
         )
@@ -1250,6 +1309,26 @@ class TodoTaskRow(QWidget):
         layout.setContentsMargins(10, 8, 8, 8)
         layout.setSpacing(8)
 
+        self.docket_label: QLabel | None = None
+        if docket_number is not None:
+            self.docket_label = QLabel(f"{docket_number:02d}")
+            self.docket_label.setObjectName("docketNumber")
+            self.docket_label.setFont(
+                QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+            )
+            docket_palette = self.docket_label.palette()
+            docket_palette.setColor(
+                docket_palette.ColorRole.WindowText, QColor("#D4A574")
+            )
+            self.docket_label.setPalette(docket_palette)
+            self.docket_label.setAccessibleName(
+                f"Today docket position {docket_number:02d}"
+            )
+            self.docket_label.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents
+            )
+            layout.addWidget(self.docket_label)
+
         copy_layout = QVBoxLayout()
         copy_layout.setContentsMargins(0, 0, 0, 0)
         copy_layout.setSpacing(3)
@@ -1257,17 +1336,35 @@ class TodoTaskRow(QWidget):
         self.text_label.setObjectName("taskText")
         self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         due_copy = item.due_date.isoformat() if item.due_date else "NO DUE DATE"
-        self.meta_label = QLabel(
-            f"{item.urgency.upper()} URGENCY  ·  SCORE {item.score}  ·  "
-            f"{item.project.upper()}  ·  {due_copy}"
-        )
+        metadata = [
+            f"{item.urgency.upper()} URGENCY",
+            f"SCORE {item.score}",
+            item.project.upper(),
+            due_copy,
+        ]
+        if show_change_status and item.change_status in {"new", "changed"}:
+            metadata.insert(0, item.change_status.upper())
+        if duplicate_position is not None:
+            position, total = duplicate_position
+            metadata.insert(0, f"copy {position} of {total}")
+        self.meta_label = QLabel("  ·  ".join(metadata))
         self.meta_label.setObjectName("taskMeta")
+        self.meta_label.setProperty(
+            "fresh",
+            show_change_status and item.change_status in {"new", "changed"},
+        )
+        if self.meta_label.property("fresh"):
+            fresh_palette = self.meta_label.palette()
+            fresh_palette.setColor(
+                fresh_palette.ColorRole.WindowText, QColor("#6FD0B0")
+            )
+            self.meta_label.setPalette(fresh_palette)
         self.meta_label.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
         )
+        self.meta_label.setToolTip(self.meta_label.text())
         self.meta_label.setAccessibleName(
-            f"{item.urgency} urgency, score {item.score}, "
-            f"project {item.project}, {due_copy.lower()}"
+            ", ".join(part.lower() for part in metadata)
         )
         self.meta_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         copy_layout.addWidget(self.text_label)
@@ -1307,6 +1404,8 @@ class TodoTaskRow(QWidget):
             self.meta_label,
             self.open_button,
         ]
+        if self.docket_label is not None:
+            styled_widgets.append(self.docket_label)
         if self.complete_button is not None:
             styled_widgets.append(self.complete_button)
         if self.dismiss_button is not None:
@@ -1332,6 +1431,92 @@ class TodoTaskRow(QWidget):
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.open_requested.emit(self.item)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class ProjectSummaryRow(QWidget):
+    """Compact per-project workload summary with a direct Focus drill-down."""
+
+    open_queue_requested = Signal(str)
+    selected = Signal(object)
+
+    def __init__(self, summary: ProjectSummary, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.summary = summary
+        self.setObjectName("projectSummaryRow")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setProperty("selected", False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        top_copy = summary.top_item.text if summary.top_item is not None else "None"
+        self.setAccessibleName(
+            f"Project {summary.project}; {summary.focus} focus; top task {top_copy}"
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 7, 8, 7)
+        layout.setSpacing(8)
+        copy_layout = QVBoxLayout()
+        copy_layout.setContentsMargins(0, 0, 0, 0)
+        copy_layout.setSpacing(2)
+        self.project_label = QLabel(summary.project)
+        self.project_label.setObjectName("projectName")
+        self.project_label.setAccessibleName(f"Project {summary.project}")
+        copy_layout.addWidget(self.project_label)
+        self.counts_label = QLabel(
+            f"{summary.active} ACTIVE  ·  {summary.focus} FOCUS  ·  "
+            f"{summary.waiting} WAITING  ·  {summary.snoozed} SNOOZED  ·  "
+            f"{summary.overdue} OVERDUE  ·  {summary.new_changed} NEW/CHANGED  ·  "
+            f"{summary.duplicates} DUPLICATES  ·  {summary.stale_30} STALE 30+"
+        )
+        self.counts_label.setObjectName("taskMeta")
+        self.counts_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
+        self.counts_label.setToolTip(self.counts_label.text())
+        self.counts_label.setAccessibleName(self.counts_label.text())
+        copy_layout.addWidget(self.counts_label)
+        self.top_label = ElidedLabel(f"TOP  ·  {top_copy}")
+        self.top_label.setObjectName("taskText")
+        self.top_label.setAccessibleName(top_copy)
+        self.top_label.setAccessibleDescription(f"Top task: {top_copy}")
+        copy_layout.addWidget(self.top_label)
+        layout.addLayout(copy_layout, 1)
+        self.open_queue_button = QPushButton("Open queue")
+        self.open_queue_button.setAccessibleName(f"Open {summary.project} queue")
+        self.open_queue_button.clicked.connect(
+            lambda: self.open_queue_requested.emit(self.summary.project)
+        )
+        layout.addWidget(self.open_queue_button)
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", selected)
+        for widget in (
+            self,
+            self.project_label,
+            self.counts_label,
+            self.top_label,
+            self.open_queue_button,
+        ):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.summary)
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Space:
+            self.selected.emit(self.summary)
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.open_queue_requested.emit(self.summary.project)
             event.accept()
             return
         super().keyPressEvent(event)
@@ -1370,7 +1555,9 @@ class SmartTodoDialog(QDialog):
         self._shutting_down = False
         self._scan_today = self.today_provider()
         self._selected_item_id: str | None = None
+        self._selected_project_name: str | None = None
         self.task_rows: list[TodoTaskRow] = []
+        self.project_rows: list[ProjectSummaryRow] = []
         self.workflow_action_buttons: list[QPushButton] = []
         self.pin_button: QPushButton | None = None
         self.unpin_button: QPushButton | None = None
@@ -1463,7 +1650,7 @@ class SmartTodoDialog(QDialog):
         self.project_combo.currentTextChanged.connect(self._render_items)
         filters.addWidget(self.project_combo)
         self.view_combo = QComboBox()
-        self.view_combo.addItems(("Focus", "All open", "Waiting", "Completed inbox", "Finished"))
+        self.view_combo.addItems(SMART_TODO_VIEWS)
         self.view_combo.setAccessibleName("Task view")
         self.view_combo.currentTextChanged.connect(self._render_items)
         filters.addWidget(self.view_combo)
@@ -1745,25 +1932,72 @@ class SmartTodoDialog(QDialog):
         view = self.view_combo.currentText()
         project = self.project_combo.currentText()
         query = self.search_edit.text().strip().casefold()
+        if view == "Today":
+            candidates = today_items(self._all_items)
+        elif view == "Focus":
+            candidates = tuple(
+                item
+                for item in self._all_items
+                if _is_actionable_on(item, self._scan_today)
+            )
+        elif view == "All open":
+            candidates = tuple(
+                item
+                for item in self._all_items
+                if not item.completed and not item.finished
+            )
+        elif view == "Waiting":
+            candidates = tuple(
+                item
+                for item in self._all_items
+                if not item.completed and not item.finished and item.waiting
+            )
+        elif view == "Snoozed":
+            candidates = tuple(
+                item
+                for item in self._all_items
+                if not item.completed
+                and not item.finished
+                and item.snoozed_until is not None
+                and item.snoozed_until > self._scan_today
+            )
+        elif view == "New / changed":
+            candidates = tuple(
+                item
+                for item in self._all_items
+                if not item.completed
+                and not item.finished
+                and item.change_status in {"new", "changed"}
+            )
+        elif view == "Duplicates":
+            duplicate_groups: dict[str, list[TodoItem]] = {}
+            for item in self._all_items:
+                if (
+                    not item.completed
+                    and not item.finished
+                    and item.duplicate_count > 1
+                ):
+                    duplicate_groups.setdefault(item.duplicate_key, []).append(item)
+            candidates = tuple(
+                item for group in duplicate_groups.values() for item in group
+            )
+        elif view.startswith("Stale "):
+            threshold = int(view.removeprefix("Stale ").removesuffix("+"))
+            candidates = stale_items(self._all_items, self._scan_today, threshold)
+        elif view == "Completed inbox":
+            candidates = tuple(
+                item
+                for item in self._all_items
+                if item.completed and item.managed_id is not None
+            )
+        elif view == "Finished":
+            candidates = tuple(
+                item for item in self._all_items if item.finished and not item.completed
+            )
+        else:
+            candidates = ()
         filtered: list[TodoItem] = []
-        for item in self._all_items:
-            if view == "Focus" and (
-                item.completed
-                or item.finished
-                or item.waiting
-                or (item.snoozed_until is not None and item.snoozed_until > self._scan_today)
-            ):
-                continue
-            if view == "All open" and (item.completed or item.finished):
-                continue
-            if view == "Waiting" and (item.completed or item.finished or not item.waiting):
-                continue
-            if view == "Completed inbox" and (
-                not item.completed or item.managed_id is None
-            ):
-                continue
-            if view == "Finished" and (not item.finished or item.completed):
-                continue
+        for item in candidates:
             if project != "All projects" and item.project != project:
                 continue
             if query:
@@ -1784,14 +2018,104 @@ class SmartTodoDialog(QDialog):
             self.task_list_layout.removeWidget(row)
             row.deleteLater()
         self.task_rows = []
+        for row in self.project_rows:
+            self.task_list_layout.removeWidget(row)
+            row.deleteLater()
+        self.project_rows = []
+
+    def _filtered_project_summaries(self) -> tuple[ProjectSummary, ...]:
+        summaries = project_summaries(self._all_items, self._scan_today)
+        project = self.project_combo.currentText()
+        query = self.search_edit.text().strip().casefold()
+        filtered: list[ProjectSummary] = []
+        for summary in summaries:
+            if project != "All projects" and summary.project != project:
+                continue
+            if query:
+                top_item = summary.top_item
+                search_values = [summary.project]
+                if top_item is not None:
+                    search_values.extend((
+                        top_item.text,
+                        top_item.heading,
+                        *top_item.tags,
+                        *top_item.why_now,
+                    ))
+                if query not in " ".join(search_values).casefold():
+                    continue
+            filtered.append(summary)
+        return tuple(filtered)
+
+    def _render_projects(self) -> None:
+        summaries = self._filtered_project_summaries()
+        visible_summaries = summaries[:MAX_VISIBLE_ITEMS]
+        for summary in visible_summaries:
+            row = ProjectSummaryRow(summary, self.task_list_widget)
+            row.selected.connect(self._select_project_summary)
+            row.open_queue_requested.connect(self._open_project_queue)
+            self.task_list_layout.insertWidget(self.task_list_layout.count() - 1, row)
+            self.project_rows.append(row)
+
+        if summaries:
+            self.empty_label.hide()
+        else:
+            self.empty_label.setText("No scanned projects have actionable tasks.")
+            self.empty_label.show()
+        if len(summaries) > MAX_VISIBLE_ITEMS:
+            self.render_limit_label.setText(
+                f"Showing first {MAX_VISIBLE_ITEMS} of {len(summaries)} project summaries."
+            )
+            self.render_limit_label.show()
+        else:
+            self.render_limit_label.hide()
+
+        selected = next(
+            (
+                summary
+                for summary in visible_summaries
+                if summary.project == self._selected_project_name
+            ),
+            visible_summaries[0] if visible_summaries else None,
+        )
+        if selected is None:
+            self._selected_project_name = None
+            self.why_title_label.setFullText("No project selected")
+            self.why_meta_label.setText(
+                "Choose a project summary to inspect its highest-ranked task."
+            )
+            self.why_reasons_label.setText(
+                "Why-now reasons appear here when a project is selected."
+            )
+            self._render_workflow_actions(None)
+        else:
+            self._select_project_summary(selected)
 
     def _render_items(self, *_args) -> None:
         self.loading_label.hide()
         self._clear_task_rows()
+        if self.view_combo.currentText() == "Projects":
+            self._render_projects()
+            return
         filtered = self._filtered_items()
-        visible_items = filtered[:MAX_VISIBLE_ITEMS]
-        for item in visible_items:
-            row = TodoTaskRow(item, self.task_list_widget)
+        view = self.view_combo.currentText()
+        visible_items = filtered if view == "Today" else filtered[:MAX_VISIBLE_ITEMS]
+        duplicate_positions: dict[str, tuple[int, int]] = {}
+        if view == "Duplicates":
+            grouped: dict[str, list[TodoItem]] = {}
+            for item in filtered:
+                grouped.setdefault(item.duplicate_key, []).append(item)
+            for group in grouped.values():
+                total = group[0].duplicate_count
+                for position, item in enumerate(group, start=1):
+                    duplicate_positions[item.id] = (position, total)
+        for index, item in enumerate(visible_items, start=1):
+            row = TodoTaskRow(
+                item,
+                self.task_list_widget,
+                docket_number=index if view == "Today" and index <= 7 else None,
+                show_change_status=view == "New / changed",
+                duplicate_position=duplicate_positions.get(item.id),
+            )
             row.selected.connect(self._select_item)
             row.complete_requested.connect(self._complete_task)
             row.dismiss_requested.connect(self._dismiss_task)
@@ -1810,7 +2134,17 @@ class SmartTodoDialog(QDialog):
         else:
             self.empty_label.hide()
 
-        if len(filtered) > MAX_VISIBLE_ITEMS:
+        pinned_overage = (
+            view == "Today"
+            and len(filtered) > 7
+            and sum(item.pinned_today for item in filtered) > 7
+        )
+        if pinned_overage:
+            self.render_limit_label.setText(
+                f"{len(filtered)} pinned tasks exceed the seven-item docket; all active pins shown."
+            )
+            self.render_limit_label.show()
+        elif len(filtered) > MAX_VISIBLE_ITEMS:
             self.render_limit_label.setText(
                 f"Showing first {MAX_VISIBLE_ITEMS} of {len(filtered)} matching tasks."
             )
@@ -1832,6 +2166,38 @@ class SmartTodoDialog(QDialog):
             self._render_workflow_actions(None)
         else:
             self._select_item(selected)
+
+    def _select_project_summary(self, summary: ProjectSummary) -> None:
+        self._selected_project_name = summary.project
+        for row in self.project_rows:
+            row.set_selected(row.summary.project == summary.project)
+        top_item = summary.top_item
+        if top_item is None:
+            self.why_title_label.setFullText(summary.project)
+            self.why_reasons_label.setText("— No active task is available.")
+        else:
+            self.why_title_label.setFullText(top_item.text)
+            reasons = top_item.why_now or ("Open task needs attention.",)
+            self.why_reasons_label.setText(
+                "\n\n".join(f"— {reason}" for reason in reasons)
+            )
+        self.why_meta_label.setText(
+            f"{summary.project} · {summary.focus} focus · {summary.active} active\n"
+            f"{summary.waiting} waiting · {summary.snoozed} snoozed · "
+            f"{summary.overdue} overdue"
+        )
+        self.why_meta_label.setAccessibleName(
+            f"{summary.project} project summary"
+        )
+        self._render_workflow_actions(None)
+
+    def _open_project_queue(self, project: str) -> None:
+        if self.project_combo.findText(project) < 0:
+            self.status_label.setText("Project is no longer available in this scan.")
+            return
+        self._selected_item_id = None
+        self.project_combo.setCurrentText(project)
+        self.view_combo.setCurrentText("Focus")
 
     def _select_item(self, item: TodoItem) -> None:
         self._selected_item_id = item.id
@@ -1962,7 +2328,7 @@ class SmartTodoDialog(QDialog):
         self.view_combo.blockSignals(True)
         self.search_edit.clear()
         self.project_combo.setCurrentText("All projects")
-        self.view_combo.setCurrentText("Focus")
+        self.view_combo.setCurrentText("Today")
         self.search_edit.blockSignals(False)
         self.project_combo.blockSignals(False)
         self.view_combo.blockSignals(False)

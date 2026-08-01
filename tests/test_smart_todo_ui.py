@@ -109,6 +109,112 @@ def selected_action_names(dialog: SmartTodoDialog):
     return [button.accessibleName() for button in dialog.workflow_action_buttons]
 
 
+def make_workflow_item(
+    tmp_path: Path,
+    text: str,
+    *,
+    project: str,
+    line: int,
+    score: int,
+    completed: bool = False,
+    waiting: bool = False,
+    finished: bool = False,
+    managed_id: str | None = None,
+    change_status: str = "",
+    unchanged_since: date | None = None,
+    snoozed_until: date | None = None,
+    pinned_today: bool = False,
+    duplicate_count: int = 1,
+):
+    return smart_todos.TodoItem(
+        id=f"{project}:{line}:{text}",
+        text=text,
+        completed=completed,
+        source_path=tmp_path / "workspace" / project / "TODO.md",
+        line=line,
+        heading="Queue",
+        project=project,
+        score=score,
+        urgency="high" if score >= 100 else "normal",
+        why_now=(f"{text} needs attention",),
+        waiting=waiting,
+        finished=finished,
+        managed_id=managed_id,
+        change_status=change_status,
+        unchanged_since=unchanged_since or TODAY,
+        snoozed_until=snoozed_until,
+        pinned_today=pinned_today,
+        duplicate_key="duplicate exact task" if duplicate_count > 1 else text.casefold(),
+        duplicate_count=duplicate_count,
+    )
+
+
+def workflow_view_fixture(tmp_path: Path):
+    return (
+        make_workflow_item(
+            tmp_path, "Pinned docket task", project="alpha", line=1, score=150,
+            pinned_today=True,
+        ),
+        make_workflow_item(
+            tmp_path, "Duplicate exact task", project="alpha", line=2, score=140,
+            duplicate_count=2,
+        ),
+        make_workflow_item(
+            tmp_path, "New scan task", project="alpha", line=3, score=130,
+            change_status="new",
+        ),
+        make_workflow_item(
+            tmp_path, "Changed scan task", project="beta", line=1, score=120,
+            change_status="changed",
+        ),
+        make_workflow_item(
+            tmp_path, "Stale ninety task", project="beta", line=2, score=110,
+            unchanged_since=TODAY - timedelta(days=91),
+        ),
+        make_workflow_item(
+            tmp_path, "Fresh active task", project="gamma", line=1, score=100,
+        ),
+        make_workflow_item(
+            tmp_path, "Stale sixty task", project="gamma", line=2, score=90,
+            unchanged_since=TODAY - timedelta(days=61),
+        ),
+        make_workflow_item(
+            tmp_path, "Stale thirty task", project="gamma", line=3, score=80,
+            unchanged_since=TODAY - timedelta(days=31),
+        ),
+        make_workflow_item(
+            tmp_path, "Duplicate exact task", project="gamma", line=4, score=70,
+            duplicate_count=2,
+        ),
+        make_workflow_item(
+            tmp_path, "Waiting owner task", project="beta", line=3, score=60,
+            waiting=True,
+        ),
+        make_workflow_item(
+            tmp_path, "Snoozed task", project="alpha", line=4, score=50,
+            snoozed_until=TODAY + timedelta(days=2),
+        ),
+        make_workflow_item(
+            tmp_path, "Completed inbox task", project="Global TODO", line=1,
+            score=40, completed=True, managed_id="completed-1",
+        ),
+        make_workflow_item(
+            tmp_path, "Finished task", project="beta", line=4, score=30,
+            finished=True,
+        ),
+    )
+
+
+def install_workflow_fixture(dialog: SmartTodoDialog, items, qapp):
+    dialog._all_items = tuple(items)
+    dialog._scan_today = TODAY
+    dialog._update_summary()
+    dialog._rebuild_project_filter()
+    dialog._render_items()
+    dialog.show()
+    qapp.processEvents()
+
+
 def accept_next_snooze_dialog(qapp, selected_date: date):
     def accept_dialog():
         dialog = qapp.activeModalWidget()
@@ -181,6 +287,7 @@ def test_refresh_emits_full_summary_and_caps_rows(qapp, tmp_path, dialog_cleanup
 
     assert summaries[-1] == (260, 0)
     assert "260 focus" in dialog.summary_label.text()
+    dialog.view_combo.setCurrentText("Focus")
     assert len(dialog.task_rows) == 250
     assert dialog.render_limit_label.isVisible()
 
@@ -204,6 +311,335 @@ def test_each_view_has_literal_membership(qapp, tmp_path, dialog_cleanup):
     assert visible_task_texts(dialog) == ["Archived inbox note"]
 
 
+def test_workflow_views_have_exact_labels_membership_order_and_metadata(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    items = workflow_view_fixture(tmp_path)
+    install_workflow_fixture(dialog, items, qapp)
+
+    expected_labels = [
+        "Today",
+        "Focus",
+        "All open",
+        "Waiting",
+        "Snoozed",
+        "New / changed",
+        "Duplicates",
+        "Projects",
+        "Stale 30+",
+        "Stale 60+",
+        "Stale 90+",
+        "Completed inbox",
+        "Finished",
+    ]
+    assert [dialog.view_combo.itemText(index) for index in range(dialog.view_combo.count())] == expected_labels
+    assert dialog.view_combo.currentText() == "Today"
+    assert visible_task_texts(dialog) == [
+        "Pinned docket task",
+        "Duplicate exact task",
+        "New scan task",
+        "Changed scan task",
+        "Stale ninety task",
+        "Fresh active task",
+        "Stale sixty task",
+    ]
+    assert [row.docket_label.text() for row in dialog.task_rows] == [
+        "01", "02", "03", "04", "05", "06", "07"
+    ]
+
+    expected_membership = {
+        "Focus": [
+            "Pinned docket task", "Duplicate exact task", "New scan task",
+            "Changed scan task", "Stale ninety task", "Fresh active task",
+            "Stale sixty task", "Stale thirty task", "Duplicate exact task",
+        ],
+        "All open": [
+            "Pinned docket task", "Duplicate exact task", "New scan task",
+            "Changed scan task", "Stale ninety task", "Fresh active task",
+            "Stale sixty task", "Stale thirty task", "Duplicate exact task",
+            "Waiting owner task", "Snoozed task",
+        ],
+        "Waiting": ["Waiting owner task"],
+        "Snoozed": ["Snoozed task"],
+        "New / changed": ["New scan task", "Changed scan task"],
+        "Duplicates": ["Duplicate exact task", "Duplicate exact task"],
+        "Stale 30+": ["Stale ninety task", "Stale sixty task", "Stale thirty task"],
+        "Stale 60+": ["Stale ninety task", "Stale sixty task"],
+        "Stale 90+": ["Stale ninety task"],
+        "Completed inbox": ["Completed inbox task"],
+        "Finished": ["Finished task"],
+    }
+    for view, expected in expected_membership.items():
+        dialog.view_combo.setCurrentText(view)
+        assert visible_task_texts(dialog) == expected
+
+    dialog.view_combo.setCurrentText("New / changed")
+    assert [row.meta_label.text().split("  ·  ", 1)[0] for row in dialog.task_rows] == [
+        "NEW", "CHANGED"
+    ]
+    assert all(row.meta_label.property("fresh") is True for row in dialog.task_rows)
+
+    dialog.view_combo.setCurrentText("Duplicates")
+    assert "copy 1 of 2" in dialog.task_rows[0].meta_label.text().lower()
+    assert "copy 2 of 2" in dialog.task_rows[1].meta_label.text().lower()
+    assert [row.item.source_path.parent.name for row in dialog.task_rows] == ["alpha", "gamma"]
+
+    dialog.search_edit.setText("stale")
+    dialog.project_combo.setCurrentText("gamma")
+    dialog.reset_filters_button.click()
+    assert dialog.search_edit.text() == ""
+    assert dialog.project_combo.currentText() == "All projects"
+    assert dialog.view_combo.currentText() == "Today"
+
+
+def test_today_docket_keeps_all_active_pins_when_more_than_seven(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    items = tuple(
+        make_workflow_item(
+            tmp_path,
+            f"Pinned task {index}",
+            project="alpha",
+            line=index,
+            score=200 - index,
+            pinned_today=True,
+        )
+        for index in range(1, 9)
+    ) + (
+        make_workflow_item(
+            tmp_path, "Unpinned overflow", project="alpha", line=9, score=300
+        ),
+    )
+    install_workflow_fixture(dialog, items, qapp)
+
+    assert dialog.view_combo.currentText() == "Today"
+    assert visible_task_texts(dialog) == [f"Pinned task {index}" for index in range(1, 9)]
+    assert [
+        row.docket_label.text() if row.docket_label is not None else None
+        for row in dialog.task_rows
+    ] == ["01", "02", "03", "04", "05", "06", "07", None]
+    assert "8 pinned" in dialog.render_limit_label.text().lower()
+
+
+def test_projects_view_renders_exact_summaries_selection_and_drill_down(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    install_workflow_fixture(dialog, workflow_view_fixture(tmp_path), qapp)
+
+    dialog.view_combo.setCurrentText("Projects")
+    qapp.processEvents()
+
+    assert dialog.task_rows == []
+    assert [row.summary.project for row in dialog.project_rows] == [
+        "alpha", "beta", "gamma"
+    ]
+    assert [
+        (
+            row.summary.active,
+            row.summary.focus,
+            row.summary.waiting,
+            row.summary.snoozed,
+            row.summary.overdue,
+            row.summary.new_changed,
+            row.summary.duplicates,
+            row.summary.stale_30,
+            row.summary.top_item.text,
+        )
+        for row in dialog.project_rows
+    ] == [
+        (4, 3, 0, 1, 0, 1, 1, 0, "Pinned docket task"),
+        (3, 2, 1, 0, 0, 1, 0, 1, "Changed scan task"),
+        (4, 4, 0, 0, 0, 0, 1, 2, "Fresh active task"),
+    ]
+
+    beta_row = dialog.project_rows[1]
+    QTest.mouseClick(beta_row, Qt.MouseButton.LeftButton)
+    assert beta_row.property("selected") is True
+    assert dialog.why_title_label.toolTip() == "Changed scan task"
+    assert "Changed scan task needs attention" in dialog.why_reasons_label.text()
+    assert dialog.workflow_action_rail.isHidden()
+
+    gamma_row = dialog.project_rows[2]
+    gamma_row.setFocus()
+    QTest.keyClick(gamma_row, Qt.Key.Key_Space)
+    assert gamma_row.property("selected") is True
+    assert dialog.why_title_label.toolTip() == "Fresh active task"
+
+    beta_row.open_queue_button.click()
+    assert dialog.project_combo.currentText() == "beta"
+    assert dialog.view_combo.currentText() == "Focus"
+    assert visible_task_texts(dialog) == ["Changed scan task", "Stale ninety task"]
+
+
+def test_project_summary_row_keyboard_open_queue_emits_exact_project(qapp, tmp_path):
+    summary = smart_todos.ProjectSummary(
+        project="alpha",
+        top_item=make_workflow_item(
+            tmp_path, "Top project task", project="alpha", line=1, score=100
+        ),
+        active=3,
+        focus=2,
+        waiting=1,
+        snoozed=0,
+        overdue=1,
+        new_changed=1,
+        duplicates=2,
+        stale_30=1,
+    )
+    row = smart_todos.ProjectSummaryRow(summary)
+    opened = []
+    row.open_queue_requested.connect(opened.append)
+    row.show()
+    row.setFocus()
+
+    QTest.keyClick(row, Qt.Key.Key_Return)
+
+    assert opened == ["alpha"]
+    assert row.open_queue_button.accessibleName() == "Open alpha queue"
+    row.close()
+    row.deleteLater()
+
+
+def test_projects_view_empty_state_explains_no_actionable_scanned_projects(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    items = (
+        make_workflow_item(
+            tmp_path, "Completed only", project="alpha", line=1, score=10,
+            completed=True, managed_id="done",
+        ),
+        make_workflow_item(
+            tmp_path, "Finished only", project="beta", line=1, score=9,
+            finished=True,
+        ),
+    )
+    install_workflow_fixture(dialog, items, qapp)
+
+    dialog.view_combo.setCurrentText("Projects")
+
+    assert dialog.project_rows == []
+    assert dialog.empty_label.isVisible()
+    assert dialog.empty_label.text() == "No scanned projects have actionable tasks."
+
+
+def test_production_docket_shape_preserves_accessibility_controls_and_zero_overflow(
+    qapp, tmp_path, dialog_cleanup, monkeypatch
+):
+    duplicate_text = "Duplicate production task " + ("duplicate context " * 100)
+    texts = [
+        "Managed production task " + ("managed context " * 105),
+        duplicate_text,
+        "New production task " + ("new context " * 130),
+        "Changed production task " + ("changed context " * 110),
+        "Stale production task " + ("stale context " * 120),
+        duplicate_text,
+        "Seventh production task " + ("seventh context " * 112),
+    ]
+    assert all(1500 <= len(text) <= 3000 for text in texts)
+    items = tuple(
+        make_workflow_item(
+            tmp_path,
+            text,
+            project=("alpha", "beta", "gamma")[index % 3],
+            line=index + 1,
+            score=200 - index,
+            managed_id="managed-production" if index == 0 else None,
+            change_status=("new" if index == 2 else "changed" if index == 3 else ""),
+            unchanged_since=TODAY - timedelta(days=45) if index == 4 else TODAY,
+            duplicate_count=2 if index in {1, 5} else 1,
+        )
+        for index, text in enumerate(texts)
+    )
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        workflow_store_path=tmp_path / "production-workflow.json",
+    )
+    opened = []
+    monkeypatch.setattr(smart_todos, "open_source_item", opened.append)
+    dialog.resize(860, 680)
+    install_workflow_fixture(dialog, items, qapp)
+
+    assert (dialog.width(), dialog.height()) == (860, 680)
+    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+    assert len(dialog.task_rows) == 7
+    assert all(0 < row.height() <= 90 for row in dialog.task_rows)
+    assert [row.docket_label.text() for row in dialog.task_rows] == [
+        "01", "02", "03", "04", "05", "06", "07"
+    ]
+    fixed_family = smart_todos.QFontDatabase.systemFont(
+        smart_todos.QFontDatabase.SystemFont.FixedFont
+    ).family()
+    assert all(row.docket_label.font().family() == fixed_family for row in dialog.task_rows)
+    assert all(
+        row.docket_label.palette().color(QPalette.ColorRole.WindowText).name()
+        == "#d4a574"
+        for row in dialog.task_rows
+    )
+    for row in dialog.task_rows:
+        assert row.text_label.toolTip() == row.item.text
+        assert row.text_label.accessibleName() == row.item.text
+        assert row.item.text in row.text_label.accessibleDescription()
+        for button in (
+            row.open_button,
+            row.complete_button,
+            row.dismiss_button,
+        ):
+            if button is not None:
+                assert button.geometry().right() <= row.contentsRect().right()
+
+    managed_row = dialog.task_rows[0]
+    assert managed_row.complete_button is not None
+    assert managed_row.dismiss_button is not None
+    assert selected_action_names(dialog) == [
+        "Pin today", "Snooze task", "Copy task context"
+    ]
+    for button in dialog.workflow_action_buttons:
+        assert button.geometry().right() <= dialog.workflow_action_rail.contentsRect().right()
+
+    managed_row.setFocus()
+    QTest.keyClick(managed_row, Qt.Key.Key_Return)
+    assert opened == [managed_row.item]
+    dialog.pin_button.setFocus()
+    QTest.keyClick(dialog.pin_button, Qt.Key.Key_Space)
+    assert dialog._all_items[0].pinned_today is True
+
+    dialog.view_combo.setCurrentText("New / changed")
+    qapp.processEvents()
+    assert [row.meta_label.accessibleName().split(",", 1)[0] for row in dialog.task_rows] == [
+        "new", "changed"
+    ]
+    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+
+    dialog.view_combo.setCurrentText("Duplicates")
+    qapp.processEvents()
+    assert len(dialog.task_rows) == 2
+    assert [row.meta_label.accessibleName().split(",", 1)[0] for row in dialog.task_rows] == [
+        "copy 1 of 2", "copy 2 of 2"
+    ]
+    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+
+    dialog.view_combo.setCurrentText("Projects")
+    qapp.processEvents()
+    assert dialog.project_rows
+    assert all(0 < row.height() <= 90 for row in dialog.project_rows)
+    assert all(
+        row.open_queue_button.geometry().right() <= row.contentsRect().right()
+        for row in dialog.project_rows
+    )
+    assert all(
+        row.summary.top_item.text in row.top_label.toolTip()
+        and row.top_label.accessibleName() == row.summary.top_item.text
+        for row in dialog.project_rows
+    )
+    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+
+
 def test_search_project_filter_and_reset(qapp, tmp_path, dialog_cleanup):
     dialog = make_dialog_with_fixture(tmp_path, dialog_cleanup)
     dialog.show_and_refresh()
@@ -220,7 +656,7 @@ def test_search_project_filter_and_reset(qapp, tmp_path, dialog_cleanup):
     dialog.reset_filters_button.click()
     assert dialog.search_edit.text() == ""
     assert dialog.project_combo.currentText() == "All projects"
-    assert dialog.view_combo.currentText() == "Focus"
+    assert dialog.view_combo.currentText() == "Today"
     assert len(dialog.task_rows) == 2
 
 

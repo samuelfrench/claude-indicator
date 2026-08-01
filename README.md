@@ -63,27 +63,60 @@ or hidden independently.
   including read-only project TODO entries. Dismissed keys are stored locally in
   `~/.claude/smart_todos_finished.json`; malformed state stays visible as a
   warning and leaves tasks active.
+- **Restore** appears in the **Finished** view. It removes only the local finished
+  marker and does not edit or reopen the source Markdown checkbox.
 - **Open source** opens the selected file at its Markdown line when `code`,
   `codium`, or `gedit` is available, and otherwise opens the file with
   `xdg-open`. No shell command is constructed.
 
 ### Views and ranking
 
-- **Focus** shows open, actionable tasks. **All open** also includes waiting
-  work. **Waiting** isolates blocked or time-gated items. **Completed inbox**
-  shows completed entries owned by the Indicator. **Finished** shows tasks
-  dismissed in the command center; they retain **Open source** but offer no
-  **Dismiss** or **Complete** action.
+- **Today** is the default. It shows pinned actionable tasks first, then fills
+  the docket from the existing rank order to seven items. If more than seven
+  active tasks are pinned, every pin remains visible. Only Today rows carry the
+  functional `01`–`07` execution-order numbering; **Reset** returns to Today
+  across all projects.
+- The remaining views are **Focus**, **All open**, **Waiting**, **Snoozed**,
+  **New / changed**, **Duplicates**, **Projects**, **Stale 30+**,
+  **Stale 60+**, **Stale 90+**, **Completed inbox**, and **Finished**. Focus is
+  actionable work; All open also includes waiting and snoozed work.
+- **New / changed** reports only differences from the immediately previous
+  successful scan and adds mint status metadata without changing task rank.
+  **Duplicates** uses exact case-folded task copy with collapsed whitespace,
+  keeps every source row contiguous, and labels each `copy N of M`. It never
+  bulk-mutates a group; each action targets one stable source identity.
+- **Projects** shows one summary per project with active, focus, waiting,
+  snoozed, overdue, new/changed, duplicate, and stale counts plus its top task.
+  Select a summary to reuse the top task's Why Now explanation, then choose
+  **Open queue** to set that project filter and enter Focus.
+- **Stale 30+**, **Stale 60+**, and **Stale 90+** contain undated actionable
+  tasks only. Age is conservative: the first observation starts at the source
+  file modification date, then later successful scans maintain task-specific
+  unchanged dates.
 - Waiting recognition includes `blocked by owner`, `blocked-by-owner`, and
   future `on or after`, `no earlier than`, `only after`, or `until` dates.
 - Search covers task text, project, heading, tags, and ranking reasons. The
-  project filter narrows results to one discovered project; **Reset** restores
-  the Focus view across all projects.
+  project filter narrows results to one discovered project.
 - Ranking is explainable in the **Why now** rail. Signals include explicit due
   dates, P0/P1 and urgent language, revenue or customer impact, billing or cost
   exposure, production verification work, and overall-inbox capture. Explicit
   waits and future `on or after` / `no earlier than` gates remain outside Focus
   until actionable.
+
+### Daily workflow actions and state
+
+- **Pin today** / **Unpin** controls explicit Today membership.
+- **Snooze…** accepts Tomorrow, Next week, or an exact future date. A task wakes
+  at the start of its stored date (`today >= until`); **Wake now** removes a
+  future snooze immediately.
+- **Copy context** places plain task, project, absolute source/line, heading,
+  due date, urgency, score, and Why Now text on the desktop clipboard. The task
+  copy is data only and is never executed.
+- Finished keys stay in `~/.claude/smart_todos_finished.json`. Pins, snoozes,
+  and content-free scan observations stay separately in
+  `~/.claude/smart_todos_workflow.json`. Both stores are strict local JSON with
+  safe atomic replacement; persistence failure is shown inline and does not
+  project a successful action into the UI.
 
 ### Local data boundary
 
@@ -95,7 +128,8 @@ oversized files, symlink TODO files, and special files in the dialog. Workspace
 candidates remain confined beneath their resolved configured root.
 All scanning, ranking, filtering, persistence, and source navigation stay on
 this computer. Smart TODOs adds no API calls, hosted service, subscription, or
-billable usage.
+billable usage. It adds no notification, email, cloud synchronization, or
+public endpoint.
 
 ## Prerequisites
 
