@@ -93,6 +93,40 @@ def test_workflow_store_rejects_noncanonical_or_invalid_state_without_mutation(
     assert path.read_bytes() == contents
 
 
+def test_workflow_store_rejects_two_snooze_records_for_the_same_task_key(tmp_path):
+    path = tmp_path / "workflow.json"
+    contents = (
+        '{"version":1,"pinned_today":[],"snoozed":['
+        '{"key":"' + SOURCE_A + '","until":"2026-08-01"},'
+        '{"key":"' + SOURCE_A + '","until":"2026-08-02"}'
+        '],"observed":[]}'
+    ).encode("utf-8")
+    path.write_bytes(contents)
+
+    with pytest.raises(ValueError, match="Workflow state"):
+        smart_todo_workflow.WorkflowStore(path).read()
+
+    assert path.read_bytes() == contents
+
+
+def test_workflow_store_rejects_two_observed_records_for_one_location(tmp_path):
+    path = tmp_path / "workflow.json"
+    contents = (
+        '{"version":1,"pinned_today":[],"snoozed":[],"observed":['
+        '{"location":"' + LOCATION_A + '","content":"' + SOURCE_A
+        + '","unchanged_since":"2026-07-01"},'
+        '{"location":"' + LOCATION_A + '","content":"' + SOURCE_B
+        + '","unchanged_since":"2026-07-02"}'
+        ']}'
+    ).encode("utf-8")
+    path.write_bytes(contents)
+
+    with pytest.raises(ValueError, match="Workflow state"):
+        smart_todo_workflow.WorkflowStore(path).read()
+
+    assert path.read_bytes() == contents
+
+
 def test_workflow_store_rejects_symlink_and_fifo_paths(tmp_path):
     target = tmp_path / "target.json"
     target.write_bytes(b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[]}')

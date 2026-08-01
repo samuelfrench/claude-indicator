@@ -137,6 +137,10 @@ def _state_from_payload(payload: object) -> WorkflowState:
     observed = tuple(_parse_observed(value) for value in payload["observed"])
     if snoozes != tuple(sorted(set(snoozes))) or observed != tuple(sorted(set(observed))):
         raise ValueError("Workflow state has noncanonical records.")
+    if len({record.key for record in snoozes}) != len(snoozes):
+        raise ValueError("Workflow state has duplicate snooze keys.")
+    if len({record.location for record in observed}) != len(observed):
+        raise ValueError("Workflow state has duplicate observed locations.")
     return WorkflowState(frozenset(pins), snoozes, observed)
 
 
