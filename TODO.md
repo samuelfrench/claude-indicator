@@ -10,3 +10,4 @@
 - [x] Keep startup visible and avoid hidden tray-only behavior: force initial sizing/raise and only hide-on-close when tray is available.
 - [ ] Watch for future Codex state schema changes; `read_latest_codex_rate_limit()` intentionally reads cached JSONL events rather than making live network/API calls.
 - [x] Add the Smart TODO tray command center with global inbox capture, cross-project urgency ranking, safe source navigation, and local-only persistence. Shipped to `master`, verified against the real 34-file TODO corpus, and restarted in production via `claude-widget-codex.service`.
+- [x] Add persistent Smart TODO dismiss state: `Dismiss` preserves every TODO source, hides finished tasks from active views and counts, and exposes them in `Finished` via local-only `~/.claude/smart_todos_finished.json` state.

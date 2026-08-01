@@ -40,7 +40,14 @@ def write_todo(path: Path, text: str) -> Path:
     return path
 
 
-def make_dialog(tmp_path: Path, dialog_cleanup, *, home_text: str, projects=None):
+def make_dialog(
+    tmp_path: Path,
+    dialog_cleanup,
+    *,
+    home_text: str,
+    projects=None,
+    finished_store_path: Path | None = None,
+):
     home_todo = write_todo(tmp_path / "home" / "TODO.md", home_text)
     workspace = tmp_path / "workspace"
     for project, text in (projects or {}).items():
@@ -49,6 +56,7 @@ def make_dialog(tmp_path: Path, dialog_cleanup, *, home_text: str, projects=None
         home_todo_path=home_todo,
         workspace_roots=(workspace,),
         today_provider=lambda: TODAY,
+        finished_store_path=finished_store_path or tmp_path / "finished.json",
     )
     dialog_cleanup.append(dialog)
     return dialog
@@ -369,6 +377,169 @@ def test_completion_control_exists_only_for_open_managed_rows(
 
     assert "- [x] Managed open task" in dialog.home_todo_path.read_text(encoding="utf-8")
     assert "Managed open task" not in visible_task_texts(dialog)
+
+
+def test_active_rows_have_dismiss_but_completed_and_finished_rows_do_not(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "<!-- claude-indicator:inbox:start -->\n"
+            "- [ ] Managed open <!-- claude-indicator:id=open-1 -->\n"
+            "- [x] Managed completed <!-- claude-indicator:id=done-1 -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+        projects={"alpha": "- [ ] Project open\n- [ ] Waiting open until 2026-08-15\n"},
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    dialog.view_combo.setCurrentText("All open")
+    assert all(row.dismiss_button is not None for row in dialog.task_rows)
+    dialog.view_combo.setCurrentText("Completed inbox")
+    assert task_row(dialog, "Managed completed").dismiss_button is None
+
+    dialog.view_combo.setCurrentText("All open")
+    task_row(dialog, "Project open").dismiss_button.click()
+    dialog.view_combo.setCurrentText("Finished")
+    finished_row = task_row(dialog, "Project open")
+    assert finished_row.dismiss_button is None
+    assert finished_row.complete_button is None
+    assert finished_row.open_button.text() == "Open source"
+
+
+@pytest.mark.parametrize(
+    ("home_text", "projects", "task_text", "source_relative"),
+    [
+        (
+            (
+                "<!-- claude-indicator:inbox:start -->\n"
+                "- [ ] Managed dismiss <!-- claude-indicator:id=managed-dismiss -->\n"
+                "<!-- claude-indicator:inbox:end -->\n"
+            ),
+            {},
+            "Managed dismiss",
+            Path("home/TODO.md"),
+        ),
+        ("# TODO\n", {"alpha": "- [ ] Project dismiss\n"}, "Project dismiss", Path("workspace/alpha/TODO.md")),
+    ],
+    ids=["managed", "project"],
+)
+def test_dismiss_preserves_source_bytes_writes_state_and_moves_to_finished(
+    qapp, tmp_path, dialog_cleanup, home_text, projects, task_text, source_relative
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=home_text,
+        projects=projects,
+    )
+    source_path = tmp_path / source_relative
+    before = source_path.read_bytes()
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    initial_summary = dialog.summary_label.text()
+
+    task_row(dialog, task_text).dismiss_button.click()
+    qapp.processEvents()
+
+    assert source_path.read_bytes() == before
+    assert task_text not in visible_task_texts(dialog)
+    assert "0 focus" in dialog.summary_label.text()
+    assert "0 open" in dialog.summary_label.text()
+    assert dialog.summary_label.text() != initial_summary
+    dialog.view_combo.setCurrentText("All open")
+    assert task_text not in visible_task_texts(dialog)
+    dialog.view_combo.setCurrentText("Finished")
+    assert visible_task_texts(dialog) == [task_text]
+    assert task_row(dialog, task_text).dismiss_button is None
+    assert smart_todos.FinishedStore(dialog.finished_store_path).read()
+
+
+def test_dismiss_write_failure_keeps_active_row_and_reports_inline_error(
+    qapp, tmp_path, dialog_cleanup
+):
+    state_path = tmp_path / "finished.json"
+    state_path.write_text("{malformed", encoding="utf-8")
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="- [ ] Do not hide after failure\n",
+        finished_store_path=state_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    task_row(dialog, "Do not hide after failure").dismiss_button.click()
+
+    assert "Finished state" in dialog.status_label.text()
+    assert visible_task_texts(dialog) == ["Do not hide after failure"]
+    assert "1 open" in dialog.summary_label.text()
+
+
+def test_malformed_finished_state_warns_and_keeps_source_tasks_active(
+    qapp, tmp_path, dialog_cleanup
+):
+    state_path = tmp_path / "finished.json"
+    state_path.write_text('{"version": 2, "finished": []}', encoding="utf-8")
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="- [ ] Keep active on warning\n",
+        finished_store_path=state_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    assert visible_task_texts(dialog) == ["Keep active on warning"]
+    assert dialog.warning_label.isVisible()
+    assert "Finished state" in dialog.warning_label.text()
+
+
+def test_finished_selection_explains_command_center_state(qapp, tmp_path, dialog_cleanup):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="- [ ] Explain finished state\n",
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    task_row(dialog, "Explain finished state").dismiss_button.click()
+    dialog.view_combo.setCurrentText("Finished")
+    QTest.mouseClick(task_row(dialog, "Explain finished state"), Qt.MouseButton.LeftButton)
+
+    assert "finished in the command center" in dialog.why_reasons_label.text().lower()
+
+
+def test_860x680_production_shape_keeps_dismiss_controls_without_horizontal_overflow(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "<!-- claude-indicator:inbox:start -->\n"
+            "- [ ] Managed production row with enough context to need compact layout "
+            "<!-- claude-indicator:id=wide-managed -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+        projects={
+            "alpha": "- [ ] Project production row with enough context to need compact layout\n"
+        },
+    )
+    dialog.resize(860, 680)
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    qapp.processEvents()
+
+    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+    assert len(dialog.task_rows) == 2
+    for row in dialog.task_rows:
+        assert row.dismiss_button is not None
+        assert row.dismiss_button.geometry().right() <= row.width()
+        assert row.height() <= 90
 
 
 def test_real_widgets_reject_project_home_outside_and_colliding_id_ownership(

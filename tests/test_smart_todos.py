@@ -1,4 +1,6 @@
 from datetime import date
+import hashlib
+import json
 import os
 from pathlib import Path
 import stat
@@ -605,6 +607,168 @@ def test_inbox_add_leaves_the_destination_unchanged_until_os_replace(tmp_path, m
     assert observed[0][1] == path
     assert observed[0][2] == before
     assert "Atomic task" in path.read_text(encoding="utf-8")
+
+
+def finished_item(
+    *,
+    managed_id: str | None = None,
+    text: str = "Finish private release",
+    line: int = 8,
+    source_path: Path = Path("/work/alpha/TODO.md"),
+    heading: str = "Release > Checks",
+) -> TodoItem:
+    return TodoItem(
+        id=f"{source_path}:{line}",
+        text=text,
+        completed=False,
+        source_path=source_path,
+        line=line,
+        heading=heading,
+        project="alpha",
+        managed_id=managed_id,
+    )
+
+
+def test_finished_key_uses_the_literal_managed_id_without_task_text():
+    item = finished_item(managed_id="managed-42", text="Secret customer copy")
+
+    assert smart_todos.todo_finished_key(item) == "managed:managed-42"
+
+
+def test_finished_source_key_is_a_literal_sha256_of_stable_source_identity():
+    item = finished_item()
+    expected_digest = hashlib.sha256(
+        b"/work/alpha/TODO.md\0Release > Checks\0Finish private release"
+    ).hexdigest()
+
+    assert smart_todos.todo_finished_key(item) == f"source:{expected_digest}"
+
+
+def test_finished_source_key_survives_line_movement_but_changes_for_source_edits():
+    original = finished_item(line=8)
+    moved = finished_item(line=99)
+    edited = finished_item(text="Finish revised private release", line=99)
+
+    assert smart_todos.todo_finished_key(original) == smart_todos.todo_finished_key(moved)
+    assert smart_todos.todo_finished_key(original) != smart_todos.todo_finished_key(edited)
+
+
+def test_finished_store_writes_sorted_unique_keys_without_task_text(tmp_path):
+    state_path = tmp_path / "state" / "finished.json"
+    store = smart_todos.FinishedStore(state_path)
+    source = finished_item(text="Private source wording")
+
+    store.finish(source)
+    store.finish(finished_item(managed_id="managed-z", text="Private managed wording"))
+    store.finish(source)
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "version": 1,
+        "finished": sorted(payload["finished"]),
+    }
+    assert payload["finished"] == sorted(set(payload["finished"]))
+    assert "Private source wording" not in state_path.read_text(encoding="utf-8")
+    assert "Private managed wording" not in state_path.read_text(encoding="utf-8")
+    assert store.read() == frozenset(payload["finished"])
+
+
+def test_finished_store_rereads_current_state_before_each_write(tmp_path):
+    state_path = tmp_path / "finished.json"
+    state_path.write_text(
+        json.dumps({"version": 1, "finished": ["managed:written-elsewhere"]}),
+        encoding="utf-8",
+    )
+
+    smart_todos.FinishedStore(state_path).finish(finished_item(managed_id="managed:new"))
+
+    assert json.loads(state_path.read_text(encoding="utf-8"))["finished"] == [
+        "managed:managed:new",
+        "managed:written-elsewhere",
+    ]
+
+
+def test_finished_store_creates_private_mode_and_preserves_existing_mode(tmp_path):
+    created_path = tmp_path / "created.json"
+    smart_todos.FinishedStore(created_path).finish(finished_item(managed_id="new"))
+    assert stat.S_IMODE(created_path.stat().st_mode) == 0o600
+
+    existing_path = tmp_path / "existing.json"
+    existing_path.write_text('{"version": 1, "finished": []}', encoding="utf-8")
+    existing_path.chmod(0o640)
+    smart_todos.FinishedStore(existing_path).finish(finished_item(managed_id="existing"))
+    assert stat.S_IMODE(existing_path.stat().st_mode) == 0o640
+
+
+def test_finished_store_never_changes_source_todo_bytes(tmp_path):
+    todo_path = tmp_path / "project" / "TODO.md"
+    before = b"# Project\r\n- [ ] Preserve these bytes\r\n"
+    todo_path.parent.mkdir()
+    todo_path.write_bytes(before)
+
+    smart_todos.FinishedStore(tmp_path / "finished.json").finish(
+        finished_item(source_path=todo_path, text="Preserve these bytes")
+    )
+
+    assert todo_path.read_bytes() == before
+
+
+def test_finished_store_leaves_destination_unchanged_until_os_replace(tmp_path, monkeypatch):
+    state_path = tmp_path / "finished.json"
+    before = b'{"version": 1, "finished": []}'
+    state_path.write_bytes(before)
+    original_replace = smart_todos.os.replace
+    observed = []
+
+    def observing_replace(source, destination):
+        observed.append((Path(source), Path(destination), state_path.read_bytes()))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(smart_todos.os, "replace", observing_replace)
+
+    smart_todos.FinishedStore(state_path).finish(finished_item(managed_id="atomic"))
+
+    assert observed == [(observed[0][0], state_path, before)]
+    assert observed[0][0].parent == state_path.parent
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        b"{not json",
+        b'{"version": 2, "finished": []}',
+        b'{"version": 1, "finished": "not-a-list"}',
+        b'{"version": 1, "finished": [42]}',
+        b'{"version": 1, "finished": [], "unexpected": true}',
+    ],
+    ids=["malformed-json", "wrong-version", "wrong-schema", "non-string-key", "extra-key"],
+)
+def test_finished_store_rejects_invalid_state_without_mutation(tmp_path, contents):
+    state_path = tmp_path / "finished.json"
+    state_path.write_bytes(contents)
+    before = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="Finished state"):
+        smart_todos.FinishedStore(state_path).finish(finished_item(managed_id="blocked"))
+
+    assert state_path.read_bytes() == before
+
+
+def test_finished_store_rejects_symlink_and_non_regular_paths_without_mutation(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text('{"version": 1, "finished": []}', encoding="utf-8")
+    symlink = tmp_path / "finished-link.json"
+    symlink.symlink_to(target)
+    target_before = target.read_bytes()
+
+    with pytest.raises(ValueError, match="Finished state path must be a regular file"):
+        smart_todos.FinishedStore(symlink).finish(finished_item(managed_id="blocked"))
+    assert target.read_bytes() == target_before
+
+    fifo_path = tmp_path / "finished.fifo"
+    os.mkfifo(fifo_path)
+    with pytest.raises(ValueError, match="Finished state path must be a regular file"):
+        smart_todos.FinishedStore(fifo_path).finish(finished_item(managed_id="blocked"))
 
 
 def source_item(*, completed=False):

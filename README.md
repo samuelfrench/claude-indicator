@@ -58,7 +58,11 @@ or hidden independently.
 - Only open tasks inside the single valid managed section in the exact injected
   home TODO have a **Complete** control. Matching Indicator IDs in project TODOs
   or elsewhere in the home file are ignored.
-  Project TODO entries are read-only in the command center.
+- **Dismiss** means finished in the command center, not Markdown completion. It
+  never edits a TODO source file and is available for every active task,
+  including read-only project TODO entries. Dismissed keys are stored locally in
+  `~/.claude/smart_todos_finished.json`; malformed state stays visible as a
+  warning and leaves tasks active.
 - **Open source** opens the selected file at its Markdown line when `code`,
   `codium`, or `gedit` is available, and otherwise opens the file with
   `xdg-open`. No shell command is constructed.
@@ -67,7 +71,9 @@ or hidden independently.
 
 - **Focus** shows open, actionable tasks. **All open** also includes waiting
   work. **Waiting** isolates blocked or time-gated items. **Completed inbox**
-  shows completed entries owned by the Indicator.
+  shows completed entries owned by the Indicator. **Finished** shows tasks
+  dismissed in the command center; they retain **Open source** but offer no
+  **Dismiss** or **Complete** action.
 - Waiting recognition includes `blocked by owner`, `blocked-by-owner`, and
   future `on or after`, `no earlier than`, `only after`, or `until` dates.
 - Search covers task text, project, heading, tags, and ranking reasons. The

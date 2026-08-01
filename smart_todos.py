@@ -6,6 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 import errno
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -97,6 +99,7 @@ class TodoItem:
     tags: tuple[str, ...] = ()
     why_now: tuple[str, ...] = ()
     waiting: bool = False
+    finished: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,95 @@ def normalize_task_text(text: str) -> str:
     if len(normalized) > MAX_TASK_TEXT_LENGTH:
         raise ValueError("Tasks must be 500 characters or fewer.")
     return normalized
+
+
+def todo_finished_key(item: TodoItem) -> str:
+    """Return a stable, non-plaintext key for a locally finished task."""
+    if item.managed_id is not None:
+        return f"managed:{item.managed_id}"
+    display_text = re.sub(r"\s+", " ", item.text).strip()
+    identity = "\0".join((str(_absolute_path(item.source_path)), item.heading, display_text))
+    return f"source:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+class FinishedStore:
+    """Persist locally finished task keys without modifying their TODO sources."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def read(self) -> frozenset[str]:
+        keys, _mode = self._read_current()
+        return keys
+
+    def finish(self, item: TodoItem) -> None:
+        keys, mode = self._read_current()
+        updated_keys = frozenset((*keys, todo_finished_key(item)))
+        self._write_atomically(updated_keys, 0o600 if mode is None else mode)
+
+    def _read_current(self) -> tuple[frozenset[str], int | None]:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(self.path, _safe_read_flags())
+        except FileNotFoundError:
+            return frozenset(), None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError("Finished state path must be a regular file.") from error
+            raise ValueError("Finished state could not be read safely.") from error
+        try:
+            stat_result = os.fstat(descriptor)
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise ValueError("Finished state path must be a regular file.")
+            data = os.read(descriptor, stat_result.st_size + 1)
+        except OSError as error:
+            raise ValueError("Finished state could not be read safely.") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("Finished state is malformed.") from error
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"version", "finished"}
+            or type(payload["version"]) is not int
+            or payload["version"] != 1
+            or not isinstance(payload["finished"], list)
+            or not all(isinstance(key, str) for key in payload["finished"])
+        ):
+            raise ValueError("Finished state has an unsupported schema.")
+        return frozenset(payload["finished"]), stat_result.st_mode & 0o7777
+
+    def _write_atomically(self, keys: frozenset[str], mode: int) -> None:
+        temporary_path: Path | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                {"version": 1, "finished": sorted(keys)},
+                separators=(",", ":"),
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(payload)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.chmod(temporary_path, mode)
+            os.replace(temporary_path, self.path)
+            temporary_path = None
+        except Exception:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
 
 
 class InboxStore:
@@ -812,6 +904,7 @@ class TodoTaskRow(QWidget):
     """Compact task summary with safe completion and source actions."""
 
     complete_requested = Signal(str)
+    dismiss_requested = Signal(object)
     open_requested = Signal(object)
     selected = Signal(object)
 
@@ -863,7 +956,7 @@ class TodoTaskRow(QWidget):
         layout.addWidget(self.open_button)
 
         self.complete_button: QPushButton | None = None
-        if item.managed_id is not None and not item.completed:
+        if item.managed_id is not None and not item.completed and not item.finished:
             self.complete_button = QPushButton("Complete")
             self.complete_button.setObjectName("completeButton")
             self.complete_button.setAccessibleName(f"Complete {item.text}")
@@ -871,6 +964,16 @@ class TodoTaskRow(QWidget):
                 lambda: self.complete_requested.emit(item.managed_id or "")
             )
             layout.addWidget(self.complete_button)
+
+        self.dismiss_button: QPushButton | None = None
+        if not item.completed and not item.finished:
+            self.dismiss_button = QPushButton("Dismiss")
+            self.dismiss_button.setObjectName("dismissButton")
+            self.dismiss_button.setAccessibleName(f"Dismiss {item.text}")
+            self.dismiss_button.clicked.connect(
+                lambda: self.dismiss_requested.emit(self.item)
+            )
+            layout.addWidget(self.dismiss_button)
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", selected)
@@ -882,6 +985,8 @@ class TodoTaskRow(QWidget):
         ]
         if self.complete_button is not None:
             styled_widgets.append(self.complete_button)
+        if self.dismiss_button is not None:
+            styled_widgets.append(self.dismiss_button)
         for widget in styled_widgets:
             widget.style().unpolish(widget)
             widget.style().polish(widget)
@@ -922,12 +1027,14 @@ class SmartTodoDialog(QDialog):
             Path.home() / "codex_workspace",
         ),
         today_provider: Callable[[], date] = date.today,
+        finished_store_path: Path = Path.home() / ".claude" / "smart_todos_finished.json",
         parent: QWidget | None = None,
     ):
         super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.home_todo_path = Path(home_todo_path)
         self.workspace_roots = tuple(Path(root) for root in workspace_roots)
         self.today_provider = today_provider
+        self.finished_store_path = Path(finished_store_path)
         self._all_items: tuple[TodoItem, ...] = ()
         self._worker: TodoScanWorker | None = None
         self._worker_finished_slots: dict[
@@ -1023,7 +1130,7 @@ class SmartTodoDialog(QDialog):
         self.project_combo.currentTextChanged.connect(self._render_items)
         filters.addWidget(self.project_combo)
         self.view_combo = QComboBox()
-        self.view_combo.addItems(("Focus", "All open", "Waiting", "Completed inbox"))
+        self.view_combo.addItems(("Focus", "All open", "Waiting", "Completed inbox", "Finished"))
         self.view_combo.setAccessibleName("Task view")
         self.view_combo.currentTextChanged.connect(self._render_items)
         filters.addWidget(self.view_combo)
@@ -1155,11 +1262,20 @@ class SmartTodoDialog(QDialog):
     def _on_scan_result(self, scan_result: ScanResult) -> None:
         if self._shutting_down:
             return
-        self._all_items = scan_result.items
+        warnings = list(scan_result.warnings)
+        try:
+            finished_keys = FinishedStore(self.finished_store_path).read()
+        except Exception as error:
+            finished_keys = frozenset()
+            warnings.append(str(error) or error.__class__.__name__)
+        self._all_items = tuple(
+            replace(item, finished=todo_finished_key(item) in finished_keys)
+            for item in scan_result.items
+        )
         self._update_summary()
         self._rebuild_project_filter()
-        self.warning_label.setText("\n".join(scan_result.warnings))
-        self.warning_label.setVisible(bool(scan_result.warnings))
+        self.warning_label.setText("\n".join(warnings))
+        self.warning_label.setVisible(bool(warnings))
         self.status_label.setText(
             f"Scanned {scan_result.scanned_files} TODO files · {len(scan_result.items)} tasks."
         )
@@ -1186,7 +1302,9 @@ class SmartTodoDialog(QDialog):
             self.refresh()
 
     def _update_summary(self) -> None:
-        open_items = [item for item in self._all_items if not item.completed]
+        open_items = [
+            item for item in self._all_items if not item.completed and not item.finished
+        ]
         focus_count = sum(not item.waiting for item in open_items)
         overdue_count = sum(
             item.due_date is not None and item.due_date < self._scan_today
@@ -1220,15 +1338,17 @@ class SmartTodoDialog(QDialog):
         query = self.search_edit.text().strip().casefold()
         filtered: list[TodoItem] = []
         for item in self._all_items:
-            if view == "Focus" and (item.completed or item.waiting):
+            if view == "Focus" and (item.completed or item.finished or item.waiting):
                 continue
-            if view == "All open" and item.completed:
+            if view == "All open" and (item.completed or item.finished):
                 continue
-            if view == "Waiting" and (item.completed or not item.waiting):
+            if view == "Waiting" and (item.completed or item.finished or not item.waiting):
                 continue
             if view == "Completed inbox" and (
                 not item.completed or item.managed_id is None
             ):
+                continue
+            if view == "Finished" and (not item.finished or item.completed):
                 continue
             if project != "All projects" and item.project != project:
                 continue
@@ -1260,6 +1380,7 @@ class SmartTodoDialog(QDialog):
             row = TodoTaskRow(item, self.task_list_widget)
             row.selected.connect(self._select_item)
             row.complete_requested.connect(self._complete_task)
+            row.dismiss_requested.connect(self._dismiss_task)
             row.open_requested.connect(self._open_item)
             self.task_list_layout.insertWidget(self.task_list_layout.count() - 1, row)
             self.task_rows.append(row)
@@ -1313,8 +1434,11 @@ class SmartTodoDialog(QDialog):
         self.why_meta_label.setAccessibleName(
             f"{item.urgency} urgency task details"
         )
-        reasons = item.why_now or (
-            "Completed inbox item." if item.completed else "Open task needs attention.",
+        reasons = (
+            ("Finished in the command center. Source TODO was not changed.",)
+            if item.finished
+            else item.why_now
+            or ("Completed inbox item." if item.completed else "Open task needs attention.",)
         )
         self.why_reasons_label.setText("\n\n".join(f"— {reason}" for reason in reasons))
 
@@ -1362,6 +1486,29 @@ class SmartTodoDialog(QDialog):
             return
         self.status_label.setText("Task completed. Refreshing local TODO files…")
         self.refresh()
+
+    def _dismiss_task(self, item: TodoItem) -> None:
+        current_item = next(
+            (candidate for candidate in self._all_items if candidate.id == item.id),
+            None,
+        )
+        if current_item is None or current_item.completed or current_item.finished:
+            self.status_label.setText("Only active tasks can be dismissed here.")
+            return
+        try:
+            FinishedStore(self.finished_store_path).finish(current_item)
+        except Exception as error:
+            self.status_label.setText(str(error) or error.__class__.__name__)
+            return
+        self._all_items = tuple(
+            replace(candidate, finished=True)
+            if candidate.id == current_item.id
+            else candidate
+            for candidate in self._all_items
+        )
+        self._update_summary()
+        self.status_label.setText("Task finished in command center. Source TODO unchanged.")
+        self._render_items()
 
     def _open_item(self, item: TodoItem) -> None:
         try:
