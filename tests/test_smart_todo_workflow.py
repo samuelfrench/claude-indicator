@@ -15,6 +15,7 @@ SOURCE_B = "source:" + "b" * 64
 LOCATION_A = "location:" + "a" * 64
 LOCATION_B = "location:" + "b" * 64
 LOCATION_C = "location:" + "c" * 64
+LOCATION_D = "location:" + "d" * 64
 MANAGED_A = "managed:inbox-a"
 
 
@@ -49,18 +50,22 @@ def test_workflow_store_writes_sorted_unique_records_without_task_text(tmp_path)
     )
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload == {
-        "version": 1,
-        "pinned_today": [SOURCE_A, SOURCE_B],
-        "snoozed": [
-            {"key": SOURCE_A, "until": "2026-08-01"},
-            {"key": SOURCE_B, "until": "2026-08-07"},
-        ],
-        "observed": [
-            {"location": LOCATION_A, "content": SOURCE_A, "unchanged_since": "2026-07-01"},
-            {"location": LOCATION_B, "content": SOURCE_B, "unchanged_since": "2026-07-01"},
-        ],
-    }
+    assert payload["version"] == 1
+    assert payload["pinned_today"] == [SOURCE_A, SOURCE_B]
+    assert payload["snoozed"] == [
+        {"key": SOURCE_A, "until": "2026-08-01"},
+        {"key": SOURCE_B, "until": "2026-08-07"},
+    ]
+    assert [record["location"] for record in payload["observed"]] == [
+        LOCATION_A, LOCATION_B
+    ]
+    assert [record["content"] for record in payload["observed"]] == [
+        SOURCE_A, SOURCE_B
+    ]
+    assert sorted(record["sequence"] for record in payload["observed"]) == [0, 1]
+    assert len({record["action"] for record in payload["observed"]}) == 2
+    assert all(record["action"].startswith("source:") for record in payload["observed"])
+    assert all(record["unchanged_since"] == "2026-07-01" for record in payload["observed"])
     text = path.read_text(encoding="utf-8")
     assert "Private task text" not in text
 
@@ -80,6 +85,9 @@ def test_workflow_store_writes_sorted_unique_records_without_task_text(tmp_path)
         b'{"version":1,"pinned_today":[],"snoozed":[{"key":"managed:a","until":"2026-7-1"}],"observed":[]}',
         b'{"version":1,"pinned_today":[],"snoozed":[{"key":"managed:a","until":"2026-08-01"},{"key":"managed:a","until":"2026-08-01"}],"observed":[]}',
         b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01"},{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01"}]}',
+        b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01","action":"bad","sequence":0}]}',
+        b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01","action":"source:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":true}]}',
+        b'{"version":1,"pinned_today":[],"snoozed":[],"observed":[{"location":"location:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","content":"source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","unchanged_since":"2026-07-01","action":"source:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sequence":0,"extra":1}]}',
     ],
 )
 def test_workflow_store_rejects_noncanonical_or_invalid_state_without_mutation(
@@ -126,6 +134,28 @@ def test_workflow_store_rejects_two_observed_records_for_one_location(tmp_path):
         smart_todo_workflow.WorkflowStore(path).read()
 
     assert path.read_bytes() == contents
+
+
+def test_workflow_store_keeps_legacy_v1_observations_readable_during_mutation(tmp_path):
+    path = tmp_path / "workflow.json"
+    path.write_text(
+        (
+            '{"version":1,"pinned_today":[],"snoozed":[],"observed":['
+            '{"location":"' + LOCATION_A + '","content":"' + SOURCE_A
+            + '","unchanged_since":"2026-07-01"}]}'
+        ),
+        encoding="utf-8",
+    )
+    store = smart_todo_workflow.WorkflowStore(path)
+
+    store.pin(MANAGED_A)
+
+    state = store.read()
+    assert state.pinned_today == frozenset({MANAGED_A})
+    assert state.observed[0].action == ""
+    assert set(json.loads(path.read_text())["observed"][0]) == {
+        "location", "content", "unchanged_since"
+    }
 
 
 @pytest.mark.parametrize(
@@ -215,8 +245,13 @@ def test_reconcile_first_snapshot_seeds_source_date_and_returns_no_changes(tmp_p
 
     state, tasks = store.reconcile((observation(modified=date(2026, 7, 1)),), TODAY)
 
-    assert state.observed == (smart_todo_workflow.ObservedRecord(LOCATION_A, SOURCE_A, date(2026, 7, 1)),)
-    assert tasks[SOURCE_A] == smart_todo_workflow.ObservedTask(LOCATION_A, SOURCE_A, date(2026, 7, 1), "")
+    assert len(state.observed) == 1
+    assert state.observed[0].location == LOCATION_A
+    assert state.observed[0].content == SOURCE_A
+    assert state.observed[0].unchanged_since == date(2026, 7, 1)
+    assert state.observed[0].action == tasks[SOURCE_A].action
+    assert state.observed[0].sequence == 0
+    assert tasks[SOURCE_A].change == ""
 
 
 def test_reconcile_keeps_same_location_content_unchanged_then_clears_change_label(tmp_path):
@@ -235,7 +270,10 @@ def test_reconcile_recognizes_moved_content_with_oldest_matching_date(tmp_path):
 
     _state, tasks = store.reconcile((observation(LOCATION_B, SOURCE_A),), date(2026, 8, 1))
 
-    assert tasks[SOURCE_A] == smart_todo_workflow.ObservedTask(LOCATION_B, SOURCE_A, date(2026, 7, 9), "")
+    assert tasks[SOURCE_A].location == LOCATION_B
+    assert tasks[SOURCE_A].content == SOURCE_A
+    assert tasks[SOURCE_A].unchanged_since == date(2026, 7, 9)
+    assert tasks[SOURCE_A].change == ""
 
 
 def test_reconcile_preserves_each_location_when_identical_content_has_two_copies(
@@ -258,12 +296,77 @@ def test_reconcile_preserves_each_location_when_identical_content_has_two_copies
         TODAY,
     )
 
-    assert tasks[LOCATION_C] == smart_todo_workflow.ObservedTask(
-        LOCATION_C, SOURCE_A, date(2026, 7, 1), ""
+    assert tasks[LOCATION_C].unchanged_since == date(2026, 7, 1)
+    assert tasks[LOCATION_C].change == ""
+    assert tasks[LOCATION_B].unchanged_since == date(2026, 7, 5)
+    assert tasks[LOCATION_B].change == ""
+
+
+def test_reconcile_persists_opaque_identity_through_inferable_duplicate_group_edits(
+    tmp_path,
+):
+    store = smart_todo_workflow.WorkflowStore(tmp_path / "workflow.json")
+    source_c = "source:" + "c" * 64
+    initial = (
+        observation(LOCATION_A, SOURCE_A),
+        observation(LOCATION_B, SOURCE_B),
+        observation(LOCATION_C, SOURCE_A),
+        observation(LOCATION_D, source_c),
+        observation("location:" + "e" * 64, SOURCE_A),
     )
-    assert tasks[LOCATION_B] == smart_todo_workflow.ObservedTask(
-        LOCATION_B, SOURCE_A, date(2026, 7, 5), ""
+    _state, tasks = store.reconcile(initial, TODAY)
+    chosen_action = tasks[LOCATION_C].action
+
+    inserted = (
+        observation("location:" + "f" * 64, SOURCE_A),
+        *initial,
     )
+    _state, tasks = store.reconcile(inserted, date(2026, 8, 1))
+    assert tasks[LOCATION_C].action == chosen_action
+    assert sum(task.action == chosen_action for key, task in tasks.items() if key.startswith("location:")) == 1
+
+    removed_peer = inserted[1:]
+    _state, tasks = store.reconcile(removed_peer, date(2026, 8, 2))
+    assert tasks[LOCATION_C].action == chosen_action
+
+    reordered_peers = (
+        observation(LOCATION_B, SOURCE_B),
+        observation(LOCATION_C, SOURCE_A),
+        observation(LOCATION_D, source_c),
+        observation(LOCATION_A, SOURCE_A),
+        observation("location:" + "e" * 64, SOURCE_A),
+    )
+    state, tasks = store.reconcile(reordered_peers, date(2026, 8, 3))
+    assert tasks[LOCATION_C].action == chosen_action
+    assert store.read() == state
+    assert chosen_action.startswith("source:")
+    assert len(chosen_action) == 71
+
+
+def test_reconcile_never_transfers_identity_across_ambiguous_adjacent_duplicate_edit(
+    tmp_path,
+):
+    store = smart_todo_workflow.WorkflowStore(tmp_path / "workflow.json")
+    _state, tasks = store.reconcile(
+        (observation(LOCATION_A), observation(LOCATION_B)), TODAY
+    )
+    old_actions = {tasks[LOCATION_A].action, tasks[LOCATION_B].action}
+
+    _state, tasks = store.reconcile(
+        (
+            observation(LOCATION_C),
+            observation(LOCATION_A),
+            observation(LOCATION_B),
+        ),
+        date(2026, 8, 1),
+    )
+
+    new_actions = {
+        tasks[LOCATION_A].action,
+        tasks[LOCATION_B].action,
+        tasks[LOCATION_C].action,
+    }
+    assert old_actions.isdisjoint(new_actions)
 
 
 def test_reconcile_marks_same_location_edit_and_unseen_content_new_for_one_scan(tmp_path):
@@ -275,8 +378,13 @@ def test_reconcile_marks_same_location_edit_and_unseen_content_new_for_one_scan(
         date(2026, 8, 1),
     )
 
-    assert tasks[SOURCE_B] == smart_todo_workflow.ObservedTask(LOCATION_A, SOURCE_B, date(2026, 8, 1), "changed")
-    assert tasks[MANAGED_A] == smart_todo_workflow.ObservedTask(MANAGED_A, MANAGED_A, date(2026, 8, 1), "new")
+    assert tasks[SOURCE_B].location == LOCATION_A
+    assert tasks[SOURCE_B].unchanged_since == date(2026, 8, 1)
+    assert tasks[SOURCE_B].change == "changed"
+    assert tasks[MANAGED_A].location == MANAGED_A
+    assert tasks[MANAGED_A].unchanged_since == date(2026, 8, 1)
+    assert tasks[MANAGED_A].change == "new"
+    assert tasks[MANAGED_A].action == MANAGED_A
 
 
 def test_reconcile_prunes_expired_snoozes_but_keeps_future_snoozes_and_missing_choices(tmp_path):

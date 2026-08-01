@@ -1497,6 +1497,151 @@ def test_same_source_duplicate_pin_and_snooze_mutate_only_selected_identity(
     }
 
 
+def test_duplicate_pin_stays_with_source_identity_after_peer_insertion_and_refresh(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": (
+                "# Queue\n"
+                "- [ ] Identical history task\n"
+                "- [ ] Anchor before selected\n"
+                "- [ ] Identical history task\n"
+                "- [ ] Anchor after selected\n"
+                "- [ ] Identical history task\n"
+            )
+        },
+        workflow_store_path=workflow_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    QTest.mouseClick(task_row_at_line(dialog, 4), Qt.MouseButton.LeftButton)
+    dialog.pin_button.click()
+    chosen_key = next(item.action_key for item in dialog._all_items if item.line == 4)
+
+    write_todo(
+        tmp_path / "workspace" / "alpha" / "TODO.md",
+        (
+            "# Queue\n"
+            "- [ ] Identical history task\n"
+            "- [ ] Identical history task\n"
+            "- [ ] Anchor before selected\n"
+            "- [ ] Identical history task\n"
+            "- [ ] Anchor after selected\n"
+            "- [ ] Identical history task\n"
+        ),
+    )
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+
+    copies = [item for item in dialog._all_items if item.text == "Identical history task"]
+    assert [(item.line, item.pinned_today) for item in copies] == [
+        (2, False), (3, False), (5, True), (7, False)
+    ]
+    assert next(item.action_key for item in copies if item.line == 5) == chosen_key
+    assert chosen_key in smart_todos.WorkflowStore(workflow_path).read().pinned_today
+
+
+def test_duplicate_snooze_stays_with_source_identity_after_peer_removal_and_refresh(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": (
+                "# Queue\n"
+                "- [ ] Identical history task\n"
+                "- [ ] Identical history task\n"
+                "- [ ] Anchor before selected\n"
+                "- [ ] Identical history task\n"
+                "- [ ] Anchor after selected\n"
+                "- [ ] Identical history task\n"
+            )
+        },
+        workflow_store_path=workflow_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    QTest.mouseClick(task_row_at_line(dialog, 5), Qt.MouseButton.LeftButton)
+    accept_next_snooze_dialog(qapp, TODAY + timedelta(days=4))
+    dialog.snooze_button.click()
+    chosen_key = next(item.action_key for item in dialog._all_items if item.line == 5)
+
+    write_todo(
+        tmp_path / "workspace" / "alpha" / "TODO.md",
+        (
+            "# Queue\n"
+            "- [ ] Identical history task\n"
+            "- [ ] Anchor before selected\n"
+            "- [ ] Identical history task\n"
+            "- [ ] Anchor after selected\n"
+            "- [ ] Identical history task\n"
+        ),
+    )
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+
+    copies = [item for item in dialog._all_items if item.text == "Identical history task"]
+    assert [(item.line, item.snoozed_until) for item in copies] == [
+        (2, None), (4, TODAY + timedelta(days=4)), (6, None)
+    ]
+    assert next(item.action_key for item in copies if item.line == 4) == chosen_key
+
+
+def test_duplicate_finished_stays_with_source_identity_when_other_peers_reorder(
+    qapp, tmp_path, dialog_cleanup
+):
+    finished_path = tmp_path / "finished.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": (
+                "# Queue\n"
+                "- [ ] Identical history task\n"
+                "- [ ] Anchor before selected\n"
+                "- [ ] Identical history task\n"
+                "- [ ] Anchor after selected\n"
+                "- [ ] Identical history task\n"
+            )
+        },
+        finished_store_path=finished_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    task_row_at_line(dialog, 4).dismiss_button.click()
+    chosen_key = next(item.action_key for item in dialog._all_items if item.line == 4)
+
+    write_todo(
+        tmp_path / "workspace" / "alpha" / "TODO.md",
+        (
+            "# Queue\n"
+            "- [ ] Anchor before selected\n"
+            "- [ ] Identical history task\n"
+            "- [ ] Anchor after selected\n"
+            "- [ ] Identical history task\n"
+            "- [ ] Identical history task\n"
+        ),
+    )
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+
+    copies = [item for item in dialog._all_items if item.text == "Identical history task"]
+    assert [(item.line, item.finished) for item in copies] == [
+        (3, True), (5, False), (6, False)
+    ]
+    assert next(item.action_key for item in copies if item.line == 3) == chosen_key
+    assert chosen_key in smart_todos.FinishedStore(finished_path).read()
+
+
 def test_same_source_duplicate_dismiss_restore_stays_selected_only_across_refresh(
     qapp, tmp_path, dialog_cleanup
 ):
@@ -1650,6 +1795,50 @@ def test_same_source_duplicate_legacy_base_keys_expand_before_selected_mutation(
         first.line: True,
         second.line: False,
     }
+
+
+def test_same_source_duplicate_legacy_ordinal_keys_read_and_migrate_selected_only(
+    qapp, tmp_path, dialog_cleanup
+):
+    workflow_path = tmp_path / "workflow.json"
+    finished_path = tmp_path / "finished.json"
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={"alpha": "# Queue\n- [ ] Legacy ordinal\n- [ ] Legacy ordinal\n"},
+        workflow_store_path=workflow_path,
+        finished_store_path=finished_path,
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    first, second = sorted(dialog._all_items, key=lambda item: item.line)
+    legacy_ordinal = second.legacy_action_keys[0]
+
+    smart_todos.WorkflowStore(workflow_path).pin(legacy_ordinal)
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert {item.line: item.pinned_today for item in dialog._all_items} == {
+        first.line: False, second.line: True
+    }
+    QTest.mouseClick(task_row_at_line(dialog, second.line), Qt.MouseButton.LeftButton)
+    dialog.unpin_button.click()
+    state = smart_todos.WorkflowStore(workflow_path).read()
+    assert legacy_ordinal not in state.pinned_today
+    assert not state.pinned_today
+
+    finished_path.write_text(
+        json.dumps({"version": 1, "finished": [legacy_ordinal]}), encoding="utf-8"
+    )
+    dialog.refresh()
+    wait_for_scan(dialog, qapp)
+    assert {item.line: item.finished for item in dialog._all_items} == {
+        first.line: False, second.line: True
+    }
+    dialog.view_combo.setCurrentText("Finished")
+    dialog.restore_button.click()
+    assert legacy_ordinal not in smart_todos.FinishedStore(finished_path).read()
+    assert not any(item.finished for item in dialog._all_items)
 
 
 def test_failed_workflow_and_restore_writes_preserve_rows_counts_and_selection(

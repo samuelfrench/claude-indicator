@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import tempfile
 
@@ -40,6 +41,7 @@ class ObservedTask:
     content: str
     unchanged_since: date
     change: str
+    action: str = ""
 
 
 @dataclass(frozen=True, order=True)
@@ -53,6 +55,8 @@ class ObservedRecord:
     location: str
     content: str
     unchanged_since: date
+    action: str = ""
+    sequence: int = -1
 
 
 @dataclass(frozen=True)
@@ -105,8 +109,10 @@ def _parse_snooze(value: object) -> SnoozeRecord:
 
 
 def _parse_observed(value: object) -> ObservedRecord:
-    if not isinstance(value, dict) or set(value) != {
-        "location", "content", "unchanged_since"
+    legacy_schema = {"location", "content", "unchanged_since"}
+    current_schema = legacy_schema | {"action", "sequence"}
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(legacy_schema), frozenset(current_schema)
     }:
         raise ValueError("Workflow state has an unsupported schema.")
     location = value["location"]
@@ -115,7 +121,19 @@ def _parse_observed(value: object) -> ObservedRecord:
         raise ValueError("Workflow state has invalid keys.")
     if MANAGED_KEY_RE.fullmatch(str(content)) and location != content:
         raise ValueError("Workflow state has invalid keys.")
-    return ObservedRecord(location, content, _parse_date(value["unchanged_since"]))
+    if set(value) == legacy_schema:
+        return ObservedRecord(location, content, _parse_date(value["unchanged_since"]))
+    action = value["action"]
+    sequence = value["sequence"]
+    if (
+        not _is_content_key(action)
+        or type(sequence) is not int
+        or sequence < 0
+    ):
+        raise ValueError("Workflow state has invalid observation identity.")
+    return ObservedRecord(
+        location, content, _parse_date(value["unchanged_since"]), action, sequence
+    )
 
 
 def _state_from_payload(payload: object) -> WorkflowState:
@@ -141,6 +159,14 @@ def _state_from_payload(payload: object) -> WorkflowState:
         raise ValueError("Workflow state has duplicate snooze keys.")
     if len({record.location for record in observed}) != len(observed):
         raise ValueError("Workflow state has duplicate observed locations.")
+    current_records = [record for record in observed if record.action]
+    if current_records and len(current_records) != len(observed):
+        raise ValueError("Workflow state mixes observation schemas.")
+    if current_records and (
+        len({record.action for record in observed}) != len(observed)
+        or sorted(record.sequence for record in observed) != list(range(len(observed)))
+    ):
+        raise ValueError("Workflow state has noncanonical observation identities.")
     return WorkflowState(frozenset(pins), snoozes, observed)
 
 
@@ -297,12 +323,13 @@ class WorkflowStore:
         for record in state.observed:
             previous_by_content.setdefault(record.content, []).append(record)
 
+        action_matches = self._match_actions(state.observed, current)
         next_records: list[ObservedRecord] = []
         content_counts: dict[str, int] = {}
         for item in current:
             content_counts[item.content] = content_counts.get(item.content, 0) + 1
         tasks: dict[str, ObservedTask] = {}
-        for item in current:
+        for sequence, item in enumerate(current):
             same_location = previous_by_location.get(item.location)
             same_content = previous_by_content.get(item.content, [])
             if first_snapshot:
@@ -320,10 +347,17 @@ class WorkflowStore:
             else:
                 unchanged_since = today
                 change = "new"
-            record = ObservedRecord(item.location, item.content, unchanged_since)
+            action = action_matches.get(sequence)
+            if item.content.startswith("managed:"):
+                action = item.content
+            if action is None:
+                action = "source:" + secrets.token_hex(32)
+            record = ObservedRecord(
+                item.location, item.content, unchanged_since, action, sequence
+            )
             next_records.append(record)
             observed_task = ObservedTask(
-                item.location, item.content, unchanged_since, change
+                item.location, item.content, unchanged_since, change, action
             )
             tasks[item.location] = observed_task
             if content_counts[item.content] == 1:
@@ -336,6 +370,106 @@ class WorkflowStore:
         )
         self._write_atomically(next_state, 0o600 if mode is None else mode)
         return next_state, tasks
+
+    @staticmethod
+    def _match_actions(
+        previous: tuple[ObservedRecord, ...],
+        current: tuple[TaskObservation, ...],
+    ) -> dict[int, str]:
+        """Reuse opaque identities only when scan history identifies one row."""
+        if not previous or any(not record.action for record in previous):
+            return {}
+        old = sorted(previous, key=lambda record: record.sequence)
+        old_by_content: dict[str, list[int]] = {}
+        new_by_content: dict[str, list[int]] = {}
+        for index, record in enumerate(old):
+            old_by_content.setdefault(record.content, []).append(index)
+        for index, observation in enumerate(current):
+            new_by_content.setdefault(observation.content, []).append(index)
+
+        matches: dict[int, str] = {}
+        used_old: set[int] = set()
+        for content, new_indices in new_by_content.items():
+            old_indices = old_by_content.get(content, [])
+            if len(old_indices) == len(new_indices) == 1:
+                old_index = old_indices[0]
+                matches[new_indices[0]] = old[old_index].action
+                used_old.add(old_index)
+                continue
+
+            old_contexts = WorkflowStore._content_contexts(
+                tuple(record.content for record in old), old_indices
+            )
+            new_contexts = WorkflowStore._content_contexts(
+                tuple(item.content for item in current), new_indices
+            )
+            for context in set(old_contexts) & set(new_contexts):
+                old_candidates = old_contexts[context]
+                new_candidates = new_contexts[context]
+                if len(old_candidates) == len(new_candidates) == 1:
+                    old_index = old_candidates[0]
+                    matches[new_candidates[0]] = old[old_index].action
+                    used_old.add(old_index)
+
+            if len(old_indices) == len(new_indices):
+                old_locations = {
+                    old[index].location: index
+                    for index in old_indices
+                    if index not in used_old
+                }
+                for new_index in new_indices:
+                    if new_index in matches:
+                        continue
+                    old_index = old_locations.get(current[new_index].location)
+                    if old_index is not None:
+                        matches[new_index] = old[old_index].action
+                        used_old.add(old_index)
+
+        # A unique same-location content edit retains its identity. Never use this
+        # fallback when either content still participates in a duplicate edit.
+        for new_index, item in enumerate(current):
+            if new_index in matches:
+                continue
+            old_record = next(
+                (
+                    (index, record)
+                    for index, record in enumerate(old)
+                    if record.location == item.location and index not in used_old
+                ),
+                None,
+            )
+            if old_record is None:
+                continue
+            old_index, record = old_record
+            if (
+                len(old_by_content.get(record.content, ())) == 1
+                and len(new_by_content.get(item.content, ())) == 1
+                and record.content not in new_by_content
+                and item.content not in old_by_content
+            ):
+                matches[new_index] = record.action
+                used_old.add(old_index)
+        return matches
+
+    @staticmethod
+    def _content_contexts(
+        contents: tuple[str, ...], indices: list[int]
+    ) -> dict[tuple[str, str], list[int]]:
+        contexts: dict[tuple[str, str], list[int]] = {}
+        for index in indices:
+            content = contents[index]
+            before = "<start>"
+            after = "<end>"
+            for candidate in range(index - 1, -1, -1):
+                if contents[candidate] != content:
+                    before = contents[candidate]
+                    break
+            for candidate in range(index + 1, len(contents)):
+                if contents[candidate] != content:
+                    after = contents[candidate]
+                    break
+            contexts.setdefault((before, after), []).append(index)
+        return contexts
 
     @staticmethod
     def _require_content_key(key: str) -> None:
@@ -401,11 +535,21 @@ class WorkflowStore:
                         for record in state.snoozed
                     ],
                     "observed": [
-                        {
-                            "location": record.location,
-                            "content": record.content,
-                            "unchanged_since": record.unchanged_since.isoformat(),
-                        }
+                        dict(
+                            {
+                                "location": record.location,
+                                "content": record.content,
+                                "unchanged_since": record.unchanged_since.isoformat(),
+                            },
+                            **(
+                                {
+                                    "action": record.action,
+                                    "sequence": record.sequence,
+                                }
+                                if record.action
+                                else {}
+                            ),
+                        )
                         for record in state.observed
                     ],
                 },

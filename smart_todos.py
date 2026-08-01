@@ -131,6 +131,7 @@ class TodoItem:
     duplicate_key: str = ""
     duplicate_count: int = 1
     action_key: str = ""
+    legacy_action_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -185,17 +186,18 @@ def todo_action_key(item: TodoItem) -> str:
     return item.action_key or todo_finished_key(item)
 
 
-def assign_task_action_keys(items: tuple[TodoItem, ...]) -> tuple[TodoItem, ...]:
-    """Disambiguate colliding v1 base keys without changing the persisted schema."""
+def assign_task_action_keys(
+    items: tuple[TodoItem, ...],
+    observed: dict[str, ObservedTask] | None = None,
+) -> tuple[TodoItem, ...]:
+    """Attach persisted opaque identities and legacy ordinal read aliases."""
     groups: dict[str, list[TodoItem]] = {}
     for item in items:
         groups.setdefault(todo_finished_key(item), []).append(item)
 
     action_keys: dict[str, str] = {}
+    legacy_keys: dict[str, tuple[str, ...]] = {}
     for base_key, group in groups.items():
-        if len(group) == 1:
-            action_keys[group[0].id] = base_key
-            continue
         ordered = sorted(
             group,
             key=lambda item: (
@@ -206,11 +208,31 @@ def assign_task_action_keys(items: tuple[TodoItem, ...]) -> tuple[TodoItem, ...]
             ),
         )
         for occurrence, item in enumerate(ordered, start=1):
-            identity = f"selected-row\0{base_key}\0{occurrence}"
-            action_keys[item.id] = (
+            legacy_identity = f"selected-row\0{base_key}\0{occurrence}"
+            legacy_key = (
+                f"source:{hashlib.sha256(legacy_identity.encode('utf-8')).hexdigest()}"
+            )
+            legacy_keys[item.id] = (legacy_key,) if len(group) > 1 else ()
+            observed_item = (observed or {}).get(_workflow_location_key(item))
+            if observed_item is not None and observed_item.action:
+                action_keys[item.id] = observed_item.action
+            elif item.managed_id is not None:
+                action_keys[item.id] = base_key
+            elif item.action_key:
+                action_keys[item.id] = item.action_key
+            else:
+                identity = "fallback-action\0" + _workflow_location_key(item) + "\0" + base_key
+                action_keys[item.id] = (
                 f"source:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
             )
-    return tuple(replace(item, action_key=action_keys[item.id]) for item in items)
+    return tuple(
+        replace(
+            item,
+            action_key=action_keys[item.id],
+            legacy_action_keys=legacy_keys[item.id],
+        )
+        for item in items
+    )
 
 
 def _workflow_location_key(item: TodoItem) -> str:
@@ -859,7 +881,7 @@ def enrich_workflow(
     today: date,
 ) -> tuple[TodoItem, ...]:
     """Apply scan-history and local workflow choices without reranking tasks."""
-    items = assign_task_action_keys(items)
+    items = assign_task_action_keys(items, observed)
     snoozes = {record.key: record.until for record in state.snoozed}
     enriched: list[TodoItem] = []
 
@@ -870,6 +892,11 @@ def enrich_workflow(
             content_key
         )
         snoozed_until = snoozes.get(action_key, snoozes.get(content_key))
+        if snoozed_until is None:
+            snoozed_until = next(
+                (snoozes[key] for key in item.legacy_action_keys if key in snoozes),
+                None,
+            )
         if snoozed_until is not None and snoozed_until <= today:
             snoozed_until = None
         enriched.append(replace(
@@ -889,6 +916,7 @@ def enrich_workflow(
                 and (
                     action_key in state.pinned_today
                     or content_key in state.pinned_today
+                    or any(key in state.pinned_today for key in item.legacy_action_keys)
                 )
             ),
         ))
@@ -1889,17 +1917,6 @@ class SmartTodoDialog(QDialog):
         except Exception as error:
             finished_keys = frozenset()
             warnings.append(str(error) or error.__class__.__name__)
-        identified_items = assign_task_action_keys(scan_result.items)
-        scanned_items = tuple(
-            replace(
-                item,
-                finished=(
-                    todo_action_key(item) in finished_keys
-                    or todo_finished_key(item) in finished_keys
-                ),
-            )
-            for item in identified_items
-        )
         try:
             workflow_state, observed = WorkflowStore(self.workflow_store_path).reconcile(
                 tuple(
@@ -1908,15 +1925,46 @@ class SmartTodoDialog(QDialog):
                         todo_finished_key(item),
                         item.source_modified_on or self._scan_today,
                     )
-                    for item in scanned_items
+                    for item in sorted(
+                        scan_result.items,
+                        key=lambda candidate: (
+                            str(_absolute_path(candidate.source_path)),
+                            candidate.heading,
+                            candidate.line,
+                            candidate.id,
+                        ),
+                    )
                 ),
                 self._scan_today,
+            )
+            identified_items = assign_task_action_keys(scan_result.items, observed)
+            scanned_items = tuple(
+                replace(
+                    item,
+                    finished=(
+                        todo_action_key(item) in finished_keys
+                        or todo_finished_key(item) in finished_keys
+                        or any(key in finished_keys for key in item.legacy_action_keys)
+                    ),
+                )
+                for item in identified_items
             )
             self._all_items = enrich_workflow(
                 scanned_items, workflow_state, observed, self._scan_today
             )
         except Exception as error:
-            self._all_items = scanned_items
+            identified_items = assign_task_action_keys(scan_result.items)
+            self._all_items = tuple(
+                replace(
+                    item,
+                    finished=(
+                        todo_action_key(item) in finished_keys
+                        or todo_finished_key(item) in finished_keys
+                        or any(key in finished_keys for key in item.legacy_action_keys)
+                    ),
+                )
+                for item in identified_items
+            )
             warnings.append(str(error) or error.__class__.__name__)
         self._update_summary()
         self._rebuild_project_filter()
@@ -1938,6 +1986,7 @@ class SmartTodoDialog(QDialog):
                 content_key,
                 item.unchanged_since or self._scan_today,
                 item.change_status,
+                item.action_key,
             )
             observed[location_key] = observed_item
             observed.setdefault(content_key, observed_item)
@@ -1956,7 +2005,13 @@ class SmartTodoDialog(QDialog):
             return
         try:
             store = WorkflowStore(self.workflow_store_path)
-            key, legacy_key, replacement_keys = self._action_key_context(current_item)
+            state_before = store.read()
+            persisted_keys = set(state_before.pinned_today) | {
+                record.key for record in state_before.snoozed
+            }
+            key, legacy_key, replacement_keys = self._action_key_context(
+                current_item, persisted_keys
+            )
             migration = (
                 {"legacy_key": legacy_key, "replacement_keys": replacement_keys}
                 if legacy_key is not None
@@ -1980,12 +2035,21 @@ class SmartTodoDialog(QDialog):
         self.status_label.setText("Workflow state updated locally.")
 
     def _action_key_context(
-        self, item: TodoItem
+        self, item: TodoItem, persisted_keys: set[str] | frozenset[str] | None = None
     ) -> tuple[str, str | None, tuple[str, ...]]:
         base_key = todo_finished_key(item)
         action_key = todo_action_key(item)
         if action_key == base_key:
             return action_key, None, ()
+        if persisted_keys is not None:
+            legacy_action_key = next(
+                (key for key in item.legacy_action_keys if key in persisted_keys),
+                None,
+            )
+            if legacy_action_key is not None:
+                return action_key, legacy_action_key, (action_key,)
+            if base_key not in persisted_keys:
+                return action_key, None, ()
         replacement_keys = tuple(sorted({
             todo_action_key(candidate)
             for candidate in self._all_items
@@ -2421,15 +2485,16 @@ class SmartTodoDialog(QDialog):
             self.status_label.setText("Only finished tasks can be restored here.")
             return
         try:
-            _key, legacy_key, replacement_keys = self._action_key_context(current_item)
+            finished_store = FinishedStore(self.finished_store_path)
+            _key, legacy_key, replacement_keys = self._action_key_context(
+                current_item, finished_store.read()
+            )
             migration = (
                 {"legacy_key": legacy_key, "replacement_keys": replacement_keys}
                 if legacy_key is not None
                 else {}
             )
-            FinishedStore(self.finished_store_path).restore(
-                current_item, **migration
-            )
+            finished_store.restore(current_item, **migration)
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
             return
@@ -2505,15 +2570,16 @@ class SmartTodoDialog(QDialog):
             self.status_label.setText("Only active tasks can be dismissed here.")
             return
         try:
-            _key, legacy_key, replacement_keys = self._action_key_context(current_item)
+            finished_store = FinishedStore(self.finished_store_path)
+            _key, legacy_key, replacement_keys = self._action_key_context(
+                current_item, finished_store.read()
+            )
             migration = (
                 {"legacy_key": legacy_key, "replacement_keys": replacement_keys}
                 if legacy_key is not None
                 else {}
             )
-            FinishedStore(self.finished_store_path).finish(
-                current_item, **migration
-            )
+            finished_store.finish(current_item, **migration)
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
             return
