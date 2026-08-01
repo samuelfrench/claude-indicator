@@ -128,10 +128,22 @@ def normalize_task_text(text: str) -> str:
 def todo_finished_key(item: TodoItem) -> str:
     """Return a stable, non-plaintext key for a locally finished task."""
     if item.managed_id is not None:
-        return f"managed:{item.managed_id}"
+        key = f"managed:{item.managed_id}"
+        if not FINISHED_MANAGED_KEY_RE.fullmatch(key):
+            raise ValueError("Finished task has an invalid managed ID.")
+        return key
     display_text = re.sub(r"\s+", " ", item.text).strip()
     identity = "\0".join((str(_absolute_path(item.source_path)), item.heading, display_text))
     return f"source:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
+def _finished_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for name, value in pairs:
+        if name in payload:
+            raise ValueError("Finished state contains duplicate JSON members.")
+        payload[name] = value
+    return payload
 
 
 class FinishedStore:
@@ -170,7 +182,10 @@ class FinishedStore:
             if descriptor is not None:
                 os.close(descriptor)
         try:
-            payload = json.loads(data.decode("utf-8"))
+            payload = json.loads(
+                data.decode("utf-8"),
+                object_pairs_hook=_finished_json_object,
+            )
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("Finished state is malformed.") from error
         if (
@@ -1508,13 +1523,14 @@ class SmartTodoDialog(QDialog):
             self.status_label.setText("Only active tasks can be dismissed here.")
             return
         try:
+            finished_key = todo_finished_key(current_item)
             FinishedStore(self.finished_store_path).finish(current_item)
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
             return
         self._all_items = tuple(
             replace(candidate, finished=True)
-            if candidate.id == current_item.id
+            if todo_finished_key(candidate) == finished_key
             else candidate
             for candidate in self._all_items
         )

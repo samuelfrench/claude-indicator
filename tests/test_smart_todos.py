@@ -680,10 +680,10 @@ def test_finished_store_rereads_current_state_before_each_write(tmp_path):
         encoding="utf-8",
     )
 
-    smart_todos.FinishedStore(state_path).finish(finished_item(managed_id="managed:new"))
+    smart_todos.FinishedStore(state_path).finish(finished_item(managed_id="managed-new"))
 
     assert json.loads(state_path.read_text(encoding="utf-8"))["finished"] == [
-        "managed:managed:new",
+        "managed:managed-new",
         "managed:written-elsewhere",
     ]
 
@@ -782,6 +782,43 @@ def test_finished_store_read_rejects_noncanonical_keys_without_mutation(tmp_path
 
     with pytest.raises(ValueError, match="Finished state"):
         smart_todos.FinishedStore(state_path).read()
+
+    assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        b'{"version":1,"version":1,"finished":[]}',
+        b'{"version":1,"finished":[],"finished":["managed:hidden"]}',
+    ],
+    ids=["duplicate-version-member", "duplicate-finished-member"],
+)
+def test_finished_store_read_rejects_duplicate_json_members_without_mutation(
+    tmp_path, contents
+):
+    state_path = tmp_path / "finished.json"
+    state_path.write_bytes(contents)
+    before = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="Finished state"):
+        smart_todos.FinishedStore(state_path).read()
+
+    assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("managed_id", ["", "bad:id", "contains space"])
+def test_finished_store_rejects_invalid_outbound_managed_ids_without_mutation(
+    tmp_path, managed_id
+):
+    state_path = tmp_path / "finished.json"
+    before = b'{"version":1,"finished":["managed:existing"]}'
+    state_path.write_bytes(before)
+
+    with pytest.raises(ValueError, match="managed ID"):
+        smart_todos.FinishedStore(state_path).finish(
+            finished_item(managed_id=managed_id)
+        )
 
     assert state_path.read_bytes() == before
 

@@ -458,6 +458,66 @@ def test_dismiss_preserves_source_bytes_writes_state_and_moves_to_finished(
     assert smart_todos.FinishedStore(dialog.finished_store_path).read()
 
 
+def test_dismiss_immediately_finishes_every_row_with_the_same_source_key(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text="# TODO\n",
+        projects={
+            "alpha": (
+                "# Same heading\n"
+                "- [ ] Duplicate source task\n"
+                "- [ ] Duplicate source task\n"
+            )
+        },
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+    assert visible_task_texts(dialog) == [
+        "Duplicate source task",
+        "Duplicate source task",
+    ]
+
+    dialog.task_rows[0].dismiss_button.click()
+
+    assert visible_task_texts(dialog) == []
+    assert "0 open" in dialog.summary_label.text()
+    dialog.view_combo.setCurrentText("Finished")
+    assert visible_task_texts(dialog) == [
+        "Duplicate source task",
+        "Duplicate source task",
+    ]
+
+
+def test_dismiss_immediately_finishes_every_row_with_the_same_managed_id(
+    qapp, tmp_path, dialog_cleanup
+):
+    dialog = make_dialog(
+        tmp_path,
+        dialog_cleanup,
+        home_text=(
+            "<!-- claude-indicator:inbox:start -->\n"
+            "- [ ] First managed copy <!-- claude-indicator:id=duplicate-id -->\n"
+            "- [ ] Second managed copy <!-- claude-indicator:id=duplicate-id -->\n"
+            "<!-- claude-indicator:inbox:end -->\n"
+        ),
+    )
+    dialog.show_and_refresh()
+    wait_for_scan(dialog, qapp)
+
+    task_row(dialog, "First managed copy").dismiss_button.click()
+
+    assert visible_task_texts(dialog) == []
+    assert "0 open" in dialog.summary_label.text()
+    dialog.view_combo.setCurrentText("Finished")
+    assert visible_task_texts(dialog) == [
+        "First managed copy",
+        "Second managed copy",
+    ]
+
+
 def test_dismiss_write_failure_keeps_active_row_and_reports_inline_error(
     qapp, tmp_path, dialog_cleanup
 ):
