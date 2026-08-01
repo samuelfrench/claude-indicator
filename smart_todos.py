@@ -823,9 +823,7 @@ def project_summaries(
         focus_items = tuple(
             item for item in active_items if _is_actionable_on(item, today)
         )
-        top_item = min(
-            enumerate(active_items), key=lambda entry: (-entry[1].score, entry[0])
-        )[1]
+        top_item = min(active_items, key=_item_sort_key)
         summaries.append(ProjectSummary(
             project=project,
             top_item=top_item,
@@ -848,7 +846,9 @@ def project_summaries(
         ))
     return tuple(sorted(
         summaries,
-        key=lambda summary: (-summary.top_item.score, summary.project.casefold()),
+        key=lambda summary: (
+            _item_sort_key(summary.top_item), summary.project.casefold()
+        ),
     ))
 
 

@@ -1111,7 +1111,7 @@ def test_project_summary_reports_exact_counts_top_item_and_ranked_project_order(
 
     assert [summary.project for summary in summaries] == ["alpha", "beta"]
     alpha, beta = summaries
-    assert alpha.top_item is items[3]
+    assert alpha.top_item is items[4]
     assert (
         alpha.active,
         alpha.focus,
@@ -1133,3 +1133,30 @@ def test_project_summary_reports_exact_counts_top_item_and_ranked_project_order(
         beta.duplicates,
         beta.stale_30,
     ) == (1, 1, 0, 0, 0, 1, 0, 0)
+
+
+def test_project_summary_uses_canonical_top_and_project_order_tie_breaking():
+    waiting = workflow_item("Alpha waiting", project="alpha", score=99, waiting=True)
+    actionable = workflow_item("Alpha actionable", project="alpha", score=95)
+    later_due = workflow_item(
+        "Gamma later due", project="gamma", score=70, due_date=date(2026, 8, 2)
+    )
+    sooner_due = workflow_item(
+        "Gamma sooner due", project="gamma", score=70, due_date=date(2026, 8, 1)
+    )
+    zeta_first = workflow_item("Zeta first", project="zeta", score=60)
+    zeta_second = workflow_item("Zeta second", project="zeta", score=60)
+    beta = workflow_item("Beta tie", project="beta", score=60)
+
+    summaries = smart_todos.project_summaries(
+        (waiting, actionable, later_due, sooner_due, zeta_first, zeta_second, beta),
+        TODAY,
+    )
+    by_project = {summary.project: summary for summary in summaries}
+
+    assert by_project["alpha"].top_item is actionable
+    assert by_project["gamma"].top_item is sooner_due
+    assert by_project["zeta"].top_item is zeta_first
+    assert [summary.project for summary in summaries] == [
+        "alpha", "gamma", "beta", "zeta"
+    ]
