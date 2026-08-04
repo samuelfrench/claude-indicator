@@ -10,7 +10,7 @@ A translucent desktop widget for Linux that displays your Claude Code Max subscr
 
 - **Real-time usage tracking** — monitors 5-hour and 7-day rate limit windows
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
-- **Codex limit percentage** — shows current Codex 5-hour usage percentage, 7-day percentage, latest-thread tokens, and lifetime local totals from cached local Codex state
+- **Codex limit percentage** — reads current limits through local `codex app-server`, renders whichever one or two windows are present, and combines them with latest-thread and lifetime totals from local Codex state
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
@@ -135,6 +135,7 @@ public endpoint.
 
 - **Claude Code Max subscription** — the widget reads usage data from Anthropic's API
 - **Claude Code CLI** — must be installed and logged in (the widget reads OAuth credentials from `~/.claude/.credentials.json`)
+- **Codex CLI** — `codex` must be installed, on `PATH`, and logged in so local `codex app-server` can read the account rate limits
 - **Python 3.10+**
 - **Linux with X11 or Wayland** (tested on Ubuntu/GNOME)
 
@@ -150,6 +151,7 @@ pip install -r requirements.txt
 
 - `PySide6` >= 6.6.0 — Qt6 bindings for the desktop widget
 - `requests` >= 2.31.0 — HTTP client for API calls
+- Installed and logged-in `codex` CLI — supplies the local app-server rate-limit protocol
 
 ## Usage
 
@@ -188,7 +190,7 @@ LD_LIBRARY_PATH=/path/to/miniconda3/lib python claude_widget.py
 1. **Reads OAuth credentials** from `~/.claude/.credentials.json` (written by Claude Code CLI)
 2. **Refreshes the access token** if it's within 5 minutes of expiry, using the OAuth refresh flow
 3. **Fetches usage data** from `GET https://api.anthropic.com/api/oauth/usage` with the `anthropic-beta: oauth-2025-04-20` header
-4. **Reads local Codex usage** from `~/.codex/state_*.sqlite` and cached session `token_count` events under `~/.codex/sessions/`
+4. **Reads Codex usage** from local `codex app-server` (`account/rateLimits/read`) plus `~/.codex/state_*.sqlite`; cached session `token_count` events under `~/.codex/sessions/` are visibly marked fallbacks and are accepted only when no more than five minutes old and not past their reset
 5. **Builds cron health** from `crontab -l` plus `journalctl` execution logs, using command equality and local-time schedule prediction
 6. **Scans local TODO files** on a background Qt worker and writes only the marked Indicator Inbox section in `~/TODO.md`
 7. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, collapsible custom rows, and a modeless Smart TODO dialog
@@ -203,7 +205,7 @@ for the local TODO domain and dialog, with these components:
 | `ClaudeUsageClient` | Handles OAuth credential reading, token refresh, and API calls |
 | `FetchWorker` | QThread that fetches usage data off the main thread |
 | `UsageBar` | Custom-painted widget for a single progress bar with label, percentage, and countdown |
-| `CodexUsageRow` | Custom-painted summary row backed by local Codex SQLite state and cached rate-limit events |
+| `CodexUsageRow` | Custom-painted summary row backed by live local app-server limits plus local Codex SQLite totals |
 | `CronJobsWidget` | Collapsible row showing per-job cron health, last run age, and next run estimate |
 | `CronJobsFetchWorker`, `CronJobInfo` | Background worker and model used to parse crontab + journal history |
 | `Cron parsing helpers` | Parsers for `crontab -l`, schedule matching, and journal matching |

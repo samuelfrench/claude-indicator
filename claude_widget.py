@@ -5,6 +5,7 @@ import getpass
 import json
 import os
 import re
+import select
 import sqlite3
 import subprocess
 import sys
@@ -59,7 +60,7 @@ SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
 RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_GROUP_REFRESH_MS = 60 * 1000  # 60 seconds
-CODEX_REFRESH_MS = 15 * 1000  # 15 seconds
+CODEX_REFRESH_MS = 60 * 1000  # 1 minute; avoid repeatedly starting app-server
 TRAY_RETRY_INTERVAL_MS = 5 * 1000  # retry while the desktop tray host is absent
 CRON_REFRESH_MS = 5 * 60 * 1000  # 5 minutes — crontab/journal state changes slowly
 CRON_JOURNAL_WINDOW_HOURS = 48
@@ -67,6 +68,11 @@ CRON_LATE_GRACE_S = 180  # allow journal lag before flagging a run as missed
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
 CODEX_RATE_LIMIT_SCAN_FILES = 20
 CODEX_RATE_LIMIT_TAIL_BYTES = 4 * 1024 * 1024
+CODEX_APP_SERVER_TIMEOUT_S = 3.0
+CODEX_APP_SERVER_STOP_TIMEOUT_S = 0.5
+# A cached event may cover at most five missed one-minute live polls. Older or
+# already-reset values are omitted instead of being presented as current usage.
+CODEX_CACHED_RATE_LIMIT_MAX_AGE_S = 5 * 60
 # Rate-limit backoff: /api/oauth/usage rate-limits aggressively (GH anthropics/claude-code#31637)
 RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
 RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
@@ -366,6 +372,8 @@ class CodexUsageSummary:
     secondary_limit_resets_at: int = 0
     plan_type: str = ""
     rate_limit_reached_type: str = ""
+    rate_limit_source: str = ""
+    rate_limit_observed_at: float = 0.0
 
 
 @dataclass
@@ -378,6 +386,8 @@ class CodexRateLimit:
     secondary_resets_at: int = 0
     plan_type: str = ""
     rate_limit_reached_type: str = ""
+    source: str = ""
+    observed_at: float = 0.0
 
 
 class SystemMetricsReader:
@@ -2069,7 +2079,25 @@ def _tail_text_lines(path: Path, max_bytes: int = CODEX_RATE_LIMIT_TAIL_BYTES) -
     return lines
 
 
-def _parse_codex_rate_limit_event(line: str) -> CodexRateLimit | None:
+def _parse_codex_event_timestamp(value, fallback_timestamp: float = 0.0) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            pass
+    return fallback_timestamp
+
+
+def _parse_codex_rate_limit_event(
+    line: str,
+    fallback_timestamp: float = 0.0,
+) -> CodexRateLimit | None:
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
@@ -2088,13 +2116,17 @@ def _parse_codex_rate_limit_event(line: str) -> CodexRateLimit | None:
     secondary = limits.get("secondary") if isinstance(limits.get("secondary"), dict) else {}
     return CodexRateLimit(
         primary_used_percent=_safe_float(primary.get("used_percent")),
-        primary_window_minutes=int(primary.get("window_minutes") or 0),
-        primary_resets_at=int(primary.get("resets_at") or 0),
+        primary_window_minutes=_safe_int(primary.get("window_minutes")),
+        primary_resets_at=_safe_int(primary.get("resets_at")),
         secondary_used_percent=_safe_float(secondary.get("used_percent")),
-        secondary_window_minutes=int(secondary.get("window_minutes") or 0),
-        secondary_resets_at=int(secondary.get("resets_at") or 0),
+        secondary_window_minutes=_safe_int(secondary.get("window_minutes")),
+        secondary_resets_at=_safe_int(secondary.get("resets_at")),
         plan_type=str(limits.get("plan_type") or ""),
         rate_limit_reached_type=str(limits.get("rate_limit_reached_type") or ""),
+        source="cached",
+        observed_at=_parse_codex_event_timestamp(
+            event.get("timestamp"), fallback_timestamp
+        ),
     )
 
 
@@ -2107,16 +2139,262 @@ def _safe_float(value) -> float | None:
         return None
 
 
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _write_codex_app_server_message(
+    process: subprocess.Popen,
+    message: dict,
+) -> bool:
+    if process.stdin is None:
+        return False
+    try:
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+        process.stdin.write(payload)
+        process.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+    return True
+
+
+def _read_codex_app_server_response(
+    process: subprocess.Popen,
+    request_id: int,
+    deadline: float,
+    pending: bytearray,
+) -> dict | None:
+    """Read one matching app-server JSONL response before ``deadline``."""
+    if process.stdout is None:
+        return None
+
+    while time.monotonic() < deadline:
+        while b"\n" in pending:
+            raw_line, _, remainder = pending.partition(b"\n")
+            pending[:] = remainder
+            if not raw_line.strip():
+                continue
+            try:
+                message = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            if isinstance(message, dict) and message.get("id") == request_id:
+                return message
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        try:
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        pending.extend(chunk)
+    return None
+
+
+def _stop_codex_app_server(process: subprocess.Popen) -> None:
+    """Close app-server input and ensure the short-lived child is reaped."""
+    try:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=CODEX_APP_SERVER_STOP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=CODEX_APP_SERVER_STOP_TIMEOUT_S)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            pass
+    finally:
+        if process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+
+def _request_codex_app_server_rate_limits(
+    timeout_s: float = CODEX_APP_SERVER_TIMEOUT_S,
+) -> dict | None:
+    """Perform the official app-server JSONL handshake and rate-limit read."""
+    process: subprocess.Popen | None = None
+    try:
+        process = subprocess.Popen(
+            ["codex", "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        deadline = time.monotonic() + timeout_s
+        pending = bytearray()
+        if not _write_codex_app_server_message(
+            process,
+            {
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "claude_indicator",
+                        "title": "Claude Indicator",
+                        "version": "1.0",
+                    }
+                },
+            },
+        ):
+            return None
+        initialized = _read_codex_app_server_response(process, 1, deadline, pending)
+        if initialized is None or "error" in initialized:
+            return None
+        if not _write_codex_app_server_message(
+            process, {"method": "initialized", "params": {}}
+        ):
+            return None
+        if not _write_codex_app_server_message(
+            process, {"method": "account/rateLimits/read", "id": 2}
+        ):
+            return None
+        response = _read_codex_app_server_response(process, 2, deadline, pending)
+        if response is None or "error" in response:
+            return None
+        return response
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    finally:
+        if process is not None:
+            _stop_codex_app_server(process)
+
+
+def _parse_codex_app_server_rate_limit(response: dict) -> CodexRateLimit | None:
+    """Parse the base Codex bucket from an app-server camelCase response."""
+    if not isinstance(response, dict):
+        return None
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    limits = None
+    buckets = result.get("rateLimitsByLimitId")
+    if isinstance(buckets, dict) and isinstance(buckets.get("codex"), dict):
+        limits = buckets["codex"]
+    single_bucket = result.get("rateLimits")
+    if not isinstance(limits, dict) and isinstance(single_bucket, dict):
+        if single_bucket.get("limitId") == "codex":
+            limits = single_bucket
+    if not isinstance(limits, dict) or limits.get("limitId") != "codex":
+        return None
+
+    primary = limits.get("primary")
+    secondary = limits.get("secondary")
+    if not isinstance(primary, dict) and not isinstance(secondary, dict):
+        return None
+    primary = primary if isinstance(primary, dict) else {}
+    secondary = secondary if isinstance(secondary, dict) else {}
+    return CodexRateLimit(
+        primary_used_percent=_safe_float(primary.get("usedPercent")),
+        primary_window_minutes=_safe_int(primary.get("windowDurationMins")),
+        primary_resets_at=_safe_int(primary.get("resetsAt")),
+        secondary_used_percent=_safe_float(secondary.get("usedPercent")),
+        secondary_window_minutes=_safe_int(secondary.get("windowDurationMins")),
+        secondary_resets_at=_safe_int(secondary.get("resetsAt")),
+        plan_type=str(limits.get("planType") or ""),
+        rate_limit_reached_type=str(limits.get("rateLimitReachedType") or ""),
+        source="live",
+        observed_at=time.time(),
+    )
+
+
+def read_live_codex_rate_limit(
+    timeout_s: float = CODEX_APP_SERVER_TIMEOUT_S,
+) -> CodexRateLimit | None:
+    response = _request_codex_app_server_rate_limits(timeout_s=timeout_s)
+    return _parse_codex_app_server_rate_limit(response) if response is not None else None
+
+
 def read_latest_codex_rate_limit(
     sessions_dir: Path = CODEX_SESSIONS_DIR,
+    now_ts: float | None = None,
+    max_age_s: float = CODEX_CACHED_RATE_LIMIT_MAX_AGE_S,
 ) -> CodexRateLimit | None:
-    """Read the newest cached Codex rate-limit percentage from session JSONL."""
+    """Read a recent, unexpired cached Codex rate limit as a fail-safe."""
+    now_ts = time.time() if now_ts is None else now_ts
     for session_path in _recent_codex_session_files(sessions_dir):
+        try:
+            file_timestamp = session_path.stat().st_mtime
+        except OSError:
+            continue
         for line in reversed(_tail_text_lines(session_path)):
-            rate_limit = _parse_codex_rate_limit_event(line)
-            if rate_limit is not None:
+            rate_limit = _parse_codex_rate_limit_event(
+                line, fallback_timestamp=file_timestamp
+            )
+            if rate_limit is not None and _cached_codex_rate_limit_is_current(
+                rate_limit, now_ts=now_ts, max_age_s=max_age_s
+            ):
                 return rate_limit
     return None
+
+
+def _cached_codex_rate_limit_is_current(
+    rate_limit: CodexRateLimit,
+    now_ts: float,
+    max_age_s: float = CODEX_CACHED_RATE_LIMIT_MAX_AGE_S,
+) -> bool:
+    observed_at = rate_limit.observed_at
+    if observed_at <= 0 or observed_at > now_ts + CODEX_REFRESH_MS / 1000:
+        return False
+    if now_ts - observed_at > max_age_s:
+        return False
+
+    has_window = False
+    for used_percent, window_minutes, resets_at in (
+        (
+            rate_limit.primary_used_percent,
+            rate_limit.primary_window_minutes,
+            rate_limit.primary_resets_at,
+        ),
+        (
+            rate_limit.secondary_used_percent,
+            rate_limit.secondary_window_minutes,
+            rate_limit.secondary_resets_at,
+        ),
+    ):
+        if used_percent is None and not window_minutes and not resets_at:
+            continue
+        has_window = True
+        if resets_at and resets_at <= now_ts:
+            return False
+    return has_window
+
+
+def read_codex_rate_limit(
+    sessions_dir: Path = CODEX_SESSIONS_DIR,
+    timeout_s: float = CODEX_APP_SERVER_TIMEOUT_S,
+    now_ts: float | None = None,
+) -> CodexRateLimit | None:
+    """Read current limits from app-server, falling back to cached sessions."""
+    live_rate_limit = read_live_codex_rate_limit(timeout_s=timeout_s)
+    if live_rate_limit is not None:
+        return live_rate_limit
+    return read_latest_codex_rate_limit(sessions_dir=sessions_dir, now_ts=now_ts)
 
 
 def read_codex_usage_summary(
@@ -2168,7 +2446,7 @@ def read_codex_usage_summary(
             summary.latest_cwd = row[6] or ""
             has_state = True
 
-    rate_limit = read_latest_codex_rate_limit(sessions_dir=sessions_dir)
+    rate_limit = read_codex_rate_limit(sessions_dir=sessions_dir)
     if rate_limit is not None:
         summary.primary_limit_used_percent = rate_limit.primary_used_percent
         summary.primary_limit_window_minutes = rate_limit.primary_window_minutes
@@ -2178,6 +2456,8 @@ def read_codex_usage_summary(
         summary.secondary_limit_resets_at = rate_limit.secondary_resets_at
         summary.plan_type = rate_limit.plan_type
         summary.rate_limit_reached_type = rate_limit.rate_limit_reached_type
+        summary.rate_limit_source = rate_limit.source
+        summary.rate_limit_observed_at = rate_limit.observed_at
 
     if not has_state and rate_limit is None:
         return None
@@ -2233,7 +2513,7 @@ class CodexUsageRow(QWidget):
     """Compact row showing local Codex token usage totals."""
 
     _COLLAPSED_H = 20
-    _EXPANDED_H = 146
+    _EXPANDED_BASE_H = 34
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2261,7 +2541,9 @@ class CodexUsageRow(QWidget):
     def set_data(self, summary: CodexUsageSummary | None):
         self._summary = summary
         self._available = summary is not None and (
-            summary.thread_count > 0 or summary.primary_limit_used_percent is not None
+            summary.thread_count > 0
+            or summary.primary_limit_used_percent is not None
+            or summary.secondary_limit_used_percent is not None
         )
         if not self._available:
             self.setToolTip("No local Codex usage found yet.")
@@ -2269,13 +2551,13 @@ class CodexUsageRow(QWidget):
             title = summary.latest_thread_title or "Untitled thread"
             model = summary.latest_model or "unknown"
             cwd = summary.latest_cwd or "unknown"
-            primary_label = _format_codex_window(summary.primary_limit_window_minutes)
-            secondary_label = _format_codex_window(summary.secondary_limit_window_minutes)
-            self.setToolTip(
-                f"{primary_label} limit: {_fmt_percent(summary.primary_limit_used_percent)} used; "
-                f"resets in {_format_epoch_remaining(summary.primary_limit_resets_at)}\n"
-                f"{secondary_label} limit: {_fmt_percent(summary.secondary_limit_used_percent)} used; "
-                f"resets in {_format_epoch_remaining(summary.secondary_limit_resets_at)}\n"
+            limit_lines = [
+                f"{label.lower()} limit: {_fmt_percent(used_percent)} used; "
+                f"resets in {_format_epoch_remaining(resets_at)}"
+                for label, used_percent, resets_at in self._rate_limit_windows(summary)
+            ]
+            detail_lines = limit_lines + [
+                f"Rate-limit source: {self._rate_limit_source_label(summary)}\n"
                 f"Plan: {summary.plan_type or 'unknown'}\n"
                 f"Latest Codex thread: {title}\n"
                 f"Model: {model}\n"
@@ -2284,12 +2566,17 @@ class CodexUsageRow(QWidget):
                 f"Latest tokens: {_fmt_tokens(summary.latest_thread_tokens)}\n"
                 f"Total tokens: {_fmt_tokens(summary.total_tokens)} across "
                 f"{summary.thread_count} threads"
-            )
+            ]
+            self.setToolTip("\n".join(detail_lines))
         self._update_height()
         self.update()
 
     def _update_height(self):
-        self.setFixedHeight(self._EXPANDED_H if self._expanded else self._COLLAPSED_H)
+        if not self._expanded:
+            self.setFixedHeight(self._COLLAPSED_H)
+            return
+        detail_count = len(self._expanded_details(self._summary or CodexUsageSummary()))
+        self.setFixedHeight(self._EXPANDED_BASE_H + 14 * detail_count)
 
     @staticmethod
     def _format_updated_at(summary: CodexUsageSummary) -> str:
@@ -2300,26 +2587,90 @@ class CodexUsageRow(QWidget):
         ).astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
 
     @staticmethod
-    def _collapsed_metrics(summary: CodexUsageSummary):
-        primary_window = summary.primary_limit_window_minutes or 300
-        secondary_window = summary.secondary_limit_window_minutes or 10080
-        return [
+    def _rate_limit_source_label(summary: CodexUsageSummary) -> str:
+        if summary.rate_limit_source == "live":
+            return "live Codex account"
+        if summary.rate_limit_source == "cached":
+            if summary.rate_limit_observed_at:
+                age_s = max(0, int(time.time() - summary.rate_limit_observed_at))
+                age_text = f"{age_s}s" if age_s < 60 else f"{age_s // 60}m"
+                return f"cached local session fallback ({age_text} old)"
+            return "cached local session fallback"
+        return "unavailable"
+
+    @staticmethod
+    def _title_text(summary: CodexUsageSummary, arrow: str) -> str:
+        marker = " CACHE" if summary.rate_limit_source == "cached" else ""
+        return f"CODEX{marker} {arrow}"
+
+    @staticmethod
+    def _rate_limit_windows(summary: CodexUsageSummary):
+        windows = []
+        for used_percent, window_minutes, resets_at in (
             (
-                _format_codex_window(primary_window).upper(),
-                _fmt_percent(summary.primary_limit_used_percent),
-                QColor(16, 163, 127),
+                summary.primary_limit_used_percent,
+                summary.primary_limit_window_minutes,
+                summary.primary_limit_resets_at,
             ),
             (
-                _format_codex_window(secondary_window).upper(),
-                _fmt_percent(summary.secondary_limit_used_percent),
-                QColor(16, 163, 127),
+                summary.secondary_limit_used_percent,
+                summary.secondary_limit_window_minutes,
+                summary.secondary_limit_resets_at,
             ),
+        ):
+            if used_percent is None and not window_minutes and not resets_at:
+                continue
+            windows.append(
+                (
+                    _format_codex_window(window_minutes).upper(),
+                    used_percent,
+                    resets_at,
+                )
+            )
+        return windows
+
+    @classmethod
+    def _collapsed_metrics(cls, summary: CodexUsageSummary):
+        metrics = [
+            (label, _fmt_percent(used_percent), QColor(16, 163, 127))
+            for label, used_percent, _resets_at in cls._rate_limit_windows(summary)
+        ]
+        metrics.append(
             (
                 "LAST",
                 _fmt_tokens(summary.latest_thread_tokens),
                 QColor(180, 180, 200),
-            ),
+            )
+        )
+        return metrics
+
+    @classmethod
+    def _expanded_details(cls, summary: CodexUsageSummary):
+        details = [
+            (
+                f"{label} LIMIT",
+                f"{_fmt_percent(used_percent)} used · "
+                f"resets {_format_epoch_remaining(resets_at)}",
+            )
+            for label, used_percent, resets_at in cls._rate_limit_windows(summary)
         ]
+        details.extend(
+            [
+                ("SOURCE", cls._rate_limit_source_label(summary)),
+                ("PLAN", summary.plan_type or "unknown"),
+                ("THREAD", summary.latest_thread_title or "Untitled thread"),
+                ("MODEL", summary.latest_model or "unknown"),
+                ("UPDATED", cls._format_updated_at(summary)),
+                ("CWD", summary.latest_cwd or "unknown"),
+                (
+                    "TOKENS",
+                    f"latest {_fmt_tokens(summary.latest_thread_tokens)} · "
+                    f"total {_fmt_tokens(summary.total_tokens)} · "
+                    f"{summary.thread_count} threads",
+                ),
+            ]
+        )
+        return details
 
     def mousePressEvent(self, event):
         self.toggle_expanded()
@@ -2336,13 +2687,19 @@ class CodexUsageRow(QWidget):
         fm = p.fontMetrics()
         y = 14
         arrow = "▾" if self._expanded else "▸"
-
-        title_color = QColor(16, 163, 127) if self._available else QColor(100, 100, 120)
-        p.setPen(title_color)
-        p.drawText(4, y, f"CODEX {arrow}")
-
-        title_w = fm.horizontalAdvance("CODEX ▾") + 12
         summary = self._summary or CodexUsageSummary()
+
+        if summary.rate_limit_source == "cached":
+            title_color = QColor(245, 158, 11)
+        else:
+            title_color = (
+                QColor(16, 163, 127) if self._available else QColor(100, 100, 120)
+            )
+        p.setPen(title_color)
+        title_text = self._title_text(summary, arrow)
+        p.drawText(4, y, title_text)
+
+        title_w = fm.horizontalAdvance(title_text) + 12
         metrics = self._collapsed_metrics(summary)
         col_w = max(1, (w - title_w - 8) // len(metrics))
 
@@ -2355,31 +2712,7 @@ class CodexUsageRow(QWidget):
             p.drawText(value_x, y, value_text if self._available else "—")
 
         if self._expanded:
-            primary_label = _format_codex_window(summary.primary_limit_window_minutes).upper()
-            secondary_label = _format_codex_window(summary.secondary_limit_window_minutes).upper()
-            details = [
-                (
-                    f"{primary_label} LIMIT",
-                    f"{_fmt_percent(summary.primary_limit_used_percent)} used · "
-                    f"resets {_format_epoch_remaining(summary.primary_limit_resets_at)}",
-                ),
-                (
-                    f"{secondary_label} LIMIT",
-                    f"{_fmt_percent(summary.secondary_limit_used_percent)} used · "
-                    f"resets {_format_epoch_remaining(summary.secondary_limit_resets_at)}",
-                ),
-                ("PLAN", summary.plan_type or "unknown"),
-                ("THREAD", summary.latest_thread_title or "Untitled thread"),
-                ("MODEL", summary.latest_model or "unknown"),
-                ("UPDATED", self._format_updated_at(summary)),
-                ("CWD", summary.latest_cwd or "unknown"),
-                (
-                    "TOKENS",
-                    f"latest {_fmt_tokens(summary.latest_thread_tokens)} · "
-                    f"total {_fmt_tokens(summary.total_tokens)} · "
-                    f"{summary.thread_count} threads",
-                ),
-            ]
+            details = self._expanded_details(summary)
             detail_font = QFont("sans-serif", 8)
             detail_font.setWeight(QFont.Weight.Normal)
             p.setFont(detail_font)
@@ -3464,7 +3797,7 @@ class ClaudeWidget(QWidget):
         self._sys_timer.timeout.connect(self._update_system_metrics)
         self._sys_timer.start(SYSTEM_METRICS_INTERVAL_MS)
 
-        # Codex usage timer - lightweight local sqlite read
+        # Codex usage timer - short local app-server read plus SQLite totals
         self._codex_timer = QTimer(self)
         self._codex_timer.timeout.connect(self._refresh_codex_usage)
         self._codex_timer.start(CODEX_REFRESH_MS)

@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -20,8 +21,11 @@ from claude_widget import (
     CodexUsageRow,
     CodexUsageSummary,
     ModelLimit,
+    _parse_codex_app_server_rate_limit,
+    _parse_codex_rate_limit_event,
     _parse_model_limits,
     load_last_usage,
+    read_codex_rate_limit,
     read_latest_codex_rate_limit,
     read_codex_usage_summary,
     save_last_usage,
@@ -597,6 +601,249 @@ class WidgetUiTest(unittest.TestCase):
             [("5H", "37.5%"), ("7D", "12.0%"), ("LAST", "12.3K")],
         )
 
+    def test_codex_usage_row_only_formats_present_rate_limit_window(self):
+        row = CodexUsageRow()
+        summary = CodexUsageSummary(
+            latest_thread_tokens=12_345,
+            primary_limit_used_percent=70.0,
+            primary_limit_window_minutes=10080,
+            primary_limit_resets_at=1_786_159_934,
+            secondary_limit_used_percent=None,
+            secondary_limit_window_minutes=0,
+            secondary_limit_resets_at=0,
+        )
+
+        row.set_data(summary)
+        metrics = row._collapsed_metrics(summary)
+        details = row._expanded_details(summary)
+
+        self.assertEqual(
+            [(label, value) for label, value, _color in metrics],
+            [("7D", "70.0%"), ("LAST", "12.3K")],
+        )
+        self.assertEqual([label for label, _value in details if "LIMIT" in label], ["7D LIMIT"])
+        self.assertEqual(row.toolTip().count("7d limit:"), 1)
+
+    def test_codex_usage_row_marks_cached_rate_limit_source(self):
+        now_ts = time.time()
+        row = CodexUsageRow()
+        summary = CodexUsageSummary(
+            latest_thread_tokens=12_345,
+            primary_limit_used_percent=70.0,
+            primary_limit_window_minutes=10080,
+            primary_limit_resets_at=int(now_ts + 3600),
+            rate_limit_source="cached",
+            rate_limit_observed_at=now_ts - 30,
+        )
+
+        row.set_data(summary)
+        details = dict(row._expanded_details(summary))
+
+        self.assertEqual(row._title_text(summary, "▸"), "CODEX CACHE ▸")
+        self.assertIn("cached local session fallback", row.toolTip())
+        self.assertIn("cached local session fallback", details["SOURCE"])
+
+    def test_parse_live_codex_rate_limit_selects_base_camel_case_bucket(self):
+        response = {
+            "id": 2,
+            "result": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 99,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1,
+                    },
+                    "secondary": None,
+                },
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 70,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1_786_159_934,
+                        },
+                        "secondary": None,
+                        "planType": "pro",
+                        "rateLimitReachedType": None,
+                    },
+                    "codex_bengalfox": {
+                        "limitId": "codex_bengalfox",
+                        "primary": {
+                            "usedPercent": 0,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1_786_409_468,
+                        },
+                        "secondary": None,
+                    },
+                },
+            },
+        }
+
+        rate_limit = _parse_codex_app_server_rate_limit(response)
+
+        self.assertIsNotNone(rate_limit)
+        self.assertEqual(rate_limit.primary_used_percent, 70.0)
+        self.assertEqual(rate_limit.primary_window_minutes, 10080)
+        self.assertEqual(rate_limit.primary_resets_at, 1_786_159_934)
+        self.assertIsNone(rate_limit.secondary_used_percent)
+        self.assertEqual(rate_limit.plan_type, "pro")
+
+    def test_parse_live_codex_rate_limit_supports_two_windows(self):
+        response = {
+            "result": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 37.5,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1_767_318_000,
+                    },
+                    "secondary": {
+                        "usedPercent": 12,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1_767_900_000,
+                    },
+                    "planType": "pro",
+                }
+            }
+        }
+
+        rate_limit = _parse_codex_app_server_rate_limit(response)
+
+        self.assertIsNotNone(rate_limit)
+        self.assertEqual(rate_limit.primary_window_minutes, 300)
+        self.assertEqual(rate_limit.secondary_used_percent, 12.0)
+        self.assertEqual(rate_limit.secondary_window_minutes, 10080)
+
+    def test_read_codex_rate_limit_falls_back_when_subprocess_fails(self):
+        resets_at = int(time.time() + 3600)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir)
+            (sessions_dir / "cached.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "limit_id": "codex",
+                                "primary": {
+                                    "used_percent": 44.0,
+                                    "window_minutes": 300,
+                                    "resets_at": resets_at,
+                                },
+                                "secondary": None,
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(claude_widget.subprocess, "Popen", side_effect=OSError):
+                rate_limit = read_codex_rate_limit(sessions_dir=sessions_dir)
+
+        self.assertIsNotNone(rate_limit)
+        self.assertEqual(rate_limit.primary_used_percent, 44.0)
+
+    def test_read_codex_rate_limit_falls_back_on_malformed_live_response(self):
+        resets_at = int(time.time() + 3600)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir)
+            (sessions_dir / "cached.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "limit_id": "codex",
+                                "primary": {
+                                    "used_percent": 31.0,
+                                    "window_minutes": 10080,
+                                    "resets_at": resets_at,
+                                },
+                                "secondary": None,
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            malformed = {
+                "id": 2,
+                "result": {
+                    "rateLimits": {
+                        "limitId": "codex",
+                        "primary": "not-an-object",
+                        "secondary": None,
+                    }
+                },
+            }
+            with patch.object(
+                claude_widget,
+                "_request_codex_app_server_rate_limits",
+                return_value=malformed,
+            ):
+                rate_limit = read_codex_rate_limit(sessions_dir=sessions_dir)
+
+        self.assertIsNotNone(rate_limit)
+        self.assertEqual(rate_limit.primary_used_percent, 31.0)
+
+    def test_read_latest_codex_rate_limit_rejects_stale_event_timestamp(self):
+        now_ts = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir)
+            (sessions_dir / "stale.jsonl").write_text(
+                '{"timestamp":1799999699,"type":"event_msg","payload":{'
+                '"type":"token_count","rate_limits":{"limit_id":"codex",'
+                '"primary":{"used_percent":44.0,"window_minutes":300,'
+                '"resets_at":1800003600},"secondary":null}}}\n',
+                encoding="utf-8",
+            )
+
+            rate_limit = read_latest_codex_rate_limit(
+                sessions_dir=sessions_dir, now_ts=now_ts
+            )
+
+        self.assertIsNone(rate_limit)
+
+    def test_read_latest_codex_rate_limit_rejects_expired_reset(self):
+        now_ts = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir)
+            (sessions_dir / "expired.jsonl").write_text(
+                '{"timestamp":1800000000,"type":"event_msg","payload":{'
+                '"type":"token_count","rate_limits":{"limit_id":"codex",'
+                '"primary":{"used_percent":44.0,"window_minutes":300,'
+                '"resets_at":1799999999},"secondary":null}}}\n',
+                encoding="utf-8",
+            )
+
+            rate_limit = read_latest_codex_rate_limit(
+                sessions_dir=sessions_dir, now_ts=now_ts
+            )
+
+        self.assertIsNone(rate_limit)
+
+    def test_parse_cached_codex_rate_limit_safely_handles_malformed_numbers(self):
+        rate_limit = _parse_codex_rate_limit_event(
+            '{"timestamp":1800000000,"type":"event_msg","payload":{'
+            '"type":"token_count","rate_limits":{"limit_id":"codex",'
+            '"primary":{"used_percent":44.0,"window_minutes":"bad",'
+            '"resets_at":{"bad":true}},"secondary":{"used_percent":12.0,'
+            '"window_minutes":[],"resets_at":"also-bad"}}}}'
+        )
+
+        self.assertIsNotNone(rate_limit)
+        self.assertEqual(rate_limit.primary_window_minutes, 0)
+        self.assertEqual(rate_limit.primary_resets_at, 0)
+        self.assertEqual(rate_limit.secondary_window_minutes, 0)
+        self.assertEqual(rate_limit.secondary_resets_at, 0)
+
     def test_read_latest_codex_rate_limit_uses_newest_session_event(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sessions_dir = Path(tmpdir)
@@ -620,7 +867,9 @@ class WidgetUiTest(unittest.TestCase):
             os.utime(stale, (1_767_000_000, 1_767_000_000))
             os.utime(fresh, (1_767_100_000, 1_767_100_000))
 
-            rate_limit = read_latest_codex_rate_limit(sessions_dir=sessions_dir)
+            rate_limit = read_latest_codex_rate_limit(
+                sessions_dir=sessions_dir, now_ts=1_767_100_100
+            )
 
         self.assertIsNotNone(rate_limit)
         self.assertEqual(rate_limit.primary_used_percent, 37.5)
@@ -690,15 +939,20 @@ class WidgetUiTest(unittest.TestCase):
             (sessions_dir / "fresh.jsonl").write_text(
                 '{"type":"event_msg","payload":{"type":"token_count",'
                 '"rate_limits":{"limit_id":"codex","primary":{"used_percent":44.0,'
-                '"window_minutes":300,"resets_at":1767318000},"secondary":null,'
+                '"window_minutes":300,"resets_at":1900000000},"secondary":null,'
                 '"plan_type":"pro"}}}\n',
                 encoding="utf-8",
             )
 
-            summary = read_codex_usage_summary(
-                db_path=db_path,
-                sessions_dir=sessions_dir,
-            )
+            with patch.object(
+                claude_widget,
+                "_request_codex_app_server_rate_limits",
+                return_value=None,
+            ):
+                summary = read_codex_usage_summary(
+                    db_path=db_path,
+                    sessions_dir=sessions_dir,
+                )
 
         self.assertIsNotNone(summary)
         self.assertEqual(summary.thread_count, 2)
@@ -708,6 +962,7 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(summary.latest_model, "gpt-5.5")
         self.assertEqual(summary.latest_cwd, "/tmp/new")
         self.assertEqual(summary.primary_limit_used_percent, 44.0)
+        self.assertEqual(summary.rate_limit_source, "cached")
 
     def test_codex_usage_worker_emits_reader_result(self):
         expected = CodexUsageSummary(
