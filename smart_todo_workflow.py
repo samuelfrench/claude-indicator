@@ -213,11 +213,15 @@ class WorkflowStore:
         key: str,
         until: date,
         *,
+        today: date | None = None,
         legacy_key: str | None = None,
         replacement_keys: tuple[str, ...] = (),
     ) -> None:
         self._require_content_key(key)
-        if not isinstance(until, date) or until <= date.today():
+        effective_today = today or date.today()
+        if not isinstance(effective_today, date):
+            raise ValueError("Workflow snoozes require a valid date context.")
+        if not isinstance(until, date) or until <= effective_today:
             raise ValueError("Workflow snoozes must be for a future date.")
         self._validate_legacy_expansion(legacy_key, replacement_keys)
         self._mutate(lambda state: self._snooze(

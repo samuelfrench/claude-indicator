@@ -2020,7 +2020,7 @@ class SmartTodoDialog(QDialog):
             elif operation == "unpin":
                 store.unpin(key, **migration)
             elif operation == "snooze" and until is not None:
-                store.snooze(key, until, **migration)
+                store.snooze(key, until, today=self._scan_today, **migration)
             elif operation == "wake":
                 store.wake(key, **migration)
             else:
