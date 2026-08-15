@@ -1,16 +1,24 @@
 # Claude Indicator
 
 ## Project Description
-Translucent PySide6 desktop widget showing Claude Code Max subscription usage limits plus local Codex usage-limit percentages, with color-coded progress bars, a 24-hour usage graph, stats row, and countdown timers.
+Translucent PySide6 desktop widget combining Claude Code Max and Codex usage,
+DeepSeek API spend/credit, and compact local Ollama/GPU/ComfyUI status.
 
 ## Architecture
 - **Single-file app**: `claude_widget.py` contains all logic (client, UI, timers, history)
 - **ClaudeUsageClient**: Reads OAuth token from `~/.claude/.credentials.json`, fetches `GET https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` header
-- **ClaudeWidget**: Frameless, translucent, always-on-top PySide6 widget with drag support (340x420)
+- **ClaudeWidget**: Frameless, translucent, always-on-top PySide6 widget with drag support and fixed 340px width
 - **UsageBar**: Custom-painted progress bars with color coding (green/yellow/orange/red)
 - **UsageGraph**: QPainter line chart showing 5-hour utilization over last 24 hours with gradient fill, grid lines, and 80% threshold
 - **StatsRow**: Compact custom-painted row with AVG, PEAK, TREND, and EXTRA usage stats
 - **CodexUsageRow**: Reads live Codex rate limits through the local `codex app-server` JSONL protocol (`account/rateLimits/read`), falls back only to unexpired cached `~/.codex/sessions/**/*.jsonl` token-count events at most five minutes old, visibly marks cached values, and combines them with `~/.codex/state_*.sqlite` latest-thread/lifetime totals; renders only the rate-limit windows the server provides
+- **DeepSeekUsageRow**: Sums numeric DeepSeek assistant-message costs from the read-only local OpenCode SQLite ledger for rolling 24-hour spend and reads current credit from official `GET /user/balance` in a background thread
+- **LocalAISection**: Collapsed Ollama/GPU summary with expandable loaded-model, GPU/VRAM, ComfyUI, and local-config Ollama task-loop details; it does not query DynamoDB
+- **DeepSeek balance history**: Currency-separated snapshots in `~/.claude/deepseek_balance_history.json` use a strict schema, mode `0600`, fsync, and atomic replacement
+- **Expansion geometry**: Usage History and Local AI are mutually exclusive so
+  the fixed-width panel remains usable on 800px-tall screens; DeepSeek remains
+  independently expandable. `ClaudeWidget.adjustSize()` clamps the full frame
+  into the primary screen's available geometry after every size change.
 - **UsageHistory**: Persists data points to `~/.claude/usage_history.json` (max 288 points / 24h), atomic writes via os.replace()
 - **Dynamic plan name**: Title detects CLAUDE MAX (opus present), CLAUDE PRO (sonnet present), or CLAUDE (neither)
 - Token refresh via `https://platform.claude.com/v1/oauth/token` with client_id `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
@@ -19,9 +27,18 @@ Translucent PySide6 desktop widget showing Claude Code Max subscription usage li
 - May require `LD_LIBRARY_PATH=<path-to-miniconda>/lib` on some systems for xcb-cursor
 - Autostart configured at `~/.config/autostart/claude-widget.desktop`
 - Dependencies: PySide6, requests
+- DeepSeek credentials resolve from `DEEPSEEK_API_KEY` first, then the existing
+  owner-controlled mode-`0600` OpenCode auth file; credentials are never stored
+  in history, logs, labels, or tooltips
 
 ## Key Decisions
 - Uses `/api/oauth/usage` endpoint (not rate limit headers from `/v1/messages` which are locked to Claude Code sessions)
 - OAuth tokens with `user:inference` scope work with this endpoint when `anthropic-beta: oauth-2025-04-20` header is included
 - History stored in `~/.claude/usage_history.json` with atomic writes (write to .tmp then os.replace)
 - Graph uses purple accent (#8b5cf6) with gradient fill and red dashed 80% threshold line
+- DeepSeek has no rolling-spend API: local OpenCode numeric request cost is the
+  immediate 24-hour source; protected balance decreases are a marked fallback.
+- Last-known DeepSeek credit is shown for at most 15 minutes and always includes
+  its snapshot age; older snapshots remain history-only and are not displayed.
+- Clawd task-loop rows remain local-configuration-only. The unified Ollama
+  section reuses those results and adds no boto3/DynamoDB polling.

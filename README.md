@@ -1,6 +1,7 @@
 # Claude Indicator
 
-A translucent desktop widget for Linux that displays your Claude Code Max subscription usage in real time plus your local Codex usage-limit percentage. Shows color-coded progress bars for rate limit windows with live countdown timers.
+A translucent Linux desktop widget combining Claude and Codex usage, DeepSeek
+API cost/credit, and local Ollama/GPU/ComfyUI status in one panel.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![PySide6](https://img.shields.io/badge/PySide6-6.6+-green)
@@ -11,6 +12,8 @@ A translucent desktop widget for Linux that displays your Claude Code Max subscr
 - **Real-time usage tracking** — monitors 5-hour and 7-day rate limit windows
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
 - **Codex limit percentage** — reads current limits through local `codex app-server`, renders whichever one or two windows are present, and combines them with latest-thread and lifetime totals from local Codex state
+- **DeepSeek spend and credit** — shows OpenCode-recorded DeepSeek cost from the rolling past 24 hours plus current account credit from DeepSeek's official balance endpoint
+- **Embedded Local AI section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
@@ -25,6 +28,8 @@ The widget displays a dark translucent overlay with:
 - "CLAUDE MAX" header in warm gold
 - Up to 3 progress bars (5-Hour Window, 7-Day Window, Model-specific 7-Day)
 - A compact `CODEX` row with current Codex limit percentage and local usage totals
+- A compact `DEEPSEEK` row with `24H` spend and `CREDIT` always visible
+- A collapsed `LOCAL AI` row with Ollama/GPU summary and expandable details
 - `CRON JOBS` row that collapses to one line and expands to show per-job status and timing
 - Percentage and reset countdown on each bar
 - Last-updated timestamp and manual refresh button
@@ -131,11 +136,38 @@ this computer. Smart TODOs adds no API calls, hosted service, subscription, or
 billable usage. It adds no notification, email, cloud synchronization, or
 public endpoint.
 
+## DeepSeek accounting boundary
+
+The `24H` amount is the sum of numeric `message.data.cost` values for DeepSeek
+assistant messages recorded in the local OpenCode database during the rolling
+past 24 hours. Its tooltip reports ledger coverage and limits the claim to
+OpenCode-recorded traffic; calls made by other clients are not included. The
+database is opened read-only, and message content is never selected or shown.
+
+`CREDIT` comes from `GET https://api.deepseek.com/user/balance`. Successful
+reads append only timestamped currency balances to
+`~/.claude/deepseek_balance_history.json` with mode-`0600` atomic replacement.
+If the local cost ledger is unavailable, observed balance decreases provide a
+clearly marked estimate. Top-ups are not counted as spend, currencies are never
+combined, partial coverage is disclosed, and cached credit is marked `LAST`.
+Cached credit is hidden after 15 minutes; while visible, its age is shown in the
+expanded row and tooltip.
+
+To keep the 340px panel usable on shorter screens, **Usage History** and
+**Local AI** are mutually exclusive expandable sections. Opening either one
+collapses the other; the compact DeepSeek details remain independently usable.
+After any content-size change, the window is repositioned as needed so its full
+frame remains inside the primary screen's available work area.
+
 ## Prerequisites
 
 - **Claude Code Max subscription** — the widget reads usage data from Anthropic's API
 - **Claude Code CLI** — must be installed and logged in (the widget reads OAuth credentials from `~/.claude/.credentials.json`)
 - **Codex CLI** — `codex` must be installed, on `PATH`, and logged in so local `codex app-server` can read the account rate limits
+- **DeepSeek API key** — set `DEEPSEEK_API_KEY`, or use OpenCode's existing
+  `~/.local/share/opencode/auth.json`; the fallback must be an owner-controlled,
+  non-symlink regular file with mode `0600`
+- **Ollama** at `127.0.0.1:11434` and **ComfyUI** at `127.0.0.1:8188` are optional
 - **Python 3.10+**
 - **Linux with X11 or Wayland** (tested on Ubuntu/GNOME)
 
@@ -206,6 +238,8 @@ for the local TODO domain and dialog, with these components:
 | `FetchWorker` | QThread that fetches usage data off the main thread |
 | `UsageBar` | Custom-painted widget for a single progress bar with label, percentage, and countdown |
 | `CodexUsageRow` | Custom-painted summary row backed by live local app-server limits plus local Codex SQLite totals |
+| `DeepSeekUsageRow` | Rolling local OpenCode cost plus official current DeepSeek credit, with source disclosure |
+| `LocalAISection` | Compact expandable Ollama models, GPU/VRAM, ComfyUI, and local task-loop status |
 | `CronJobsWidget` | Collapsible row showing per-job cron health, last run age, and next run estimate |
 | `CronJobsFetchWorker`, `CronJobInfo` | Background worker and model used to parse crontab + journal history |
 | `Cron parsing helpers` | Parsers for `crontab -l`, schedule matching, and journal matching |

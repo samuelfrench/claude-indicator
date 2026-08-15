@@ -42,9 +42,9 @@ def test_workflow_store_writes_sorted_unique_records_without_task_text(tmp_path)
     store.pin(SOURCE_B)
     store.pin(SOURCE_A)
     store.pin(SOURCE_A)
-    store.snooze(SOURCE_B, date(2026, 8, 7))
-    store.snooze(SOURCE_A, date(2026, 8, 1))
-    store.snooze(SOURCE_A, date(2026, 8, 1))
+    store.snooze(SOURCE_B, date(2026, 8, 7), today=TODAY)
+    store.snooze(SOURCE_A, date(2026, 8, 1), today=TODAY)
+    store.snooze(SOURCE_A, date(2026, 8, 1), today=TODAY)
     _state, _tasks = store.reconcile(
         (observation(LOCATION_B, SOURCE_B), observation(LOCATION_A, SOURCE_A)), TODAY
     )
@@ -409,7 +409,7 @@ def test_reconcile_prunes_expired_snoozes_but_keeps_future_snoozes_and_missing_c
 def test_workflow_store_unpin_wake_and_invalid_mutations_leave_state_valid(tmp_path):
     store = smart_todo_workflow.WorkflowStore(tmp_path / "workflow.json")
     store.pin(MANAGED_A)
-    store.snooze(MANAGED_A, date(2026, 8, 1))
+    store.snooze(MANAGED_A, date(2026, 8, 1), today=TODAY)
     store.unpin(MANAGED_A)
     store.wake(MANAGED_A)
 

@@ -1,16 +1,19 @@
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 import claude_widget
@@ -20,6 +23,16 @@ from claude_widget import (
     CodexUsageWorker,
     CodexUsageRow,
     CodexUsageSummary,
+    BalanceSnapshot,
+    ComfyUIStatus,
+    DeepSeekUsageRow,
+    DeepSeekUsageSummary,
+    LoadedModel,
+    LocalAISection,
+    MoneyBalance,
+    OllamaStatus,
+    SystemMetrics,
+    TaskLoopInfo,
     ModelLimit,
     _parse_codex_app_server_rate_limit,
     _parse_codex_rate_limit_event,
@@ -28,6 +41,12 @@ from claude_widget import (
     read_codex_rate_limit,
     read_latest_codex_rate_limit,
     read_codex_usage_summary,
+    balance_decrease_spend,
+    load_deepseek_history,
+    parse_deepseek_balance,
+    read_deepseek_api_key,
+    read_opencode_deepseek_spend,
+    record_deepseek_snapshot,
     save_last_usage,
     UsageData,
     UsageEntry,
@@ -336,6 +355,9 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_fetch_cron_jobs", lambda self: None),
             patch.object(ClaudeWidget, "_update_system_metrics", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_deepseek_usage", lambda self: None),
+            patch.object(ClaudeWidget, "_fetch_ollama", lambda self: None),
+            patch.object(ClaudeWidget, "_fetch_comfyui", lambda self: None),
             patch.object(claude_widget, "SmartTodoDialog", dialog_factory),
         ]
         for active_patch in patches:
@@ -976,6 +998,352 @@ class WidgetUiTest(unittest.TestCase):
         worker.run()
 
         self.assertEqual(received, [expected])
+
+    def test_deepseek_api_key_prefers_environment_and_reads_protected_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth_path = Path(tmpdir) / "auth.json"
+            auth_path.write_text('{"deepseek":{"type":"api","key":"file-key"}}')
+            auth_path.chmod(0o600)
+
+            self.assertEqual(
+                read_deepseek_api_key(
+                    auth_path=auth_path, environ={"DEEPSEEK_API_KEY": "env-key"}
+                ),
+                "env-key",
+            )
+            self.assertEqual(
+                read_deepseek_api_key(auth_path=auth_path, environ={}),
+                "file-key",
+            )
+
+            auth_path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                read_deepseek_api_key(auth_path=auth_path, environ={})
+
+    def test_deepseek_api_key_rejects_symlink_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "target.json"
+            target.write_text('{"deepseek":{"key":"secret"}}')
+            target.chmod(0o600)
+            link = Path(tmpdir) / "auth.json"
+            link.symlink_to(target)
+            with self.assertRaises(ValueError):
+                read_deepseek_api_key(auth_path=link, environ={})
+
+    def test_parse_deepseek_balance_uses_official_string_money_schema(self):
+        available, balances = parse_deepseek_balance(
+            {
+                "is_available": True,
+                "balance_infos": [
+                    {
+                        "currency": "USD",
+                        "total_balance": "47.63",
+                        "granted_balance": "2.00",
+                        "topped_up_balance": "45.63",
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(available)
+        self.assertEqual(balances[0].total, Decimal("47.63"))
+        with self.assertRaises(ValueError):
+            parse_deepseek_balance(
+                {
+                    "is_available": True,
+                    "balance_infos": [
+                        {
+                            "currency": "USD",
+                            "total_balance": "NaN",
+                            "granted_balance": "0",
+                            "topped_up_balance": "0",
+                        }
+                    ],
+                }
+            )
+
+    def test_opencode_deepseek_spend_reads_only_matching_valid_cost_rows(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                rows = [
+                    ("old", int((now - 25 * 3600) * 1000), {"role": "assistant", "providerID": "deepseek", "cost": 9}),
+                    ("a", int((now - 60) * 1000), {"role": "assistant", "providerID": "deepseek", "cost": 1.25}),
+                    ("b", int((now - 30) * 1000), {"role": "assistant", "providerID": "deepseek", "cost": 0.375}),
+                    ("user", int((now - 20) * 1000), {"role": "user", "providerID": "deepseek", "cost": 7}),
+                    ("other", int((now - 10) * 1000), {"role": "assistant", "providerID": "openai", "cost": 8}),
+                ]
+                conn.executemany(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    [(row_id, created, json.dumps(data)) for row_id, created, data in rows],
+                )
+                conn.execute(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    ("malformed", int((now - 5) * 1000), "{not-json"),
+                )
+
+            spent, count, coverage = read_opencode_deepseek_spend(
+                db_path=db_path, now=now
+            )
+
+        self.assertEqual(spent, Decimal("1.625"))
+        self.assertEqual(count, 2)
+        self.assertEqual(coverage, 24 * 3600)
+
+    def test_opencode_deepseek_spend_rejects_missing_or_nonnumeric_cost(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                conn.execute(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    ("bad", int(now * 1000), json.dumps({"role": "assistant", "providerID": "deepseek", "cost": "1.00"})),
+                )
+            with self.assertRaises(ValueError):
+                read_opencode_deepseek_spend(db_path=db_path, now=now)
+
+    def test_deepseek_balance_history_is_private_atomic_and_topup_safe(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "history.json"
+            balances = [MoneyBalance("USD", Decimal("50"), Decimal("0"), Decimal("50"))]
+            record_deepseek_snapshot(balances, now=now - 25 * 3600, path=path)
+            record_deepseek_snapshot(
+                [MoneyBalance("USD", Decimal("45"), Decimal("0"), Decimal("45"))],
+                now=now - 20 * 3600,
+                path=path,
+            )
+            record_deepseek_snapshot(
+                [MoneyBalance("USD", Decimal("65"), Decimal("0"), Decimal("65"))],
+                now=now - 10 * 3600,
+                path=path,
+            )
+            points = record_deepseek_snapshot(
+                [MoneyBalance("USD", Decimal("62"), Decimal("0"), Decimal("62"))],
+                now=now,
+                path=path,
+            )
+            spent, coverage = balance_decrease_spend(points, now=now, currency="USD")
+
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(load_deepseek_history(path), points)
+        self.assertEqual(spent, Decimal("8"))
+        self.assertEqual(coverage, 24 * 3600)
+
+    def test_deepseek_row_discloses_local_only_spend_and_live_credit(self):
+        row = DeepSeekUsageRow()
+        summary = DeepSeekUsageSummary(
+            balances=[MoneyBalance("USD", Decimal("47.63"), Decimal("0"), Decimal("47.63"))],
+            balance_source="live",
+            spent_24h=Decimal("2.61694"),
+            spend_source="opencode",
+            spend_coverage_s=24 * 3600,
+            spend_message_count=1170,
+        )
+        row.set_data(summary)
+
+        self.assertEqual(row._spend_text(summary), "$2.62")
+        self.assertEqual(row._credit_text(summary), "$47.63")
+        self.assertIn("OpenCode-recorded traffic only", row.toolTip())
+        collapsed = row.height()
+
+        class Event:
+            def accept(self):
+                pass
+
+        row.mousePressEvent(Event())
+        self.assertGreater(row.height(), collapsed)
+
+    def test_deepseek_snapshot_credit_has_bounded_age_and_discloses_age(self):
+        now = time.time()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "history.json"
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+            record_deepseek_snapshot(
+                [MoneyBalance("USD", Decimal("12.34"), Decimal("0"), Decimal("12.34"))],
+                now=now - 120,
+                path=history_path,
+            )
+            with patch.object(claude_widget, "fetch_deepseek_balance", side_effect=OSError):
+                recent = claude_widget.read_deepseek_usage(
+                    now=now,
+                    history_path=history_path,
+                    db_path=db_path,
+                    environ={"DEEPSEEK_API_KEY": "dummy"},
+                )
+
+            record_deepseek_snapshot(
+                [MoneyBalance("USD", Decimal("11.11"), Decimal("0"), Decimal("11.11"))],
+                now=now,
+                path=history_path,
+            )
+            stale_now = now + claude_widget.DEEPSEEK_SNAPSHOT_MAX_AGE_S + 1
+            with patch.object(claude_widget, "fetch_deepseek_balance", side_effect=OSError):
+                stale = claude_widget.read_deepseek_usage(
+                    now=stale_now,
+                    history_path=history_path,
+                    db_path=db_path,
+                    environ={"DEEPSEEK_API_KEY": "dummy"},
+                )
+
+        self.assertEqual(recent.balance_source, "snapshot")
+        self.assertEqual(recent.balances[0].total, Decimal("12.34"))
+        row = DeepSeekUsageRow()
+        with patch.object(claude_widget.time, "time", return_value=now):
+            row.set_data(recent)
+        self.assertIn("2m old", row.toolTip())
+        self.assertEqual(stale.balance_source, "")
+        self.assertEqual(stale.balances, [])
+
+    def test_local_ai_section_is_compact_expandable_and_filters_local_ollama_loops(self):
+        section = LocalAISection()
+        section.set_ollama(
+            OllamaStatus(running=True, version="0.11.0"),
+            [LoadedModel(name="qwen:latest", size_vram=4 * 1024**3)],
+            4,
+        )
+        section.set_gpu(
+            SystemMetrics(
+                gpu_available=True,
+                gpu_pct=25,
+                gpu_mem_used_gb=4,
+                gpu_mem_total_gb=24,
+                gpu_temp=52,
+            )
+        )
+        section.set_comfyui(ComfyUIStatus(running=True))
+        section.set_task_loops(
+            [
+                TaskLoopInfo("local", "ollama/qwen", "high", 10),
+                TaskLoopInfo("cloud", "claude-opus", "high", 10),
+            ]
+        )
+        collapsed = section.height()
+
+        class Event:
+            def accept(self):
+                pass
+
+        section.mousePressEvent(Event())
+
+        self.assertEqual([loop.name for loop in section._task_loops], ["local"])
+        self.assertGreater(section.height(), collapsed)
+        self.assertLess(section.height(), 300)
+        self.assertIn("no DynamoDB query", section.toolTip())
+
+    def test_unified_widget_contains_deepseek_and_local_ai_rows(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+
+        self.assertIsInstance(widget._deepseek_row, DeepSeekUsageRow)
+        self.assertIsInstance(widget._local_ai_section, LocalAISection)
+        self.assertEqual(widget.width(), 340)
+
+    def test_tall_sections_are_mutually_exclusive_and_fit_800px_screen(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        widget.show()
+        widget._local_ai_section.set_ollama(
+            OllamaStatus(running=True),
+            [LoadedModel(name=f"model-{index}") for index in range(3)],
+            3,
+        )
+        widget._local_ai_section.set_task_loops(
+            [TaskLoopInfo(f"task-{index}", "ollama/qwen", "high", 10) for index in range(3)]
+        )
+
+        widget._local_ai_section.set_expanded(True)
+        widget._deepseek_row.mousePressEvent(Mock())
+        widget.adjustSize()
+        QApplication.processEvents()
+
+        self.assertTrue(widget._local_ai_section.is_expanded())
+        self.assertFalse(widget._history_expanded)
+        self.assertLessEqual(widget.height(), 760)
+
+        widget._toggle_history()
+        widget.adjustSize()
+        QApplication.processEvents()
+
+        self.assertTrue(widget._history_expanded)
+        self.assertFalse(widget._local_ai_section.is_expanded())
+        self.assertLessEqual(widget.height(), 760)
+
+    def test_fable_and_max_expansions_reposition_inside_800px_work_area(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        widget.show()
+        screen = QApplication.primaryScreen()
+        self.assertIsNotNone(screen)
+        available = screen.availableGeometry()
+        self.assertEqual((available.width(), available.height()), (800, 800))
+        widget.move(available.right() - widget.width() + 1, available.top() + 40)
+        self.assertEqual(widget.frameGeometry().top(), available.top() + 40)
+
+        widget._usage = UsageData(
+            five_hour=UsageEntry(utilization=10),
+            seven_day=UsageEntry(utilization=20),
+            model_limits=[
+                ModelLimit(
+                    name="Fable",
+                    window="7-Day",
+                    entry=UsageEntry(utilization=30),
+                )
+            ],
+            fetched_at=time.time(),
+        )
+        widget._update_display()
+        widget._local_ai_section.set_ollama(
+            OllamaStatus(running=True),
+            [LoadedModel(name=f"model-{index}") for index in range(3)],
+            3,
+        )
+        widget._local_ai_section.set_task_loops(
+            [TaskLoopInfo(f"task-{index}", "ollama/qwen", "high", 10) for index in range(3)]
+        )
+        widget._local_ai_section.set_expanded(True)
+        widget._deepseek_row.mousePressEvent(Mock())
+        widget.adjustSize()
+        QApplication.processEvents()
+
+        frame = widget.frameGeometry()
+        self.assertLessEqual(widget.height(), available.height())
+        self.assertGreaterEqual(frame.left(), available.left())
+        self.assertGreaterEqual(frame.top(), available.top())
+        self.assertLessEqual(frame.right(), available.right())
+        self.assertLessEqual(frame.bottom(), available.bottom())
+
+        widget.move(frame.left(), available.bottom() - frame.height() + 21)
+        self.assertGreater(widget.frameGeometry().bottom(), available.bottom())
+        widget.clamp_to_available_screen()
+        self.assertLessEqual(widget.frameGeometry().bottom(), available.bottom())
+
+    def test_shutdown_stops_owned_timers_and_quiesces_new_workers_once(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        timer = QTimer(widget)
+        timer.start(1000)
+
+        class Worker:
+            def __init__(self):
+                self.requestInterruption = Mock()
+                self.wait = Mock(return_value=True)
+
+        workers = [Worker(), Worker(), Worker()]
+        widget._deepseek_worker, widget._ollama_worker, widget._comfyui_worker = workers
+
+        widget.shutdown()
+        widget.shutdown()
+
+        self.assertFalse(timer.isActive())
+        self.assertFalse(widget._tray_retry_timer.isActive())
+        for worker in workers:
+            worker.requestInterruption.assert_called_once_with()
+            worker.wait.assert_called_once()
+            timeout_ms = worker.wait.call_args.args[0]
+            self.assertGreaterEqual(timeout_ms, 0)
+            self.assertLessEqual(timeout_ms, 16_000)
 
 
 if __name__ == "__main__":

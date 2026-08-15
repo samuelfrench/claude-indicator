@@ -1888,7 +1888,7 @@ def test_legacy_duplicate_choices_orphan_after_ambiguous_peer_insertion(
         smart_todos.WorkflowStore(workflow_path).pin(legacy_key)
     elif legacy_kind == "snooze":
         smart_todos.WorkflowStore(workflow_path).snooze(
-            legacy_key, TODAY + timedelta(days=5)
+            legacy_key, TODAY + timedelta(days=5), today=TODAY
         )
     else:
         finished_path.write_text(

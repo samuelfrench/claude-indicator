@@ -7,11 +7,14 @@ import os
 import re
 import select
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import requests
@@ -42,7 +45,11 @@ from smart_todos import SmartTodoDialog
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 CODEX_HOME = Path.home() / ".codex"
+DEEPSEEK_AUTH_PATH = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+DEEPSEEK_HISTORY_PATH = Path.home() / ".claude" / "deepseek_balance_history.json"
+OPENCODE_DB_PATH = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -61,6 +68,9 @@ RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_GROUP_REFRESH_MS = 60 * 1000  # 60 seconds
 CODEX_REFRESH_MS = 60 * 1000  # 1 minute; avoid repeatedly starting app-server
+DEEPSEEK_REFRESH_MS = 5 * 60 * 1000  # balance endpoint and local cost ledger
+OLLAMA_REFRESH_MS = 10 * 1000
+COMFYUI_REFRESH_MS = 10 * 1000
 TRAY_RETRY_INTERVAL_MS = 5 * 1000  # retry while the desktop tray host is absent
 CRON_REFRESH_MS = 5 * 60 * 1000  # 5 minutes — crontab/journal state changes slowly
 CRON_JOURNAL_WINDOW_HOURS = 48
@@ -76,6 +86,11 @@ CODEX_CACHED_RATE_LIMIT_MAX_AGE_S = 5 * 60
 # Rate-limit backoff: /api/oauth/usage rate-limits aggressively (GH anthropics/claude-code#31637)
 RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
 RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
+OLLAMA_URL = "http://127.0.0.1:11434"
+COMFYUI_URL = "http://127.0.0.1:8188"
+DEEPSEEK_HISTORY_VERSION = 1
+DEEPSEEK_HISTORY_RETENTION_S = 8 * 24 * 3600
+DEEPSEEK_SNAPSHOT_MAX_AGE_S = 15 * 60
 
 
 def build_task_compass_icon(size: int = 64) -> QIcon:
@@ -390,6 +405,77 @@ class CodexRateLimit:
     observed_at: float = 0.0
 
 
+@dataclass(frozen=True)
+class MoneyBalance:
+    currency: str
+    total: Decimal
+    granted: Decimal
+    topped_up: Decimal
+
+
+@dataclass(frozen=True)
+class BalanceSnapshot:
+    timestamp: int
+    balances: dict[str, Decimal]
+
+
+@dataclass
+class DeepSeekUsageSummary:
+    balances: list[MoneyBalance] = field(default_factory=list)
+    balance_fetched_at: float = 0.0
+    balance_source: str = ""
+    balance_error: str = ""
+    spent_24h: Decimal | None = None
+    spend_currency: str = "USD"
+    spend_source: str = ""
+    spend_coverage_s: int = 0
+    spend_message_count: int = 0
+    spend_error: str = ""
+    is_available: bool | None = None
+
+
+@dataclass
+class OllamaStatus:
+    running: bool = False
+    version: str = ""
+    error: str = ""
+
+
+@dataclass
+class LoadedModel:
+    name: str = ""
+    size_vram: int = 0
+    parameter_size: str = ""
+    quantization: str = ""
+    expires_at: str = ""
+
+    @property
+    def vram_gb(self) -> float:
+        return self.size_vram / (1024 ** 3)
+
+    def time_until_expiry(self) -> str:
+        if not self.expires_at:
+            return ""
+        try:
+            expires = datetime.fromisoformat(self.expires_at)
+            seconds = int((expires - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            return ""
+        if seconds <= 0:
+            return "expiring"
+        if seconds >= 3600:
+            return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+        return f"{seconds // 60}m"
+
+
+@dataclass
+class ComfyUIStatus:
+    running: bool = False
+    queue_pending: int = 0
+    queue_running: int = 0
+    error: str = ""
+
+
 class SystemMetricsReader:
     """Reads CPU, RAM, and GPU metrics from /proc and nvidia-smi."""
 
@@ -474,6 +560,332 @@ class SystemMetricsReader:
                 m.gpu_available = False
 
         return m
+
+
+def _decimal_money(value) -> Decimal:
+    if not isinstance(value, (str, int, float, Decimal)) or isinstance(value, bool):
+        raise ValueError("invalid money value")
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError("invalid money value") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("invalid money value")
+    return amount
+
+
+def _read_owned_private_json(path: Path) -> dict:
+    """Read a small owner-only regular JSON file without following symlinks."""
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ValueError("credential file unavailable") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size > 1024 * 1024
+    ):
+        raise ValueError("credential file is not a protected regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            after = os.fstat(handle.fileno())
+            if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                raise ValueError("credential file changed while opening")
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("credential file unavailable") from exc
+    if not isinstance(data, dict):
+        raise ValueError("credential file schema is invalid")
+    return data
+
+
+def read_deepseek_api_key(
+    *, auth_path: Path = DEEPSEEK_AUTH_PATH, environ: dict | None = None
+) -> str:
+    environment = os.environ if environ is None else environ
+    env_key = environment.get("DEEPSEEK_API_KEY", "")
+    if isinstance(env_key, str) and env_key.strip():
+        return env_key.strip()
+    data = _read_owned_private_json(auth_path)
+    provider = data.get("deepseek")
+    if not isinstance(provider, dict):
+        raise ValueError("DeepSeek credential unavailable")
+    key = provider.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("DeepSeek credential unavailable")
+    return key.strip()
+
+
+def parse_deepseek_balance(payload: dict) -> tuple[bool, list[MoneyBalance]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("is_available"), bool):
+        raise ValueError("DeepSeek balance response schema is invalid")
+    infos = payload.get("balance_infos")
+    if not isinstance(infos, list) or not infos:
+        raise ValueError("DeepSeek balance response has no currencies")
+    balances: list[MoneyBalance] = []
+    seen: set[str] = set()
+    for info in infos:
+        if not isinstance(info, dict):
+            raise ValueError("DeepSeek balance response schema is invalid")
+        currency = info.get("currency")
+        if (
+            not isinstance(currency, str)
+            or not re.fullmatch(r"[A-Z]{3}", currency)
+            or currency in seen
+        ):
+            raise ValueError("DeepSeek balance currency is invalid")
+        seen.add(currency)
+        balances.append(
+            MoneyBalance(
+                currency=currency,
+                total=_decimal_money(info.get("total_balance")),
+                granted=_decimal_money(info.get("granted_balance")),
+                topped_up=_decimal_money(info.get("topped_up_balance")),
+            )
+        )
+    return payload["is_available"], balances
+
+
+def fetch_deepseek_balance(api_key: str) -> tuple[bool, list[MoneyBalance]]:
+    response = requests.get(
+        DEEPSEEK_BALANCE_URL,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return parse_deepseek_balance(response.json())
+
+
+def load_deepseek_history(path: Path = DEEPSEEK_HISTORY_PATH) -> list[BalanceSnapshot]:
+    if not path.exists():
+        return []
+    raw = _read_owned_private_json(path)
+    if raw.get("version") != DEEPSEEK_HISTORY_VERSION or not isinstance(raw.get("points"), list):
+        raise ValueError("DeepSeek history schema is invalid")
+    points: list[BalanceSnapshot] = []
+    previous = -1
+    for item in raw["points"]:
+        if not isinstance(item, dict) or not isinstance(item.get("timestamp"), int):
+            raise ValueError("DeepSeek history schema is invalid")
+        timestamp = item["timestamp"]
+        balances_raw = item.get("balances")
+        if timestamp <= previous or not isinstance(balances_raw, dict) or not balances_raw:
+            raise ValueError("DeepSeek history schema is invalid")
+        balances: dict[str, Decimal] = {}
+        for currency, amount in balances_raw.items():
+            if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+                raise ValueError("DeepSeek history schema is invalid")
+            balances[currency] = _decimal_money(amount)
+        points.append(BalanceSnapshot(timestamp=timestamp, balances=balances))
+        previous = timestamp
+    return points
+
+
+def save_deepseek_history(
+    points: list[BalanceSnapshot], path: Path = DEEPSEEK_HISTORY_PATH
+) -> None:
+    if path.exists() or path.is_symlink():
+        existing = path.lstat()
+        if (
+            not stat.S_ISREG(existing.st_mode)
+            or existing.st_uid != os.getuid()
+            or stat.S_IMODE(existing.st_mode) != 0o600
+        ):
+            raise ValueError("DeepSeek history path is unsafe")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = {
+        "version": DEEPSEEK_HISTORY_VERSION,
+        "points": [
+            {
+                "timestamp": point.timestamp,
+                "balances": {k: str(v) for k, v in sorted(point.balances.items())},
+            }
+            for point in points
+        ],
+    }
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def record_deepseek_snapshot(
+    balances: list[MoneyBalance], *, now: float, path: Path = DEEPSEEK_HISTORY_PATH
+) -> list[BalanceSnapshot]:
+    points = load_deepseek_history(path)
+    timestamp = int(now)
+    snapshot = BalanceSnapshot(timestamp, {b.currency: b.total for b in balances})
+    if points and points[-1].timestamp == timestamp:
+        points[-1] = snapshot
+    elif not points or points[-1].timestamp < timestamp:
+        points.append(snapshot)
+    else:
+        raise ValueError("DeepSeek history clock moved backwards")
+    cutoff = timestamp - DEEPSEEK_HISTORY_RETENTION_S
+    points = [point for point in points if point.timestamp >= cutoff]
+    save_deepseek_history(points, path)
+    return points
+
+
+def balance_decrease_spend(
+    points: list[BalanceSnapshot], *, now: float, currency: str
+) -> tuple[Decimal | None, int]:
+    cutoff = int(now) - 24 * 3600
+    eligible = [p for p in points if currency in p.balances and p.timestamp <= int(now)]
+    if not eligible:
+        return None, 0
+    baseline_index = max(
+        (i for i, point in enumerate(eligible) if point.timestamp <= cutoff),
+        default=0,
+    )
+    window = eligible[baseline_index:]
+    if len(window) < 2:
+        return Decimal("0"), max(0, int(now) - window[0].timestamp)
+    spent = Decimal("0")
+    for previous, current in zip(window, window[1:]):
+        decrease = previous.balances[currency] - current.balances[currency]
+        if decrease > 0:
+            spent += decrease
+    coverage = min(24 * 3600, max(0, int(now) - window[0].timestamp))
+    return spent, coverage
+
+
+def read_opencode_deepseek_spend(
+    *, db_path: Path = OPENCODE_DB_PATH, now: float | None = None
+) -> tuple[Decimal, int, int]:
+    now = time.time() if now is None else now
+    try:
+        metadata = db_path.lstat()
+    except OSError as exc:
+        raise ValueError("OpenCode cost database unavailable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise ValueError("OpenCode cost database is unsafe")
+    cutoff_ms = int((now - 24 * 3600) * 1000)
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=1) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            total, valid, cost, oldest = conn.execute(
+                """
+                WITH parsed AS (
+                  SELECT
+                    time_created,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.role'
+                    ) AS role,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.providerID'
+                    ) AS provider,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.cost'
+                    ) AS cost
+                  FROM message
+                )
+                SELECT
+                  COUNT(*),
+                  SUM(CASE WHEN typeof(cost) IN ('integer','real')
+                                AND cost >= 0 THEN 1 ELSE 0 END),
+                  SUM(CASE WHEN typeof(cost) IN ('integer','real')
+                                AND cost >= 0 THEN cost ELSE 0 END),
+                  (SELECT MIN(time_created) FROM parsed
+                   WHERE role = 'assistant' AND provider = 'deepseek')
+                FROM parsed
+                WHERE time_created >= ?
+                  AND role = 'assistant'
+                  AND provider = 'deepseek'
+                """,
+                (cutoff_ms,),
+            ).fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        raise ValueError("OpenCode cost database unavailable") from exc
+    total = int(total or 0)
+    valid = int(valid or 0)
+    if total != valid:
+        raise ValueError("OpenCode DeepSeek rows contain invalid costs")
+    amount = _decimal_money(cost or 0)
+    coverage_s = 0 if oldest is None else min(24 * 3600, max(0, int(now - int(oldest) / 1000)))
+    return amount, total, coverage_s
+
+
+def read_deepseek_usage(
+    *,
+    now: float | None = None,
+    auth_path: Path = DEEPSEEK_AUTH_PATH,
+    history_path: Path = DEEPSEEK_HISTORY_PATH,
+    db_path: Path = OPENCODE_DB_PATH,
+    environ: dict | None = None,
+) -> DeepSeekUsageSummary:
+    now = time.time() if now is None else now
+    summary = DeepSeekUsageSummary()
+    history: list[BalanceSnapshot] = []
+    try:
+        api_key = read_deepseek_api_key(auth_path=auth_path, environ=environ)
+        available, balances = fetch_deepseek_balance(api_key)
+        summary.is_available = available
+        summary.balances = balances
+        summary.balance_fetched_at = now
+        summary.balance_source = "live"
+    except (ValueError, OSError, requests.RequestException, json.JSONDecodeError):
+        summary.balance_error = "Current credit unavailable"
+        try:
+            history = load_deepseek_history(history_path)
+        except (ValueError, OSError):
+            history = []
+        if history:
+            latest = history[-1]
+            snapshot_age = int(now) - latest.timestamp
+            if 0 <= snapshot_age <= DEEPSEEK_SNAPSHOT_MAX_AGE_S:
+                summary.balances = [
+                    MoneyBalance(currency, total, Decimal("0"), Decimal("0"))
+                    for currency, total in sorted(latest.balances.items())
+                ]
+                summary.balance_fetched_at = latest.timestamp
+                summary.balance_source = "snapshot"
+    else:
+        try:
+            history = record_deepseek_snapshot(balances, now=now, path=history_path)
+        except (ValueError, OSError):
+            # A bad history path must not downgrade a valid live balance. It
+            # only disables the balance-decrease fallback for this refresh.
+            history = []
+
+    try:
+        spent, count, coverage = read_opencode_deepseek_spend(db_path=db_path, now=now)
+        summary.spent_24h = spent
+        summary.spend_message_count = count
+        summary.spend_coverage_s = coverage
+        summary.spend_source = "opencode"
+    except ValueError as exc:
+        summary.spend_error = str(exc)
+        currency = "USD" if any(b.currency == "USD" for b in summary.balances) else ""
+        if currency and history:
+            spent, coverage = balance_decrease_spend(history, now=now, currency=currency)
+            summary.spent_24h = spent
+            summary.spend_coverage_s = coverage
+            summary.spend_currency = currency
+            summary.spend_source = "balance"
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1521,6 +1933,96 @@ class CodexUsageWorker(QThread):
     def run(self):
         reader = self._reader or read_codex_usage_summary
         self.result.emit(reader())
+
+
+class DeepSeekUsageWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        reader = self._reader or read_deepseek_usage
+        summary = reader()
+        if not self.isInterruptionRequested():
+            self.result.emit(summary)
+
+
+class OllamaFetchWorker(QThread):
+    result = Signal(object, list, int)
+
+    def run(self):
+        status = OllamaStatus()
+        loaded: list[LoadedModel] = []
+        available_count = 0
+        try:
+            response = requests.get(f"{OLLAMA_URL}/api/version", timeout=3)
+            response.raise_for_status()
+            payload = response.json()
+            status.running = True
+            status.version = str(payload.get("version", ""))
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            status.error = type(exc).__name__
+            self.result.emit(status, loaded, available_count)
+            return
+        if self.isInterruptionRequested():
+            return
+        try:
+            response = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+            response.raise_for_status()
+            for raw in response.json().get("models", []):
+                if not isinstance(raw, dict):
+                    continue
+                details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+                loaded.append(
+                    LoadedModel(
+                        name=str(raw.get("name", "")),
+                        size_vram=max(0, int(raw.get("size_vram", 0) or 0)),
+                        parameter_size=str(details.get("parameter_size", "")),
+                        quantization=str(details.get("quantization_level", "")),
+                        expires_at=str(raw.get("expires_at", "")),
+                    )
+                )
+        except (requests.RequestException, ValueError, TypeError, AttributeError):
+            loaded = []
+        if self.isInterruptionRequested():
+            return
+        try:
+            response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+            response.raise_for_status()
+            models = response.json().get("models", [])
+            available_count = len(models) if isinstance(models, list) else 0
+        except (requests.RequestException, ValueError, TypeError, AttributeError):
+            available_count = 0
+        if not self.isInterruptionRequested():
+            self.result.emit(status, loaded, available_count)
+
+
+class ComfyUIFetchWorker(QThread):
+    result = Signal(object)
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        status = ComfyUIStatus()
+        try:
+            response = requests.get(f"{COMFYUI_URL}/queue", timeout=3)
+            response.raise_for_status()
+            payload = response.json()
+            pending = payload.get("queue_pending", [])
+            running = payload.get("queue_running", [])
+            if not isinstance(pending, list) or not isinstance(running, list):
+                raise ValueError("invalid queue response")
+            status.running = True
+            status.queue_pending = len(pending)
+            status.queue_running = len(running)
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            status.error = type(exc).__name__
+        if not self.isInterruptionRequested():
+            self.result.emit(status)
 
 
 # ---------------------------------------------------------------------------
@@ -2730,6 +3232,314 @@ class CodexUsageRow(QWidget):
         p.end()
 
 
+def _money_text(amount: Decimal, currency: str) -> str:
+    prefix = {"USD": "$", "CNY": "¥"}.get(currency, f"{currency} ")
+    return f"{prefix}{amount:,.2f}"
+
+
+def _resize_parent(widget: QWidget) -> None:
+    parent = widget.parent()
+    while parent is not None:
+        if hasattr(parent, "adjustSize"):
+            parent.adjustSize()
+            if hasattr(parent, "clamp_to_available_screen"):
+                parent.clamp_to_available_screen()
+            return
+        parent = parent.parent() if hasattr(parent, "parent") else None
+
+
+class DeepSeekUsageRow(QWidget):
+    """Compact DeepSeek spend and current-credit row with source disclosure."""
+
+    _COLLAPSED_H = 30
+    _EXPANDED_H = 88
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._summary: DeepSeekUsageSummary | None = None
+        self._expanded = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, summary: DeepSeekUsageSummary | None):
+        self._summary = summary
+        self.setToolTip(self._tooltip(summary))
+        self.update()
+
+    @staticmethod
+    def _primary_balance(summary: DeepSeekUsageSummary | None) -> MoneyBalance | None:
+        if summary is None or not summary.balances:
+            return None
+        return next((b for b in summary.balances if b.currency == "USD"), summary.balances[0])
+
+    def _spend_text(self, summary: DeepSeekUsageSummary | None) -> str:
+        if summary is None or summary.spent_24h is None:
+            return "—"
+        text = _money_text(summary.spent_24h, summary.spend_currency)
+        return f"~{text}" if summary.spend_source == "balance" else text
+
+    def _credit_text(self, summary: DeepSeekUsageSummary | None) -> str:
+        balance = self._primary_balance(summary)
+        if balance is None:
+            return "—"
+        text = _money_text(balance.total, balance.currency)
+        return f"LAST {text}" if summary.balance_source == "snapshot" else text
+
+    @staticmethod
+    def _snapshot_age_text(summary: DeepSeekUsageSummary | None) -> str:
+        if summary is None or summary.balance_source != "snapshot":
+            return ""
+        age_s = max(0, int(time.time() - summary.balance_fetched_at))
+        if age_s < 60:
+            return f"{age_s}s old"
+        return f"{age_s // 60}m old"
+
+    def _tooltip(self, summary: DeepSeekUsageSummary | None) -> str:
+        if summary is None:
+            return "DeepSeek data has not been read yet."
+        lines: list[str] = []
+        if summary.spent_24h is not None and summary.spend_source == "opencode":
+            coverage = min(24, summary.spend_coverage_s / 3600)
+            lines.append(
+                f"24h spend: {self._spend_text(summary)} from "
+                f"{summary.spend_message_count:,} valid DeepSeek assistant messages "
+                f"in the local OpenCode database ({coverage:.1f}h ledger coverage)."
+            )
+            lines.append("This covers OpenCode-recorded traffic only, not other API clients.")
+        elif summary.spent_24h is not None and summary.spend_source == "balance":
+            coverage = min(24, summary.spend_coverage_s / 3600)
+            lines.append(
+                f"24h spend estimate: {self._spend_text(summary)} from observed balance "
+                f"decreases ({coverage:.1f}h coverage); top-ups are not counted as spend."
+            )
+        else:
+            lines.append(f"24h spend unavailable: {summary.spend_error or 'no safe source'}.")
+        if summary.balances:
+            balances = ", ".join(
+                f"{balance.currency} {_money_text(balance.total, balance.currency)}"
+                for balance in summary.balances
+            )
+            if summary.balance_source == "live":
+                source = "live DeepSeek /user/balance"
+            else:
+                source = f"last protected snapshot, {self._snapshot_age_text(summary)}"
+            lines.append(f"Credit: {balances} ({source}).")
+        if summary.balance_error:
+            lines.append(summary.balance_error + ".")
+        return "\n".join(lines)
+
+    def mousePressEvent(self, event):
+        self._expanded = not self._expanded
+        self.setFixedHeight(self._EXPANDED_H if self._expanded else self._COLLAPSED_H)
+        _resize_parent(self)
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        arrow = "▾" if self._expanded else "▸"
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 18, f"DEEPSEEK {arrow}")
+
+        summary = self._summary
+        spend = self._spend_text(summary)
+        credit = self._credit_text(summary)
+        right = f"24H {spend}  ·  CREDIT {credit}"
+        right_color = QColor(180, 180, 200)
+        if summary and summary.balance_source == "snapshot":
+            right_color = QColor(234, 179, 8)
+        painter.setPen(right_color)
+        fm = painter.fontMetrics()
+        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 18, right)
+
+        if self._expanded:
+            painter.setFont(QFont("sans-serif", 7))
+            painter.setPen(QColor(100, 100, 120))
+            source = "OpenCode only" if summary and summary.spend_source == "opencode" else "balance estimate"
+            if not summary or not summary.spend_source:
+                source = "unavailable"
+            painter.drawText(8, 40, f"24H SPEND   {spend}   ·   {source}")
+            balance_source = "live API" if summary and summary.balance_source == "live" else "last snapshot"
+            if summary and summary.balance_source == "snapshot":
+                balance_source += f" · {self._snapshot_age_text(summary)}"
+            if not summary or not summary.balance_source:
+                balance_source = "unavailable"
+            painter.drawText(8, 58, f"CREDIT      {credit}   ·   {balance_source}")
+            coverage = summary.spend_coverage_s / 3600 if summary else 0
+            detail = f"COVERAGE    {min(24, coverage):.1f}h"
+            if summary and summary.spend_source == "opencode":
+                detail += f"   ·   {summary.spend_message_count:,} messages"
+            painter.drawText(8, 76, detail)
+        painter.end()
+
+
+class LocalAISection(QWidget):
+    """Collapsed local Ollama summary with compact model/GPU/ComfyUI details."""
+
+    expanded_changed = Signal(bool)
+    _COLLAPSED_H = 26
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = False
+        self._status = OllamaStatus()
+        self._models: list[LoadedModel] = []
+        self._available_count = 0
+        self._gpu = SystemMetrics()
+        self._comfyui = ComfyUIStatus()
+        self._task_loops: list[TaskLoopInfo] = []
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _expanded_height(self) -> int:
+        model_rows = max(1, min(3, len(self._models)))
+        task_rows = max(1, min(3, len(self._task_loops)))
+        return self._COLLAPSED_H + 116 + model_rows * 28 + task_rows * 20
+
+    def _sync_height(self):
+        self.setFixedHeight(self._expanded_height() if self._expanded else self._COLLAPSED_H)
+        _resize_parent(self)
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def set_expanded(self, expanded: bool) -> None:
+        expanded = bool(expanded)
+        if self._expanded == expanded:
+            return
+        self._expanded = expanded
+        self._sync_height()
+        self.expanded_changed.emit(expanded)
+        self.update()
+
+    def set_ollama(self, status: OllamaStatus, models: list[LoadedModel], available_count: int):
+        self._status = status
+        self._models = models
+        self._available_count = available_count
+        if self._expanded:
+            self._sync_height()
+        self._update_tooltip()
+        self.update()
+
+    def set_gpu(self, metrics: SystemMetrics):
+        self._gpu = metrics
+        self._update_tooltip()
+        self.update()
+
+    def set_comfyui(self, status: ComfyUIStatus):
+        self._comfyui = status
+        self._update_tooltip()
+        self.update()
+
+    def set_task_loops(self, loops: list[TaskLoopInfo]):
+        self._task_loops = [loop for loop in loops if "ollama" in loop.model.lower()]
+        if self._expanded:
+            self._sync_height()
+        self._update_tooltip()
+        self.update()
+
+    def _update_tooltip(self):
+        ollama = "running" if self._status.running else "stopped"
+        lines = [f"Ollama {ollama}; {len(self._models)} loaded / {self._available_count} available models."]
+        if self._gpu.gpu_available:
+            lines.append(
+                f"GPU {self._gpu.gpu_pct:.0f}%; VRAM {self._gpu.gpu_mem_used_gb:.1f}/"
+                f"{self._gpu.gpu_mem_total_gb:.1f} GB; {self._gpu.gpu_temp}°C."
+            )
+        lines.append("Ollama task loops come from local clawd-bot configuration; no DynamoDB query is used.")
+        self.setToolTip("\n".join(lines))
+
+    def mousePressEvent(self, event):
+        self.set_expanded(not self._expanded)
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        width = self.width()
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        arrow = "▾" if self._expanded else "▸"
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 17, f"LOCAL AI {arrow}")
+        ollama_text = "OLLAMA RUNNING" if self._status.running else "OLLAMA STOPPED"
+        gpu_text = f"GPU {self._gpu.gpu_pct:.0f}%" if self._gpu.gpu_available else "GPU —"
+        summary = f"{ollama_text}  ·  {gpu_text}"
+        painter.setPen(QColor(34, 197, 94) if self._status.running else QColor(239, 68, 68))
+        painter.drawText(width - fm.horizontalAdvance(summary) - 4, 17, summary)
+        if not self._expanded:
+            painter.end()
+            return
+
+        y = 38
+        painter.setPen(QColor(180, 180, 200))
+        version = f" v{self._status.version}" if self._status.version else ""
+        painter.drawText(8, y, f"OLLAMA  {'Running' if self._status.running else 'Stopped'}{version}")
+        y += 18
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(8, y, f"LOADED MODELS  ({len(self._models)} loaded / {self._available_count} available)")
+        y += 18
+        small = QFont("sans-serif", 7)
+        painter.setFont(small)
+        sfm = painter.fontMetrics()
+        if self._models:
+            for model in self._models[:3]:
+                info = " · ".join(part for part in (model.parameter_size, model.quantization) if part)
+                line = f"{model.name}   {info}".strip()
+                painter.setPen(QColor(139, 92, 246))
+                painter.drawText(12, y, sfm.elidedText(line, Qt.TextElideMode.ElideRight, width - 24))
+                expiry = model.time_until_expiry()
+                detail = f"VRAM {model.vram_gb:.1f} GB" + (f" · expires {expiry}" if expiry else "")
+                painter.setPen(QColor(130, 130, 150))
+                painter.drawText(12, y + 12, detail)
+                y += 28
+        else:
+            painter.setPen(QColor(130, 130, 150))
+            painter.drawText(12, y, "No models loaded" if self._status.running else "Service unavailable")
+            y += 28
+
+        painter.setFont(font)
+        painter.setPen(QColor(160, 160, 180))
+        if self._gpu.gpu_available:
+            gpu = (
+                f"GPU  {self._gpu.gpu_pct:.0f}%  ·  VRAM {self._gpu.gpu_mem_used_gb:.1f}/"
+                f"{self._gpu.gpu_mem_total_gb:.1f} GB  ·  {self._gpu.gpu_temp}°C"
+            )
+        else:
+            gpu = "GPU  No NVIDIA GPU detected"
+        painter.drawText(8, y, gpu)
+        y += 20
+        if self._comfyui.running:
+            queue = "idle"
+            if self._comfyui.queue_running:
+                queue = f"generating {self._comfyui.queue_running}"
+            elif self._comfyui.queue_pending:
+                queue = f"queued {self._comfyui.queue_pending}"
+            comfy = f"COMFYUI  Running · {queue}"
+        else:
+            comfy = "COMFYUI  Stopped"
+        painter.drawText(8, y, comfy)
+        y += 20
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(8, y, "OLLAMA TASK LOOPS  (local config)")
+        y += 18
+        painter.setFont(small)
+        painter.setPen(QColor(130, 130, 150))
+        if self._task_loops:
+            for loop in self._task_loops[:3]:
+                line = f"{loop.name} · {loop.model} · {loop.next_run_str()}"
+                painter.drawText(12, y, sfm.elidedText(line, Qt.TextElideMode.ElideRight, width - 24))
+                y += 20
+        else:
+            painter.drawText(12, y, "No configured Ollama task loops")
+        painter.end()
+
+
 class DeployRow(QWidget):
     """Collapsible row showing deploy status per active Claude project."""
 
@@ -3507,6 +4317,9 @@ class ClaudeWidget(QWidget):
         self._task_group_worker: TaskGroupFetchWorker | None = None
         self._cron_worker: CronJobsFetchWorker | None = None
         self._codex_worker: CodexUsageWorker | None = None
+        self._deepseek_worker: DeepSeekUsageWorker | None = None
+        self._ollama_worker: OllamaFetchWorker | None = None
+        self._comfyui_worker: ComfyUIFetchWorker | None = None
         self._history = UsageHistory()
         self._next_fetch_at: float = 0.0
         saved_until, saved_count = load_rate_limit_until()
@@ -3535,6 +4348,8 @@ class ClaudeWidget(QWidget):
         self._fetch_task_loops()
         self._fetch_task_groups()
         self._fetch_cron_jobs()
+        self._fetch_ollama()
+        self._fetch_comfyui()
 
         # Initial system metrics read so widget isn't blank
         self._update_system_metrics()
@@ -3547,6 +4362,7 @@ class ClaudeWidget(QWidget):
                 tstats.get("total_cache", 0),
             )
         self._refresh_codex_usage()
+        self._refresh_deepseek_usage()
 
         # Initialize graph with persisted history
         if self._history.points:
@@ -3702,6 +4518,10 @@ class ClaudeWidget(QWidget):
         self._codex_row = CodexUsageRow()
         layout.addWidget(self._codex_row)
 
+        # DeepSeek API spend and credit row
+        self._deepseek_row = DeepSeekUsageRow()
+        layout.addWidget(self._deepseek_row)
+
         # Deploy status row
         self._deploy_row = DeployRow()
         layout.addWidget(self._deploy_row)
@@ -3726,6 +4546,13 @@ class ClaudeWidget(QWidget):
         self._sys_row = SystemMetricsRow()
         layout.addWidget(self._sys_row)
 
+        # Embedded replacement for the standalone Ollama Indicator.
+        self._local_ai_section = LocalAISection()
+        self._local_ai_section.expanded_changed.connect(
+            self._on_local_ai_expanded_changed
+        )
+        layout.addWidget(self._local_ai_section)
+
         layout.addSpacing(2)
 
         # Bottom separator
@@ -3749,11 +4576,36 @@ class ClaudeWidget(QWidget):
         # Click = force a fetch, bypassing the rate-limit cooldown. Useful when
         # the user believes the server window has cleared. Long-running 429
         # loops may keep extending the window, so use sparingly.
-        refresh_btn.mousePressEvent = lambda _: self._fetch_usage(force=True)
-        refresh_btn.setToolTip("Refresh now (bypasses rate-limit cooldown)")
+        refresh_btn.mousePressEvent = lambda _: self._refresh_all()
+        refresh_btn.setToolTip("Refresh all indicators now (Claude bypasses cooldown)")
         status_layout.addWidget(refresh_btn)
 
         layout.addLayout(status_layout)
+
+    def clamp_to_available_screen(self) -> None:
+        """Reposition the full panel inside the primary screen's work area."""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        max_x = available.right() - frame.width() + 1
+        max_y = available.bottom() - frame.height() + 1
+        target_x = available.left() if max_x < available.left() else min(
+            max(frame.left(), available.left()), max_x
+        )
+        target_y = available.top() if max_y < available.top() else min(
+            max(frame.top(), available.top()), max_y
+        )
+        if target_x != frame.left() or target_y != frame.top():
+            self.move(
+                self.x() + target_x - frame.left(),
+                self.y() + target_y - frame.top(),
+            )
+
+    def adjustSize(self):
+        super().adjustSize()
+        self.clamp_to_available_screen()
 
     def _setup_timers(self):
         # Fetch timer — polls on the normal cadence; _fetch_usage no-ops while
@@ -3802,7 +4654,30 @@ class ClaudeWidget(QWidget):
         self._codex_timer.timeout.connect(self._refresh_codex_usage)
         self._codex_timer.start(CODEX_REFRESH_MS)
 
+        self._deepseek_timer = QTimer(self)
+        self._deepseek_timer.timeout.connect(self._refresh_deepseek_usage)
+        self._deepseek_timer.start(DEEPSEEK_REFRESH_MS)
+
+        self._ollama_timer = QTimer(self)
+        self._ollama_timer.timeout.connect(self._fetch_ollama)
+        self._ollama_timer.start(OLLAMA_REFRESH_MS)
+
+        self._comfyui_timer = QTimer(self)
+        self._comfyui_timer.timeout.connect(self._fetch_comfyui)
+        self._comfyui_timer.start(COMFYUI_REFRESH_MS)
+
+    def _refresh_all(self):
+        self._fetch_usage(force=True)
+        self._refresh_codex_usage()
+        self._refresh_deepseek_usage()
+        self._fetch_ollama()
+        self._fetch_comfyui()
+        self._fetch_task_loops()
+        self._update_system_metrics()
+
     def _fetch_usage(self, force: bool = False):
+        if self._shutdown_started:
+            return
         if self._worker and self._worker.isRunning():
             return
         if not force and time.time() < self._rate_limit_until:
@@ -3927,6 +4802,7 @@ class ClaudeWidget(QWidget):
 
         estimate = self._history.estimated_time_left(data.five_hour.utilization)
         self._usage_limits.set_data(data, estimate=estimate)
+        self.adjustSize()
 
         # Status line: if rate-limited, show "Stale · next in Xm Ys" countdown,
         # otherwise show true data age and next-update countdown.
@@ -3976,17 +4852,22 @@ class ClaudeWidget(QWidget):
                 )
 
     def _toggle_history(self):
-        self._history_expanded = not self._history_expanded
-        visible = self._history_expanded
-        for w in self._window_labels + self._window_spacers:
-            w.setVisible(visible)
-        self._graph.setVisible(visible)
-        self._stats_sep.setVisible(visible)
-        self._stats_row.setVisible(visible)
-        self._token_row.setVisible(visible)
+        visible = not self._history_expanded
+        if visible and self._local_ai_section.is_expanded():
+            self._local_ai_section.set_expanded(False)
+        self._set_history_expanded(visible)
 
-        arrow = "▾" if visible else "▸"
-        if visible:
+    def _set_history_expanded(self, visible: bool):
+        self._history_expanded = bool(visible)
+        for w in self._window_labels + self._window_spacers:
+            w.setVisible(self._history_expanded)
+        self._graph.setVisible(self._history_expanded)
+        self._stats_sep.setVisible(self._history_expanded)
+        self._stats_row.setVisible(self._history_expanded)
+        self._token_row.setVisible(self._history_expanded)
+
+        arrow = "▾" if self._history_expanded else "▸"
+        if self._history_expanded:
             self._graph_title.setText(f"Usage History {arrow}")
         else:
             avg = self._history.avg_five_hour
@@ -3997,6 +4878,10 @@ class ClaudeWidget(QWidget):
             )
         self._update_window_tabs()
         self.adjustSize()
+
+    def _on_local_ai_expanded_changed(self, expanded: bool):
+        if expanded and self._history_expanded:
+            self._set_history_expanded(False)
 
     def _update_countdowns(self):
         """Update countdown strings every second without re-fetching."""
@@ -4034,6 +4919,7 @@ class ClaudeWidget(QWidget):
 
     def _on_task_loops_fetched(self, loops: list):
         self._task_loop_row.set_data(loops)
+        self._local_ai_section.set_task_loops(loops)
         self.adjustSize()
 
     def _fetch_task_groups(self):
@@ -4061,6 +4947,7 @@ class ClaudeWidget(QWidget):
     def _update_system_metrics(self):
         metrics = self._sys_reader.read()
         self._sys_row.set_data(metrics)
+        self._local_ai_section.set_gpu(metrics)
 
     def _refresh_codex_usage(self):
         if self._codex_worker and self._codex_worker.isRunning():
@@ -4071,6 +4958,45 @@ class ClaudeWidget(QWidget):
 
     def _on_codex_usage_read(self, summary: CodexUsageSummary | None):
         self._codex_row.set_data(summary)
+        self.adjustSize()
+
+    def _refresh_deepseek_usage(self):
+        if self._shutdown_started:
+            return
+        if self._deepseek_worker and self._deepseek_worker.isRunning():
+            return
+        self._deepseek_worker = DeepSeekUsageWorker()
+        self._deepseek_worker.result.connect(self._on_deepseek_usage_read)
+        self._deepseek_worker.start()
+
+    def _on_deepseek_usage_read(self, summary: DeepSeekUsageSummary | None):
+        self._deepseek_row.set_data(summary)
+        self.adjustSize()
+
+    def _fetch_ollama(self):
+        if self._shutdown_started:
+            return
+        if self._ollama_worker and self._ollama_worker.isRunning():
+            return
+        self._ollama_worker = OllamaFetchWorker()
+        self._ollama_worker.result.connect(self._on_ollama_read)
+        self._ollama_worker.start()
+
+    def _on_ollama_read(self, status: OllamaStatus, models: list, available_count: int):
+        self._local_ai_section.set_ollama(status, models, available_count)
+        self.adjustSize()
+
+    def _fetch_comfyui(self):
+        if self._shutdown_started:
+            return
+        if self._comfyui_worker and self._comfyui_worker.isRunning():
+            return
+        self._comfyui_worker = ComfyUIFetchWorker()
+        self._comfyui_worker.result.connect(self._on_comfyui_read)
+        self._comfyui_worker.start()
+
+    def _on_comfyui_read(self, status: ComfyUIStatus):
+        self._local_ai_section.set_comfyui(status)
         self.adjustSize()
 
     def paintEvent(self, event):
@@ -4162,7 +5088,25 @@ class ClaudeWidget(QWidget):
         if self._shutdown_started:
             return
         self._shutdown_started = True
-        self._tray_retry_timer.stop()
+        for timer in self.findChildren(QTimer):
+            if timer.parent() is self:
+                timer.stop()
+        workers = tuple(
+            worker
+            for worker in (
+                self._deepseek_worker,
+                self._ollama_worker,
+                self._comfyui_worker,
+            )
+            if worker is not None
+        )
+        for worker in workers:
+            worker.requestInterruption()
+        deadline = time.monotonic() + 16.0
+        for worker in workers:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not worker.wait(remaining_ms):
+                log_line(f"shutdown: {type(worker).__name__} did not stop before deadline")
         if self._smart_todo_dialog is not None:
             self._smart_todo_dialog.shutdown()
 
@@ -4200,6 +5144,7 @@ def main():
     # Position at top-right of screen with some padding
     screen = app.primaryScreen().geometry()
     widget.move(screen.width() - widget.width() - 20, 40)
+    widget.clamp_to_available_screen()
 
     sys.exit(app.exec())
 
