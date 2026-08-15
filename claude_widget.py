@@ -3466,8 +3466,8 @@ class LocalAISection(QWidget):
         fm = painter.fontMetrics()
         arrow = "▾" if self._expanded else "▸"
         painter.setPen(QColor(100, 100, 120))
-        painter.drawText(4, 17, f"LOCAL AI {arrow}")
-        ollama_text = "OLLAMA RUNNING" if self._status.running else "OLLAMA STOPPED"
+        painter.drawText(4, 17, f"OLLAMA {arrow}")
+        ollama_text = "RUNNING" if self._status.running else "STOPPED"
         gpu_text = f"GPU {self._gpu.gpu_pct:.0f}%" if self._gpu.gpu_available else "GPU —"
         summary = f"{ollama_text}  ·  {gpu_text}"
         painter.setPen(QColor(34, 197, 94) if self._status.running else QColor(239, 68, 68))

@@ -3,6 +3,8 @@
 A translucent Linux desktop widget combining Claude and Codex usage, DeepSeek
 API cost/credit, and local Ollama/GPU/ComfyUI status in one panel.
 
+![Unified Claude, Codex, DeepSeek, and Ollama indicator](docs/images/unified-indicator.png)
+
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![PySide6](https://img.shields.io/badge/PySide6-6.6+-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
@@ -13,7 +15,7 @@ API cost/credit, and local Ollama/GPU/ComfyUI status in one panel.
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
 - **Codex limit percentage** — reads current limits through local `codex app-server`, renders whichever one or two windows are present, and combines them with latest-thread and lifetime totals from local Codex state
 - **DeepSeek spend and credit** — shows OpenCode-recorded DeepSeek cost from the rolling past 24 hours plus current account credit from DeepSeek's official balance endpoint
-- **Embedded Local AI section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
+- **Embedded Ollama section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
@@ -29,7 +31,7 @@ The widget displays a dark translucent overlay with:
 - Up to 3 progress bars (5-Hour Window, 7-Day Window, Model-specific 7-Day)
 - A compact `CODEX` row with current Codex limit percentage and local usage totals
 - A compact `DEEPSEEK` row with `24H` spend and `CREDIT` always visible
-- A collapsed `LOCAL AI` row with Ollama/GPU summary and expandable details
+- A collapsed `OLLAMA` row with GPU summary and expandable details
 - `CRON JOBS` row that collapses to one line and expands to show per-job status and timing
 - Percentage and reset countdown on each bar
 - Last-updated timestamp and manual refresh button
@@ -154,7 +156,7 @@ Cached credit is hidden after 15 minutes; while visible, its age is shown in the
 expanded row and tooltip.
 
 To keep the 340px panel usable on shorter screens, **Usage History** and
-**Local AI** are mutually exclusive expandable sections. Opening either one
+**Ollama** are mutually exclusive expandable sections. Opening either one
 collapses the other; the compact DeepSeek details remain independently usable.
 After any content-size change, the window is repositioned as needed so its full
 frame remains inside the primary screen's available work area.

@@ -15,7 +15,7 @@ DeepSeek API spend/credit, and compact local Ollama/GPU/ComfyUI status.
 - **DeepSeekUsageRow**: Sums numeric DeepSeek assistant-message costs from the read-only local OpenCode SQLite ledger for rolling 24-hour spend and reads current credit from official `GET /user/balance` in a background thread
 - **LocalAISection**: Collapsed Ollama/GPU summary with expandable loaded-model, GPU/VRAM, ComfyUI, and local-config Ollama task-loop details; it does not query DynamoDB
 - **DeepSeek balance history**: Currency-separated snapshots in `~/.claude/deepseek_balance_history.json` use a strict schema, mode `0600`, fsync, and atomic replacement
-- **Expansion geometry**: Usage History and Local AI are mutually exclusive so
+- **Expansion geometry**: Usage History and Ollama are mutually exclusive so
   the fixed-width panel remains usable on 800px-tall screens; DeepSeek remains
   independently expandable. `ClaudeWidget.adjustSize()` clamps the full frame
   into the primary screen's available geometry after every size change.
