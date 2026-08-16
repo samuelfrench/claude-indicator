@@ -5,7 +5,7 @@
 - [x] Complete and review the immediate Cloudflare cutover for all 16 active Route 53 zones while leaving every source zone intact.
 - [ ] Delete the 16 Route 53 source zones only after `2026-07-20T15:18:57.201000Z`, each rolling stale-cache clock, a 13-round/one-hour resolver clean window, and both full delayed gates pass.
 - [x] Show the Fable-specific usage limit: parse the `/api/oauth/usage` `limits` array (model-scoped `weekly_scoped` entries) and render one `UsageBar` per model cap — currently `Fable (7-Day)` — with legacy `seven_day_opus`/`seven_day_sonnet` fallback and `last_usage.json` round-trip.
-- [x] Add header minimize-to-tray button plus shared tray hide/show behavior.
+- [x] Keep minimize recoverable: collapse the header button to a visible right-edge restore sliver while retaining shared tray hide/show behavior.
 - [x] Show Codex usage-limit percentage: `CodexUsageRow` reads the live base `codex` bucket through local `codex app-server` `account/rateLimits/read`, renders only present windows, preserves local token/thread totals, and uses cached session `token_count` events only as a fail-safe.
 - [x] Keep startup visible and avoid hidden tray-only behavior: force initial sizing/raise and only hide-on-close when tray is available.
 - [x] Handle the current Codex rate-limit schema where the base bucket can expose one 7-day primary window and `secondary: null`, while retaining support for two-window responses.

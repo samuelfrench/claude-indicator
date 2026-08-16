@@ -528,23 +528,45 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertGreater(widget.height(), before)
 
-    def test_claude_header_minimize_button_toggles_from_tray(self):
+    def test_claude_header_minimize_button_collapses_to_visible_sliver(self):
         widget = self._make_inert_claude_widget(tray_available=True)
         calls = []
-        widget._toggle_from_tray = lambda: calls.append("toggle")
+        widget.collapse_to_sliver = lambda: calls.append("collapse")
 
         widget._minimize_btn.mousePressEvent(None)
 
-        self.assertEqual(calls, ["toggle"])
+        self.assertEqual(calls, ["collapse"])
 
-    def test_claude_header_minimize_button_closes_without_tray(self):
+    def test_claude_header_minimize_uses_sliver_without_tray(self):
         widget = self._make_inert_claude_widget(tray_available=False)
         calls = []
-        widget.close = lambda: calls.append("close")
+        widget.collapse_to_sliver = lambda: calls.append("collapse")
 
         widget._minimize_btn.mousePressEvent(None)
 
-        self.assertEqual(calls, ["close"])
+        self.assertEqual(calls, ["collapse"])
+
+    def test_collapsed_sliver_stays_on_right_edge_and_restores_widget(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        widget.show()
+        QApplication.processEvents()
+        available = QApplication.primaryScreen().availableGeometry()
+        widget.move(available.right() - widget.width() + 1, available.top() + 40)
+
+        widget.collapse_to_sliver()
+        QApplication.processEvents()
+
+        self.assertFalse(widget.isVisible())
+        self.assertTrue(widget._restore_sliver.isVisible())
+        self.assertEqual(widget._restore_sliver.frameGeometry().right(), available.right())
+        self.assertEqual(widget._restore_sliver.frameGeometry().top(), available.top() + 40)
+        self.assertEqual(widget._restore_sliver.toolTip(), "Expand Claude Indicator")
+
+        widget._restore_sliver.restore_requested.emit()
+        QApplication.processEvents()
+
+        self.assertFalse(widget._restore_sliver.isVisible())
+        self.assertTrue(widget.isVisible())
 
     def test_claude_close_event_uses_hide_to_tray(self):
         widget = self._make_inert_claude_widget(tray_available=True)

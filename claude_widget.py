@@ -72,6 +72,8 @@ DEEPSEEK_REFRESH_MS = 5 * 60 * 1000  # balance endpoint and local cost ledger
 OLLAMA_REFRESH_MS = 10 * 1000
 COMFYUI_REFRESH_MS = 10 * 1000
 TRAY_RETRY_INTERVAL_MS = 5 * 1000  # retry while the desktop tray host is absent
+RESTORE_SLIVER_WIDTH = 28
+RESTORE_SLIVER_HEIGHT = 72
 CRON_REFRESH_MS = 5 * 60 * 1000  # 5 minutes — crontab/journal state changes slowly
 CRON_JOURNAL_WINDOW_HOURS = 48
 CRON_LATE_GRACE_S = 180  # allow journal lag before flagging a run as missed
@@ -4286,6 +4288,49 @@ class SystemMetricsRow(QWidget):
 # Main widget
 # ---------------------------------------------------------------------------
 
+
+class RestoreSliver(QWidget):
+    """Small screen-edge tab that restores a collapsed Claude widget."""
+
+    restore_requested = Signal()
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(RESTORE_SLIVER_WIDTH, RESTORE_SLIVER_HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Expand Claude Indicator")
+        self.setAccessibleName("Expand Claude Indicator")
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        field = QRectF(1.0, 1.0, self.width() - 2.0, self.height() - 2.0)
+        painter.setBrush(QColor(20, 20, 30, 235))
+        painter.setPen(QPen(QColor(212, 165, 116, 210), 1.5))
+        painter.drawRoundedRect(field, 9.0, 9.0)
+
+        arrow_font = QFont("sans-serif", 18)
+        arrow_font.setWeight(QFont.Weight.Bold)
+        painter.setFont(arrow_font)
+        painter.setPen(QColor("#d4a574"))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "‹")
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.restore_requested.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class ClaudeWidget(QWidget):
     """Translucent always-on-top widget displaying Claude Max usage."""
 
@@ -4306,6 +4351,9 @@ class ClaudeWidget(QWidget):
         self._tray_retry_timer = QTimer(self)
         self._tray_retry_timer.setInterval(TRAY_RETRY_INTERVAL_MS)
         self._tray_retry_timer.timeout.connect(self._setup_tray_icon)
+        self._restore_sliver = RestoreSliver()
+        self._restore_sliver.restore_requested.connect(self._restore_from_sliver)
+        self.destroyed.connect(self._restore_sliver.deleteLater)
 
         self._drag_pos = QPoint()
         self._usage: UsageData | None = load_last_usage()
@@ -4428,9 +4476,8 @@ class ClaudeWidget(QWidget):
             "color: #666680; font-size: 14px; padding: 2px 6px;"
         )
         self._minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._minimize_btn.mousePressEvent = lambda _: (
-            self._toggle_from_tray() if self._tray else self.close()
-        )
+        self._minimize_btn.setToolTip("Collapse to screen edge")
+        self._minimize_btn.mousePressEvent = lambda _: self.collapse_to_sliver()
         header.addWidget(self._minimize_btn)
 
         # Close button
@@ -5069,6 +5116,7 @@ class ClaudeWidget(QWidget):
     def _show_from_tray(self):
         if self._tray is None:
             return
+        self._restore_sliver.hide()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -5076,7 +5124,37 @@ class ClaudeWidget(QWidget):
     def hide_to_tray(self):
         if self._tray is None:
             return
+        self._restore_sliver.hide()
         self.hide()
+
+    def collapse_to_sliver(self):
+        """Replace the full panel with a visible tab on the nearest screen edge."""
+        if self._shutdown_started:
+            return
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        top = min(
+            max(self.frameGeometry().top(), available.top()),
+            available.bottom() - self._restore_sliver.height() + 1,
+        )
+        left = available.right() - self._restore_sliver.width() + 1
+        self.hide()
+        self._restore_sliver.move(left, top)
+        self._restore_sliver.show()
+        self._restore_sliver.raise_()
+
+    def _restore_from_sliver(self):
+        self._restore_sliver.hide()
+        self.show()
+        self.adjustSize()
+        self.clamp_to_available_screen()
+        self.raise_()
+        self.activateWindow()
 
     def _toggle_from_tray(self):
         if self.isVisible():
@@ -5088,6 +5166,8 @@ class ClaudeWidget(QWidget):
         if self._shutdown_started:
             return
         self._shutdown_started = True
+        self._restore_sliver.hide()
+        self._restore_sliver.close()
         for timer in self.findChildren(QTimer):
             if timer.parent() is self:
                 timer.stop()

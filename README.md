@@ -18,6 +18,7 @@ API cost/credit, and local Ollama/GPU/ComfyUI status in one panel.
 - **Embedded Ollama section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
+- **Recoverable minimize** — the header minimize button collapses the panel to a small always-on-top tab at the right screen edge; click the tab to expand it again, or use the tray menu
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
 - **Live countdown timers** — shows time remaining until each window resets
 - **Always-on-top translucent widget** — frameless, draggable, stays visible over other windows
