@@ -18,3 +18,5 @@
 - [x] Add an ollama scheduler watchdog: a 5-minute systemd timer that restarts `ollama` once its scheduler has been wedged for 15 minutes, detected via stale keep-alive expiry or a hung no-token load probe.
 - [x] Add a local-model token tracker: today and all-time token volume plus message counts from the OpenCode ollama-provider ledger, labelled in the UI so the source scope is explicit.
 - [x] Break the OpenCode ledger figures down per model so MiniMax, DeepSeek and ollama traffic are individually attributable, each line tagged with its provider.
+- [x] Add the terminal tabs workflow surface: a `TABS` row summarising live claude/codex/opencode terminal sessions with a NEEDS-YOU count, plus an animated side panel docked to the widget with per-session cards — WORKING/WAITING/NEEDS YOU/PARKED grouping, park/unpark, persistent notes, and click-to-jump terminal navigation via xdotool.
+- [ ] Consider a tray notification (rate-limited) when a session flips to NEEDS YOU, and journald-based local token tracking for non-OpenCode clients (see memory: local_token_sources).

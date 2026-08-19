@@ -40,6 +40,8 @@ from claude_widget import (
     OllamaStatus,
     SystemMetrics,
     TaskLoopInfo,
+    TerminalSession,
+    TerminalSessionsSnapshot,
     ModelLimit,
     _parse_codex_app_server_rate_limit,
     _parse_codex_rate_limit_event,
@@ -815,6 +817,9 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_refresh_deepseek_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_minimax_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_opencode_usage", lambda self: None),
+            patch.object(
+                ClaudeWidget, "_refresh_terminal_sessions", lambda self: None
+            ),
             patch.object(ClaudeWidget, "_fetch_ollama", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_comfyui", lambda self: None),
             patch.object(claude_widget, "SmartTodoDialog", dialog_factory),
@@ -825,6 +830,148 @@ class WidgetUiTest(unittest.TestCase):
         widget = ClaudeWidget()
         self.addCleanup(widget.deleteLater)
         return widget
+
+    @staticmethod
+    def _terminal_session(key="1:1", parked=False, needs_attention=False):
+        return TerminalSession(
+            key=key, tool="CLAUDE", project="demo", cwd="/home/sam/demo",
+            tty="pts/1", pid=int(key.split(":")[0]), busy=not needs_attention,
+            parked=parked, idle_seconds=300.0 if needs_attention else 0.0,
+            needs_attention=needs_attention,
+        )
+
+    def test_widget_reads_terminal_sessions_and_prunes_dead_state(self):
+        widget = self._make_inert_claude_widget()
+        widget._parked_sessions = {"1:1", "9:9"}
+        widget._session_notes = {"1:1": "keep", "9:9": "gone"}
+        snapshot = TerminalSessionsSnapshot(
+            sessions=[self._terminal_session(key="1:1", parked=True)],
+            updated_at=1.0,
+        )
+
+        with patch.object(claude_widget, "save_terminal_state",
+                          return_value=({"1:1"}, {"1:1": "keep"})) as save:
+            widget._on_terminal_sessions_read(snapshot)
+
+        save.assert_called_once_with({"1:1"}, {"1:1": "keep"},
+                                     live_keys={"1:1"})
+        self.assertEqual(widget._parked_sessions, {"1:1"})
+        self.assertEqual(widget._session_notes, {"1:1": "keep"})
+        self.assertEqual(widget._terminal_sessions_row.summary_text(),
+                         "1 OPEN · OK")
+        self.assertEqual(widget._tabs_panel.card_summaries()[0][1], "demo")
+
+    def test_widget_keeps_terminal_state_when_scan_errors(self):
+        widget = self._make_inert_claude_widget()
+        widget._parked_sessions = {"1:1"}
+
+        with patch.object(claude_widget, "save_terminal_state") as save:
+            widget._on_terminal_sessions_read(
+                TerminalSessionsSnapshot(error="boom", updated_at=1.0)
+            )
+
+        save.assert_not_called()
+        self.assertEqual(widget._parked_sessions, {"1:1"})
+        self.assertEqual(widget._terminal_sessions_row.summary_text(), "—")
+
+    def test_widget_park_toggle_persists_and_updates_both_views(self):
+        widget = self._make_inert_claude_widget()
+        widget._parked_sessions = set()
+        widget._session_notes = {}
+        snapshot = TerminalSessionsSnapshot(
+            sessions=[self._terminal_session(key="5:5", needs_attention=True)],
+            updated_at=1.0,
+        )
+        with patch.object(claude_widget, "save_terminal_state",
+                          side_effect=lambda parked, notes, **kw: (set(parked), dict(notes))):
+            widget._on_terminal_sessions_read(snapshot)
+            self.assertEqual(widget._terminal_sessions_row.summary_text(),
+                             "1 OPEN · 1 NEED YOU")
+
+            widget._on_session_park_toggled("5:5", True)
+
+        self.assertEqual(widget._parked_sessions, {"5:5"})
+        self.assertEqual(widget._terminal_sessions_row.summary_text(),
+                         "1 OPEN · OK")
+        self.assertEqual(widget._tabs_panel.card_summaries()[0][2], "PARKED")
+
+    def test_widget_note_change_persists(self):
+        widget = self._make_inert_claude_widget()
+        widget._parked_sessions = set()
+        widget._session_notes = {}
+
+        with patch.object(claude_widget, "save_terminal_state",
+                          side_effect=lambda parked, notes, **kw: (set(parked), dict(notes))) as save:
+            widget._on_session_note_changed("5:5", "deploying")
+            widget._on_session_note_changed("5:5", "")
+
+        self.assertEqual(save.call_args_list[0].args[1], {"5:5": "deploying"})
+        self.assertEqual(save.call_args_list[1].args[1], {})
+        self.assertEqual(widget._session_notes, {})
+
+    def test_tabs_panel_slides_out_from_the_widget_left_edge(self):
+        widget = self._make_inert_claude_widget()
+        widget.show()
+        widget.move(500, 40)
+
+        widget._toggle_tabs_panel()
+        anim = widget._tabs_panel_anim
+        # The slide starts tucked under the widget's left edge...
+        self.assertTrue(widget._tabs_panel.isVisible())
+        self.assertTrue(widget._terminal_sessions_row._panel_open)
+        self.assertEqual(anim.startValue().x(), 500)
+        # ...and lands attached to it.
+        anim.setCurrentTime(anim.duration())
+        self.assertEqual(widget._tabs_panel.x(),
+                         500 - widget._tabs_panel.width())
+        self.assertEqual(widget._tabs_panel.y(), 40)
+
+        widget._toggle_tabs_panel()
+        self.assertFalse(widget._terminal_sessions_row._panel_open)
+        # Jumping to the end of the slide emits finished, which hides the panel.
+        anim.setCurrentTime(anim.duration())
+        self.assertFalse(widget._tabs_panel.isVisible())
+
+    def test_navigate_request_spawns_a_focus_worker_for_that_session(self):
+        widget = self._make_inert_claude_widget()
+        session = self._terminal_session(key="5:5")
+        snapshot = TerminalSessionsSnapshot(sessions=[session], updated_at=1.0)
+        with patch.object(claude_widget, "save_terminal_state",
+                          side_effect=lambda parked, notes, **kw: (set(parked), dict(notes))):
+            widget._on_terminal_sessions_read(snapshot)
+
+        with patch.object(claude_widget, "TerminalFocusWorker") as worker_cls:
+            worker_cls.return_value.isRunning.return_value = False
+            widget._on_session_navigate("5:5")
+            widget._on_session_navigate("no-such-key")
+
+        worker_cls.assert_called_once_with(session)
+        worker_cls.return_value.start.assert_called_once()
+
+    def test_navigation_is_ignored_while_a_focus_worker_runs(self):
+        widget = self._make_inert_claude_widget()
+        session = self._terminal_session(key="5:5")
+        snapshot = TerminalSessionsSnapshot(sessions=[session], updated_at=1.0)
+        with patch.object(claude_widget, "save_terminal_state",
+                          side_effect=lambda parked, notes, **kw: (set(parked), dict(notes))):
+            widget._on_terminal_sessions_read(snapshot)
+
+        with patch.object(claude_widget, "TerminalFocusWorker") as worker_cls:
+            worker_cls.return_value.isRunning.return_value = True
+            widget._on_session_navigate("5:5")
+            widget._on_session_navigate("5:5")
+
+        worker_cls.assert_called_once_with(session)
+
+    def test_hide_to_tray_hides_the_tabs_panel(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        widget.show()
+        widget._toggle_tabs_panel()
+        self.assertTrue(widget._tabs_panel.isVisible())
+
+        widget.hide_to_tray()
+
+        self.assertFalse(widget._tabs_panel.isVisible())
 
     def test_task_compass_icon_renders_common_tray_sizes(self):
         for size in (16, 32, 64):

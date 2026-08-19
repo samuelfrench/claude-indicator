@@ -18,7 +18,16 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QPoint, QRectF, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    QRectF,
+    QThread,
+    QTimer,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -32,9 +41,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
+    QPushButton,
+    QScrollArea,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -114,6 +127,23 @@ OPENCODE_PROVIDER_LABELS = (
     ("ollama", "ollama"),
 )
 OPENCODE_MODEL_LINES = 5
+# Agent CLI sessions on terminal tabs: a process from this table with a
+# controlling pts is one tab. The busy fraction is the share of wall-clock CPU
+# above which a session counts as working; opencode's TUI redraws even while it
+# is settled, so its threshold sits higher than the node/rust CLIs.
+TERMINAL_SESSION_TOOLS = (
+    ("claude", "CLAUDE", 0.03),
+    ("codex", "CODEX", 0.03),
+    ("opencode", "OPENCODE", 0.08),
+)
+TERMINAL_SESSIONS_STATE_PATH = Path.home() / ".claude" / "terminal_sessions.json"
+TERMINAL_SESSIONS_REFRESH_MS = 15 * 1000
+TERMINAL_SESSION_ATTENTION_IDLE_S = 120
+# Children forked this long after the session started are running tools (the
+# MCP/shell helpers every session spawns at launch all start almost at once),
+# so a quiet parent waiting on a subprocess still counts as working.
+TERMINAL_SESSION_CHILD_GRACE_S = 90
+TERMINAL_SESSION_MIN_SAMPLE_S = 2.0  # too little wall time to judge CPU use
 
 
 def build_task_compass_icon(size: int = 64) -> QIcon:
@@ -507,6 +537,27 @@ class OpencodeUsage:
     models: list[OpencodeModelUsage] = field(default_factory=list)
     local: LocalTokenUsage = field(default_factory=LocalTokenUsage)
     error: str = ""
+
+
+@dataclass
+class TerminalSession:
+    key: str
+    tool: str
+    project: str
+    cwd: str
+    tty: str
+    pid: int
+    busy: bool
+    parked: bool
+    idle_seconds: float
+    needs_attention: bool
+
+
+@dataclass
+class TerminalSessionsSnapshot:
+    sessions: list[TerminalSession] = field(default_factory=list)
+    error: str = ""
+    updated_at: float = 0.0
 
 
 @dataclass
@@ -1361,6 +1412,353 @@ def read_opencode_usage(
         models=models,
         local=local,
     )
+
+
+def _pts_name(tty_nr: int) -> str | None:
+    """Decode a stat tty_nr into pts/N, or None for any other terminal."""
+    major = (tty_nr >> 8) & 0xFFF
+    minor = (tty_nr & 0xFF) | ((tty_nr >> 12) & 0xFFF00)
+    if 136 <= major <= 143:
+        return f"pts/{(major - 136) * 256 + minor}"
+    return None
+
+
+def _read_proc_stat(stat_path: Path) -> dict | None:
+    try:
+        text = stat_path.read_text()
+        open_paren = text.index("(")
+        close_paren = text.rindex(")")
+        fields = text[close_paren + 2:].split()
+        return {
+            "comm": text[open_paren + 1:close_paren],
+            "ppid": int(fields[1]),
+            "tty_nr": int(fields[4]),
+            "cpu_ticks": int(fields[11]) + int(fields[12]),
+            "starttime": int(fields[19]),
+        }
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _scan_agent_processes(proc_root: Path) -> tuple[dict[int, dict], dict[int, int]]:
+    """(agent CLI processes on a pts by pid, pid->ppid map for every process)."""
+    tools = {comm: (label, busy) for comm, label, busy in TERMINAL_SESSION_TOOLS}
+    matched: dict[int, dict] = {}
+    parents: dict[int, int] = {}
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        info = _read_proc_stat(entry / "stat")
+        if info is None:
+            continue
+        pid = int(entry.name)
+        parents[pid] = info["ppid"]
+        tool = tools.get(info["comm"])
+        if tool is None:
+            continue
+        tty = _pts_name(info["tty_nr"])
+        if tty is None:
+            continue
+        info.update(pid=pid, label=tool[0], busy_fraction=tool[1], tty=tty)
+        matched[pid] = info
+    return matched, parents
+
+
+def _has_agent_ancestor(pid: int, parents: dict[int, int],
+                        matched: dict[int, dict]) -> bool:
+    current = parents.get(pid, 0)
+    for _ in range(32):
+        if current <= 1:
+            return False
+        if current in matched:
+            return True
+        current = parents.get(current, 0)
+    return False
+
+
+def _has_tool_child(proc_root: Path, pid: int, parent_starttime: int,
+                    clk_tck: int) -> bool:
+    try:
+        text = (proc_root / str(pid) / "task" / str(pid) / "children").read_text()
+    except OSError:
+        return False
+    grace_ticks = TERMINAL_SESSION_CHILD_GRACE_S * clk_tck
+    for child in text.split():
+        child_info = _read_proc_stat(proc_root / child / "stat")
+        if child_info and child_info["starttime"] - parent_starttime > grace_ticks:
+            return True
+    return False
+
+
+def _proc_cwd(proc_root: Path, pid: int) -> str:
+    try:
+        return os.readlink(proc_root / str(pid) / "cwd")
+    except OSError:
+        return ""
+
+
+def read_terminal_sessions(
+    prev_state: dict,
+    parked_keys: set[str],
+    *,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+    clk_tck: int | None = None,
+) -> tuple[TerminalSessionsSnapshot, dict]:
+    """One poll of the agent CLI sessions holding terminal tabs.
+
+    prev_state carries per-session CPU samples between polls so working/waiting
+    can be judged from the delta; the returned state replaces it wholesale,
+    which also forgets sessions that have exited. A session seen for the first
+    time counts as working so a fresh scan never flags stale-looking tabs
+    before a full sample interval has passed.
+    """
+    if now is None:
+        now = time.time()
+    if clk_tck is None:
+        clk_tck = os.sysconf("SC_CLK_TCK")
+    try:
+        matched, parents = _scan_agent_processes(proc_root)
+    except OSError as exc:
+        return TerminalSessionsSnapshot(error=str(exc), updated_at=now), {}
+
+    sessions: list[TerminalSession] = []
+    next_state: dict = {}
+    for pid, info in sorted(matched.items()):
+        # An agent forked inside another agent's tool call is not its own tab;
+        # its activity already registers on the ancestor as a tool child.
+        if _has_agent_ancestor(pid, parents, matched):
+            continue
+        key = f"{pid}:{info['starttime']}"
+        prev = prev_state.get(key)
+        if prev is None:
+            busy = True
+            last_active = now
+            sample_cpu, sample_ts = info["cpu_ticks"], now
+        elif now - prev["ts"] < TERMINAL_SESSION_MIN_SAMPLE_S:
+            busy = prev["busy"]
+            last_active = prev["last_active"]
+            sample_cpu, sample_ts = prev["cpu"], prev["ts"]
+        else:
+            elapsed = now - prev["ts"]
+            cpu_fraction = max(0, info["cpu_ticks"] - prev["cpu"]) / clk_tck / elapsed
+            busy = cpu_fraction > info["busy_fraction"] or _has_tool_child(
+                proc_root, pid, info["starttime"], clk_tck
+            )
+            last_active = now if busy else prev["last_active"]
+            sample_cpu, sample_ts = info["cpu_ticks"], now
+        next_state[key] = {
+            "cpu": sample_cpu, "ts": sample_ts,
+            "last_active": last_active, "busy": busy,
+        }
+        idle_seconds = 0.0 if busy else now - last_active
+        parked = key in parked_keys
+        cwd = _proc_cwd(proc_root, pid)
+        sessions.append(TerminalSession(
+            key=key,
+            tool=info["label"],
+            project=Path(cwd).name if cwd else "?",
+            cwd=cwd,
+            tty=info["tty"],
+            pid=pid,
+            busy=busy,
+            parked=parked,
+            idle_seconds=idle_seconds,
+            needs_attention=(
+                not parked and not busy
+                and idle_seconds >= TERMINAL_SESSION_ATTENTION_IDLE_S
+            ),
+        ))
+    return TerminalSessionsSnapshot(sessions=sessions, updated_at=now), next_state
+
+
+def load_terminal_state(
+    path: Path = TERMINAL_SESSIONS_STATE_PATH,
+) -> tuple[set[str], dict[str, str]]:
+    """(parked session keys, per-session notes) from the state file."""
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return set(), {}
+    if not isinstance(payload, dict):
+        return set(), {}
+    parked_raw = payload.get("parked")
+    notes_raw = payload.get("notes")
+    parked = {str(k) for k in parked_raw} if isinstance(parked_raw, list) else set()
+    notes = (
+        {str(k): str(v) for k, v in notes_raw.items() if str(v).strip()}
+        if isinstance(notes_raw, dict)
+        else {}
+    )
+    return parked, notes
+
+
+def save_terminal_state(
+    parked_keys: set[str],
+    notes: dict[str, str],
+    *,
+    live_keys: set[str] | None = None,
+    path: Path = TERMINAL_SESSIONS_STATE_PATH,
+) -> tuple[set[str], dict[str, str]]:
+    """Persist parked keys and notes, dropping state for exited sessions."""
+    keep_parked = set(parked_keys)
+    keep_notes = {k: v for k, v in notes.items() if str(v).strip()}
+    if live_keys is not None:
+        keep_parked &= set(live_keys)
+        keep_notes = {k: v for k, v in keep_notes.items() if k in live_keys}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(
+        {"version": 2, "parked": sorted(keep_parked), "notes": keep_notes}
+    ))
+    os.replace(tmp, path)
+    return keep_parked, keep_notes
+
+
+# Comm prefixes (15-char truncated) that mark a process as a terminal emulator
+# when walking up from an agent session to find the window that hosts its tab.
+TERMINAL_EMULATOR_COMMS = (
+    "gnome-terminal",
+    "konsole",
+    "xterm",
+    "kitty",
+    "alacritty",
+    "tilix",
+    "terminator",
+    "wezterm",
+    "ptyxis",
+    "xfce4-terminal",
+)
+
+
+def _terminal_ancestor_pid(pid: int, proc_root: Path = Path("/proc")) -> int | None:
+    current = pid
+    for _ in range(32):
+        info = _read_proc_stat(proc_root / str(current) / "stat")
+        if info is None:
+            return None
+        if any(info["comm"].startswith(comm) for comm in TERMINAL_EMULATOR_COMMS):
+            return current
+        if info["ppid"] <= 1:
+            return None
+        current = info["ppid"]
+    return None
+
+
+class XdotoolRunner:
+    """Thin xdotool wrapper so terminal focusing stays testable."""
+
+    def _run(self, *args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["xdotool", *args], capture_output=True, text=True, timeout=5
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def windows_for_pid(self, pid: int) -> list[int]:
+        out = self._run("search", "--onlyvisible", "--pid", str(pid))
+        return [int(w) for w in out.split() if w.isdigit()]
+
+    def window_name(self, wid: int) -> str:
+        return self._run("getwindowname", str(wid))
+
+    def activate(self, wid: int) -> None:
+        self._run("windowactivate", "--sync", str(wid))
+
+    def active_window(self) -> int | None:
+        out = self._run("getactivewindow")
+        return int(out) if out.isdigit() else None
+
+    def send_next_tab(self) -> None:
+        # XTEST to the focused window: GTK terminals ignore XSendEvent keys,
+        # so this must only run after confirming our window holds the focus.
+        self._run("key", "--clearmodifiers", "ctrl+Next")
+
+    def send_prev_tab(self) -> None:
+        self._run("key", "--clearmodifiers", "ctrl+Prior")
+
+
+def focus_terminal_session(
+    session: TerminalSession,
+    *,
+    runner=None,
+    proc_root: Path = Path("/proc"),
+    max_tabs: int = 24,
+    settle: float = 0.12,
+) -> tuple[bool, str]:
+    """Best-effort jump to the terminal tab hosting this agent session.
+
+    Matches the session's project name against window titles first (shells
+    and agent CLIs set the title to the working directory). When the tab is
+    not the active one, its title is invisible, so the fallback activates the
+    terminal window and cycles tabs until the title matches, stopping early
+    if focus is lost or cycling has no effect.
+    """
+    if runner is None:
+        runner = XdotoolRunner()
+    term_pid = _terminal_ancestor_pid(session.pid, proc_root)
+    if term_pid is None:
+        return False, "no terminal emulator ancestor found"
+    windows = runner.windows_for_pid(term_pid)
+    if not windows:
+        return False, "the terminal emulator has no visible windows"
+    target = session.project.lower()
+
+    for wid in windows:
+        if target and target in runner.window_name(wid).lower():
+            runner.activate(wid)
+            return True, f"window title matched {session.project}"
+
+    for wid in windows:
+        runner.activate(wid)
+        if runner.active_window() != wid:
+            continue
+        title = runner.window_name(wid).lower()
+        sent = 0
+        for _ in range(max_tabs):
+            if target and target in title:
+                return True, f"tab found by cycling window {wid}"
+            runner.send_next_tab()
+            sent += 1
+            if settle:
+                time.sleep(settle)
+            if runner.active_window() != wid:
+                break
+            new_title = runner.window_name(wid).lower()
+            if new_title == title:
+                break  # cycling has no effect: single tab or keys ignored
+            title = new_title
+        if target and target in title:
+            return True, f"tab found by cycling window {wid}"
+        # No match here: undo every tab switch so the window is left as found.
+        for _ in range(sent):
+            if runner.active_window() != wid:
+                break
+            runner.send_prev_tab()
+            if settle:
+                time.sleep(settle)
+
+    runner.activate(windows[0])
+    return False, "tab title never matched; activated the terminal window"
+
+
+class TerminalFocusWorker(QThread):
+    result = Signal(bool, str)
+
+    def __init__(self, session: TerminalSession, focuser=None):
+        super().__init__()
+        self._session = session
+        self._focuser = focuser
+
+    def run(self):
+        focuser = self._focuser or focus_terminal_session
+        try:
+            ok, detail = focuser(self._session)
+        except Exception as exc:  # never let a focus attempt kill the widget
+            ok, detail = False, str(exc)
+        if not self.isInterruptionRequested():
+            self.result.emit(ok, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -4232,6 +4630,458 @@ class OpencodeUsageRow(QWidget):
         painter.end()
 
 
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 90 * 60:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+_TERMINAL_TOOL_COLORS = {
+    "CLAUDE": QColor(212, 165, 116),
+    "CODEX": QColor(100, 181, 246),
+    "OPENCODE": QColor(129, 199, 132),
+}
+
+
+def _ordered_terminal_sessions(
+    snapshot: TerminalSessionsSnapshot | None,
+) -> list[TerminalSession]:
+    """Attention first (stalest on top), then idle, busy, and parked last."""
+    if snapshot is None or snapshot.error:
+        return []
+
+    def rank(session: TerminalSession):
+        return (_terminal_group_index(session), -session.idle_seconds, session.pid)
+
+    return sorted(snapshot.sessions, key=rank)
+
+
+_TERMINAL_GROUPS = ("NEEDS YOU", "WAITING", "WORKING", "PARKED")
+
+
+def _terminal_group_index(session: TerminalSession) -> int:
+    if session.parked:
+        return 3
+    if session.needs_attention:
+        return 0
+    if not session.busy:
+        return 1
+    return 2
+
+
+def _terminal_status_text(session: TerminalSession) -> str:
+    if session.parked:
+        return "PARKED"
+    if session.needs_attention:
+        return f"NEEDS YOU {_fmt_duration(session.idle_seconds)}"
+    if session.busy:
+        return "WORKING"
+    return f"WAITING {_fmt_duration(session.idle_seconds)}"
+
+
+def _terminal_status_color(session: TerminalSession) -> QColor:
+    if session.parked:
+        return QColor(102, 102, 128)
+    if session.needs_attention:
+        return QColor(239, 83, 80)
+    if session.busy:
+        return QColor(129, 199, 132)
+    return QColor(255, 183, 77)
+
+
+def _terminal_summary_text(snapshot: TerminalSessionsSnapshot | None) -> str:
+    if snapshot is None or snapshot.error:
+        return "—"
+    count = len(snapshot.sessions)
+    if count == 0:
+        return "NONE"
+    attention = sum(1 for s in snapshot.sessions if s.needs_attention)
+    if attention:
+        return f"{count} OPEN · {attention} NEED YOU"
+    return f"{count} OPEN · OK"
+
+
+class TerminalSessionsRow(QWidget):
+    """Summary line for agent CLI sessions; clicking toggles the tabs panel.
+
+    Height is budgeted at 22px (not the usual 30) so the main panel still
+    fits an 800px work area with a tall section expanded. The full session
+    list lives in TerminalTabsPanel, a separate window docked to the widget.
+    """
+
+    panel_toggle_requested = Signal()
+
+    _COLLAPSED_H = 22
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._snapshot: TerminalSessionsSnapshot | None = None
+        self._panel_open = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, snapshot: TerminalSessionsSnapshot | None):
+        self._snapshot = snapshot
+        self.setToolTip(self._tooltip(snapshot))
+        self.update()
+
+    def set_panel_open(self, open_: bool):
+        self._panel_open = open_
+        self.update()
+
+    def label_text(self) -> str:
+        return "TABS"
+
+    def _usable(self) -> TerminalSessionsSnapshot | None:
+        snapshot = self._snapshot
+        if snapshot is None or snapshot.error:
+            return None
+        return snapshot
+
+    def attention_count(self) -> int:
+        snapshot = self._usable()
+        if snapshot is None:
+            return 0
+        return sum(1 for s in snapshot.sessions if s.needs_attention)
+
+    def summary_text(self) -> str:
+        return _terminal_summary_text(self._usable())
+
+    def session_lines(self) -> list[tuple[str, str, str, str]]:
+        """(tool, project, tty, status) per session in display order."""
+        return [
+            (s.tool, s.project, s.tty, _terminal_status_text(s))
+            for s in _ordered_terminal_sessions(self._usable())
+        ]
+
+    def _tooltip(self, snapshot: TerminalSessionsSnapshot | None) -> str:
+        if snapshot is None:
+            return "Terminal agent sessions have not been scanned yet."
+        if snapshot.error:
+            return f"Terminal session scan failed: {snapshot.error}."
+        if not snapshot.sessions:
+            return "No claude/codex/opencode sessions hold a terminal right now."
+        lines = []
+        for s in _ordered_terminal_sessions(snapshot):
+            lines.append(
+                f"{_terminal_status_text(s)} — {s.tool.lower()} pid {s.pid} on "
+                f"{s.tty} in {s.cwd or '?'}"
+            )
+        lines.append("Click to open the tabs panel (park, unpark, notes).")
+        return "\n".join(lines)
+
+    def mousePressEvent(self, event):
+        self.panel_toggle_requested.emit()
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        arrow = "◂" if self._panel_open else "▸"
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 15, f"{self.label_text()} {arrow}")
+
+        right = self.summary_text()
+        if self._usable() is None:
+            summary_color = QColor(160, 160, 180)
+        elif self.attention_count():
+            summary_color = QColor(239, 83, 80)
+        else:
+            summary_color = QColor(129, 199, 132)
+        painter.setPen(summary_color)
+        fm = painter.fontMetrics()
+        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 15, right)
+        painter.end()
+
+
+class TerminalTabsPanel(QWidget):
+    """Docked companion window with one interactive card per terminal tab.
+
+    This is the workflow surface: each card shows the session's project,
+    state, and location, a PARK/UNPARK toggle, and a free-text note that
+    persists for the session's lifetime. Card rebuilds are deferred while a
+    note is being edited so the refresh timer never steals focus mid-typing.
+    """
+
+    parked_toggled = Signal(str, bool)
+    note_changed = Signal(str, str)
+    navigate_requested = Signal(str)
+    close_requested = Signal()
+
+    PANEL_WIDTH = 420
+    _CARD_H = 88
+    _MIN_H = 180
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedWidth(self.PANEL_WIDTH)
+
+        self._snapshot: TerminalSessionsSnapshot | None = None
+        self._notes: dict[str, str] = {}
+        self._pending: tuple | None = None
+        self._cards: list[dict] = []
+        self._group_labels: list[str] = []
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 12, 16, 12)
+        outer.setSpacing(6)
+
+        header = QHBoxLayout()
+        self._header_label = QLabel("TERMINAL TABS")
+        header_font = QFont("sans-serif", 10)
+        header_font.setWeight(QFont.Weight.Bold)
+        header_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        self._header_label.setFont(header_font)
+        self._header_label.setStyleSheet("color: #d4a574;")
+        header.addWidget(self._header_label)
+        header.addStretch()
+        close_btn = QLabel("✕")
+        close_btn.setStyleSheet("color: #666680; font-size: 13px; padding: 0 4px;")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.mousePressEvent = lambda _: self.close_requested.emit()
+        header.addWidget(close_btn)
+        outer.addLayout(header)
+
+        hint = QLabel("park a tab to silence it · notes persist per session")
+        hint.setStyleSheet("color: #666680; font-size: 9px;")
+        outer.addWidget(hint)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._scroll.setStyleSheet(
+            "QScrollArea { background: transparent; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        self._cards_host = QWidget()
+        self._cards_layout = QVBoxLayout(self._cards_host)
+        self._cards_layout.setContentsMargins(0, 0, 0, 0)
+        self._cards_layout.setSpacing(6)
+        self._scroll.setWidget(self._cards_host)
+        outer.addWidget(self._scroll)
+
+    # -- data ---------------------------------------------------------------
+
+    def set_data(self, snapshot: TerminalSessionsSnapshot | None,
+                 notes: dict[str, str]):
+        if self._editor_focused():
+            self._pending = (snapshot, dict(notes))
+            return
+        self._apply(snapshot, dict(notes))
+
+    def flush_pending(self):
+        if self._pending is not None and not self._editor_focused():
+            snapshot, notes = self._pending
+            self._pending = None
+            self._apply(snapshot, notes)
+
+    def _editor_focused(self) -> bool:
+        return any(card["note_edit"].hasFocus() for card in self._cards)
+
+    def _apply(self, snapshot, notes):
+        self._snapshot = snapshot
+        self._notes = notes
+        self._header_label.setText(
+            f"TERMINAL TABS — {_terminal_summary_text(snapshot)}"
+        )
+        while self._cards_layout.count():
+            item = self._cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._cards = []
+        self._group_labels = []
+        sessions = _ordered_terminal_sessions(snapshot)
+        if not sessions:
+            empty = QLabel("no claude / codex / opencode session holds a terminal")
+            empty.setStyleSheet("color: #8888a0; font-size: 10px; padding: 12px;")
+            self._cards_layout.addWidget(empty)
+        current_group = None
+        for session in sessions:
+            group = _TERMINAL_GROUPS[_terminal_group_index(session)]
+            if group != current_group:
+                current_group = group
+                header = QLabel(group)
+                color = _terminal_status_color(session).name()
+                header.setStyleSheet(
+                    f"color: {color}; font-size: 9px; font-weight: bold;"
+                    " letter-spacing: 1px; padding: 4px 2px 0 2px;"
+                )
+                self._group_labels.append(group)
+                self._cards_layout.addWidget(header)
+            self._cards_layout.addWidget(
+                self._build_card(session, notes.get(session.key, ""))
+            )
+        self._cards_layout.addStretch(1)
+        self._sync_height(len(sessions), len(self._group_labels))
+
+    def _build_card(self, session: TerminalSession, note: str) -> QWidget:
+        card = QFrame()
+        card.setFixedHeight(self._CARD_H)
+        accent = _terminal_status_color(session).name()
+        card.setStyleSheet(
+            "QFrame { background: rgba(35, 35, 50, 150); border-radius: 8px;"
+            f" border-left: 3px solid {accent}; }}"
+            "QLabel { background: transparent; border: none; }"
+        )
+        v = QVBoxLayout(card)
+        v.setContentsMargins(10, 6, 10, 6)
+        v.setSpacing(2)
+
+        key = session.key
+        top = QHBoxLayout()
+        tool = QLabel(session.tool)
+        tool_color = _TERMINAL_TOOL_COLORS.get(session.tool, QColor(150, 150, 170))
+        tool.setStyleSheet(
+            f"color: {tool_color.name()}; font-size: 9px; font-weight: bold;"
+        )
+        tool.setCursor(Qt.CursorShape.PointingHandCursor)
+        tool.mousePressEvent = lambda _e, k=key: self.navigate_requested.emit(k)
+        top.addWidget(tool)
+        name = QLabel(session.project)
+        name.setStyleSheet(
+            "color: #d8d8e8; font-size: 12px; font-weight: bold; padding-left: 4px;"
+        )
+        name.setCursor(Qt.CursorShape.PointingHandCursor)
+        name.setToolTip("Jump to this terminal tab")
+        name.mousePressEvent = lambda _e, k=key: self.navigate_requested.emit(k)
+        top.addWidget(name)
+        top.addStretch()
+        status = QLabel(_terminal_status_text(session))
+        status_color = _terminal_status_color(session)
+        status.setStyleSheet(
+            f"color: {status_color.name()}; font-size: 10px; font-weight: bold;"
+            f" background: rgba({status_color.red()}, {status_color.green()},"
+            f" {status_color.blue()}, 40); border-radius: 4px; padding: 2px 8px;"
+        )
+        top.addWidget(status)
+        v.addLayout(top)
+
+        where = QLabel(f"{session.cwd or '?'}  ·  {session.tty}  ·  pid {session.pid}")
+        where.setStyleSheet("color: #8888a0; font-size: 9px;")
+        v.addWidget(where)
+
+        bottom = QHBoxLayout()
+        note_edit = QLineEdit(note)
+        note_edit.setPlaceholderText("note — what is this tab doing?")
+        note_edit.setStyleSheet(
+            "QLineEdit { background: rgba(20, 20, 30, 180); color: #c8c8dc;"
+            " border: 1px solid rgba(100, 100, 120, 60); border-radius: 4px;"
+            " font-size: 10px; padding: 3px 6px; }"
+        )
+        bottom.addWidget(note_edit, 1)
+        park_btn = QPushButton("UNPARK" if session.parked else "PARK")
+        park_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        park_btn.setStyleSheet(
+            "QPushButton { background: rgba(60, 60, 85, 180); color: #b0b0c8;"
+            " border: none; border-radius: 4px; font-size: 9px;"
+            " font-weight: bold; padding: 4px 10px; }"
+            "QPushButton:hover { background: rgba(90, 90, 125, 200); }"
+        )
+        bottom.addWidget(park_btn)
+        v.addLayout(bottom)
+
+        parked = session.parked
+        park_btn.clicked.connect(
+            lambda _=False, k=key, p=parked: self.parked_toggled.emit(k, not p)
+        )
+        note_edit.editingFinished.connect(lambda k=key: self._on_note_finished(k))
+
+        self._cards.append({
+            "key": key,
+            "widget": card,
+            "note_edit": note_edit,
+            "park_btn": park_btn,
+            "status": status,
+            "project": session.project,
+        })
+        return card
+
+    def _sync_height(self, session_count: int, group_count: int = 0):
+        content = 70 + max(1, session_count) * (self._CARD_H + 6) + group_count * 20
+        available_h = None
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available_h = screen.availableGeometry().height() - 60
+        height = max(self._MIN_H, content)
+        if available_h is not None:
+            height = min(height, available_h)
+        self.setFixedHeight(height)
+
+    # -- helpers used by the widget and tests --------------------------------
+
+    def header_text(self) -> str:
+        return self._header_label.text()
+
+    def group_titles(self) -> list[str]:
+        return list(self._group_labels)
+
+    def click_navigate(self, key: str):
+        self._card(key)  # raises KeyError for unknown sessions
+        self.navigate_requested.emit(key)
+
+    def card_summaries(self) -> list[tuple[str, str, str, str]]:
+        """(key, project, status, park-button label) in display order."""
+        return [
+            (c["key"], c["project"], c["status"].text(), c["park_btn"].text())
+            for c in self._cards
+        ]
+
+    def _card(self, key: str) -> dict:
+        for card in self._cards:
+            if card["key"] == key:
+                return card
+        raise KeyError(key)
+
+    def click_park(self, key: str):
+        self._card(key)["park_btn"].click()
+
+    def note_text(self, key: str) -> str:
+        return self._card(key)["note_edit"].text()
+
+    def set_note_text(self, key: str, text: str):
+        self._card(key)["note_edit"].setText(text)
+        self._on_note_finished(key)
+
+    def _on_note_finished(self, key: str):
+        try:
+            card = self._card(key)
+        except KeyError:
+            return
+        text = card["note_edit"].text().strip()
+        if text != self._notes.get(key, ""):
+            if text:
+                self._notes[key] = text
+            else:
+                self._notes.pop(key, None)
+            self.note_changed.emit(key, text)
+        self.flush_pending()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
+        p.fillPath(path, QColor(20, 20, 30, 225))
+        p.setPen(QPen(QColor(80, 80, 100, 60), 1))
+        p.drawPath(path)
+        p.end()
+
+
 class LocalAISection(QWidget):
     """Collapsed local Ollama summary with compact model/GPU/ComfyUI details."""
 
@@ -5242,6 +6092,21 @@ class ClaudeWidget(QWidget):
             )
         self._sys_reader = SystemMetricsReader()
         self._has_fetched_usage = False
+        self._terminal_state: dict = {}
+        self._parked_sessions, self._session_notes = load_terminal_state()
+        self._last_terminal_snapshot: TerminalSessionsSnapshot | None = None
+        self._tabs_panel = TerminalTabsPanel()
+        self._tabs_panel.parked_toggled.connect(self._on_session_park_toggled)
+        self._tabs_panel.note_changed.connect(self._on_session_note_changed)
+        self._tabs_panel.navigate_requested.connect(self._on_session_navigate)
+        self._tabs_panel.close_requested.connect(self._toggle_tabs_panel)
+        self._terminal_focus_worker: TerminalFocusWorker | None = None
+        self._tabs_panel_closing = False
+        self._tabs_panel_anim = QPropertyAnimation(self._tabs_panel, b"pos", self)
+        self._tabs_panel_anim.setDuration(180)
+        self._tabs_panel_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._tabs_panel_anim.finished.connect(self._on_tabs_panel_anim_finished)
+        self.destroyed.connect(self._tabs_panel.deleteLater)
 
         self._build_ui()
         self.adjustSize()
@@ -5270,6 +6135,7 @@ class ClaudeWidget(QWidget):
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
         self._refresh_opencode_usage()
+        self._refresh_terminal_sessions()
 
         # Initialize graph with persisted history
         if self._history.points:
@@ -5441,6 +6307,13 @@ class ClaudeWidget(QWidget):
         self._opencode_row = OpencodeUsageRow()
         layout.addWidget(self._opencode_row)
 
+        # Agent CLI sessions on terminal tabs; click opens the docked panel
+        self._terminal_sessions_row = TerminalSessionsRow()
+        self._terminal_sessions_row.panel_toggle_requested.connect(
+            self._toggle_tabs_panel
+        )
+        layout.addWidget(self._terminal_sessions_row)
+
         # Deploy status row
         self._deploy_row = DeployRow()
         layout.addWidget(self._deploy_row)
@@ -5585,6 +6458,12 @@ class ClaudeWidget(QWidget):
         self._opencode_timer.timeout.connect(self._refresh_opencode_usage)
         self._opencode_timer.start(LOCAL_TOKENS_REFRESH_MS)
 
+        self._terminal_sessions_timer = QTimer(self)
+        self._terminal_sessions_timer.timeout.connect(
+            self._refresh_terminal_sessions
+        )
+        self._terminal_sessions_timer.start(TERMINAL_SESSIONS_REFRESH_MS)
+
         self._ollama_timer = QTimer(self)
         self._ollama_timer.timeout.connect(self._fetch_ollama)
         self._ollama_timer.start(OLLAMA_REFRESH_MS)
@@ -5599,6 +6478,7 @@ class ClaudeWidget(QWidget):
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
         self._refresh_opencode_usage()
+        self._refresh_terminal_sessions()
         self._fetch_ollama()
         self._fetch_comfyui()
         self._fetch_task_loops()
@@ -5934,6 +6814,133 @@ class ClaudeWidget(QWidget):
         self._opencode_row.set_data(usage)
         self.adjustSize()
 
+    def _refresh_terminal_sessions(self):
+        # Synchronous on purpose: one /proc pass with no network, same as the
+        # system-metrics reader, so parked toggles never race a worker thread.
+        snapshot, self._terminal_state = read_terminal_sessions(
+            self._terminal_state, self._parked_sessions
+        )
+        self._on_terminal_sessions_read(snapshot)
+
+    def _on_terminal_sessions_read(self, snapshot: TerminalSessionsSnapshot):
+        if not snapshot.error:
+            live = {session.key for session in snapshot.sessions}
+            pruned_parked = self._parked_sessions & live
+            pruned_notes = {
+                k: v for k, v in self._session_notes.items() if k in live
+            }
+            if (pruned_parked != self._parked_sessions
+                    or pruned_notes != self._session_notes):
+                self._parked_sessions, self._session_notes = save_terminal_state(
+                    pruned_parked, pruned_notes, live_keys=live
+                )
+            self._last_terminal_snapshot = snapshot
+            self._tabs_panel.set_data(snapshot, self._session_notes)
+        self._terminal_sessions_row.set_data(snapshot)
+
+    def _push_terminal_state_to_views(self):
+        """Re-derive parked/attention on the held snapshot and repaint views."""
+        snapshot = self._last_terminal_snapshot
+        if snapshot is None:
+            return
+        for session in snapshot.sessions:
+            session.parked = session.key in self._parked_sessions
+            session.needs_attention = (
+                not session.parked and not session.busy
+                and session.idle_seconds >= TERMINAL_SESSION_ATTENTION_IDLE_S
+            )
+        self._terminal_sessions_row.set_data(snapshot)
+        self._tabs_panel.set_data(snapshot, self._session_notes)
+
+    def _on_session_park_toggled(self, key: str, parked: bool):
+        if parked:
+            self._parked_sessions.add(key)
+        else:
+            self._parked_sessions.discard(key)
+        self._parked_sessions, self._session_notes = save_terminal_state(
+            set(self._parked_sessions), dict(self._session_notes)
+        )
+        self._push_terminal_state_to_views()
+
+    def _on_session_note_changed(self, key: str, text: str):
+        text = text.strip()
+        if text:
+            self._session_notes[key] = text
+        else:
+            self._session_notes.pop(key, None)
+        self._parked_sessions, self._session_notes = save_terminal_state(
+            set(self._parked_sessions), dict(self._session_notes)
+        )
+
+    def _on_session_navigate(self, key: str):
+        # One navigation at a time: replacing a still-running worker destroys
+        # its QThread mid-flight (fatal), and two cycling passes would send
+        # interleaved tab keystrokes anyway.
+        if (self._terminal_focus_worker is not None
+                and self._terminal_focus_worker.isRunning()):
+            return
+        snapshot = self._last_terminal_snapshot
+        if snapshot is None:
+            return
+        session = next((s for s in snapshot.sessions if s.key == key), None)
+        if session is None:
+            return
+        worker = TerminalFocusWorker(session)
+        worker.result.connect(self._on_session_focus_result)
+        self._terminal_focus_worker = worker
+        worker.start()
+
+    def _on_session_focus_result(self, ok: bool, detail: str):
+        log_line(f"terminal navigate: {'ok' if ok else 'failed'} — {detail}")
+
+    def _toggle_tabs_panel(self):
+        opening = not self._tabs_panel.isVisible() or self._tabs_panel_closing
+        self._slide_tabs_panel(opening)
+        self._terminal_sessions_row.set_panel_open(opening)
+
+    def _panel_positions(self) -> tuple[QPoint, QPoint]:
+        """(open, tucked-away) positions; the panel slides between them."""
+        open_x = self.x() - self._tabs_panel.width()
+        hidden_x = self.x()
+        screen = QApplication.primaryScreen()
+        if screen is not None and open_x < screen.availableGeometry().left():
+            open_x = self.x() + self.width()
+            hidden_x = self.x() + self.width() - self._tabs_panel.width()
+        return QPoint(open_x, self.y()), QPoint(hidden_x, self.y())
+
+    def _slide_tabs_panel(self, opening: bool):
+        panel, anim = self._tabs_panel, self._tabs_panel_anim
+        anim.stop()
+        open_pos, hidden_pos = self._panel_positions()
+        self._tabs_panel_closing = not opening
+        if opening and not panel.isVisible():
+            panel.move(hidden_pos)
+            panel.show()
+        # Keep the main panel on top so the tabs panel emerges from under it.
+        self.raise_()
+        anim.setStartValue(panel.pos())
+        anim.setEndValue(open_pos if opening else hidden_pos)
+        anim.start()
+
+    def _on_tabs_panel_anim_finished(self):
+        if self._tabs_panel_closing:
+            self._tabs_panel.hide()
+            self._tabs_panel_closing = False
+        else:
+            # The widget may have been dragged mid-slide (tracking is paused
+            # while the animation runs); snap to the current dock position.
+            self._tabs_panel.move(self._panel_positions()[0])
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        panel = getattr(self, "_tabs_panel", None)
+        anim = getattr(self, "_tabs_panel_anim", None)
+        if (panel is not None and panel.isVisible()
+                and anim is not None
+                and anim.state() != QPropertyAnimation.State.Running
+                and not self._tabs_panel_closing):
+            panel.move(self._panel_positions()[0])
+
     def _fetch_ollama(self):
         if self._shutdown_started:
             return
@@ -6038,8 +7045,17 @@ class ClaudeWidget(QWidget):
     def hide_to_tray(self):
         if self._tray is None:
             return
+        self._hide_tabs_panel()
         self._restore_sliver.hide()
         self.hide()
+
+    def _hide_tabs_panel(self):
+        # Immediate hide for tray/sliver/shutdown paths — no slide animation.
+        self._tabs_panel_anim.stop()
+        self._tabs_panel_closing = False
+        if self._tabs_panel.isVisible():
+            self._tabs_panel.hide()
+            self._terminal_sessions_row.set_panel_open(False)
 
     def collapse_to_sliver(self):
         """Replace the full panel with a visible tab on the nearest screen edge."""
@@ -6057,6 +7073,7 @@ class ClaudeWidget(QWidget):
             available.bottom() - self._restore_sliver.height() + 1,
         )
         left = available.right() - self._restore_sliver.width() + 1
+        self._hide_tabs_panel()
         self.hide()
         self._restore_sliver.move(left, top)
         self._restore_sliver.show()
@@ -6080,6 +7097,8 @@ class ClaudeWidget(QWidget):
         if self._shutdown_started:
             return
         self._shutdown_started = True
+        self._tabs_panel.hide()
+        self._tabs_panel.close()
         self._restore_sliver.hide()
         self._restore_sliver.close()
         for timer in self.findChildren(QTimer):
@@ -6093,6 +7112,7 @@ class ClaudeWidget(QWidget):
                 self._opencode_worker,
                 self._ollama_worker,
                 self._comfyui_worker,
+                self._terminal_focus_worker,
             )
             if worker is not None
         )
