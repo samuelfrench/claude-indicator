@@ -35,6 +35,7 @@ def make_proc(
     ppid: int = 1,
     tty_nr: int = 0,
     cpu_ticks: int = 0,
+    wchar: int = 0,
     starttime: int = 100_000,
     cwd: str = "/home/sam/claude-workspace/demo-project",
     children: tuple[int, ...] = (),
@@ -49,6 +50,7 @@ def make_proc(
         f"{pid} ({comm}) S {ppid} 0 0 {tty_nr} 0 0 0 0 0 0 "
         f"{cpu_ticks} 0 0 0 20 0 1 0 {starttime} 0 0"
     )
+    (proc_dir / "io").write_text(f"rchar: 0\nwchar: {wchar}\n")
     (task_dir / "children").write_text(" ".join(str(c) for c in children))
     if cwd:
         os.symlink(cwd, proc_dir / "cwd")
@@ -180,8 +182,24 @@ class ReadTerminalSessionsTest(unittest.TestCase):
         self.assertEqual(snapshot.sessions, [])
         self.assertEqual(state, {})
 
+    def test_terminal_writes_mark_busy_even_when_cpu_is_flat(self):
+        # An agent waiting on the API barely uses CPU but keeps redrawing its
+        # spinner/timer, so terminal write volume is the working signal.
+        make_proc(self.proc, 100, "claude", tty_nr=PTS3, wchar=1_000_000)
+        _, state = self._read(now=1_000.0)
+
+        # 50 KB over 10s = 5 KB/s of terminal output: working.
+        (self.proc / "100" / "io").write_text("rchar: 0\nwchar: 1051200\n")
+        snapshot, state = self._read(prev=state, now=1_010.0)
+        self.assertTrue(snapshot.sessions[0].busy)
+
+        # 100 bytes over the next 10s: an idle prompt.
+        (self.proc / "100" / "io").write_text("rchar: 0\nwchar: 1051300\n")
+        snapshot, _ = self._read(prev=state, now=1_020.0)
+        self.assertFalse(snapshot.sessions[0].busy)
+
     def test_config_covers_all_three_agent_clis(self):
-        comms = {comm for comm, _, _ in TERMINAL_SESSION_TOOLS}
+        comms = {comm for comm, _, _, _ in TERMINAL_SESSION_TOOLS}
         self.assertEqual(comms, {"claude", "codex", "opencode"})
 
 

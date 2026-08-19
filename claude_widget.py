@@ -128,16 +128,18 @@ OPENCODE_PROVIDER_LABELS = (
 )
 OPENCODE_MODEL_LINES = 5
 # Agent CLI sessions on terminal tabs: a process from this table with a
-# controlling pts is one tab. The busy fraction is the share of wall-clock CPU
-# above which a session counts as working; opencode's TUI redraws even while it
-# is settled, so its threshold sits higher than the node/rust CLIs.
+# controlling pts is one tab, judged working by either CPU share or terminal
+# write volume (wchar bytes/s). The write signal matters most for claude and
+# codex: while waiting on the API they barely use CPU but keep redrawing their
+# spinner/elapsed timer at KB/s, whereas an idle input prompt is near-silent.
+# opencode's TUI redraws even while settled, so both its thresholds sit higher.
 TERMINAL_SESSION_TOOLS = (
-    ("claude", "CLAUDE", 0.03),
-    ("codex", "CODEX", 0.03),
-    ("opencode", "OPENCODE", 0.08),
+    ("claude", "CLAUDE", 0.03, 1024),
+    ("codex", "CODEX", 0.03, 1024),
+    ("opencode", "OPENCODE", 0.08, 65536),
 )
 TERMINAL_SESSIONS_STATE_PATH = Path.home() / ".claude" / "terminal_sessions.json"
-TERMINAL_SESSIONS_REFRESH_MS = 15 * 1000
+TERMINAL_SESSIONS_REFRESH_MS = 5 * 1000
 TERMINAL_SESSION_ATTENTION_IDLE_S = 120
 # Children forked this long after the session started are running tools (the
 # MCP/shell helpers every session spawns at launch all start almost at once),
@@ -1440,9 +1442,23 @@ def _read_proc_stat(stat_path: Path) -> dict | None:
         return None
 
 
+def _read_proc_wchar(proc_root: Path, pid: int) -> int:
+    """Bytes the process has written (terminal output plus files); 0 if unknown."""
+    try:
+        for line in (proc_root / str(pid) / "io").read_text().splitlines():
+            if line.startswith("wchar:"):
+                return int(line.split(":", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
 def _scan_agent_processes(proc_root: Path) -> tuple[dict[int, dict], dict[int, int]]:
     """(agent CLI processes on a pts by pid, pid->ppid map for every process)."""
-    tools = {comm: (label, busy) for comm, label, busy in TERMINAL_SESSION_TOOLS}
+    tools = {
+        comm: (label, busy, io_rate)
+        for comm, label, busy, io_rate in TERMINAL_SESSION_TOOLS
+    }
     matched: dict[int, dict] = {}
     parents: dict[int, int] = {}
     for entry in proc_root.iterdir():
@@ -1459,7 +1475,10 @@ def _scan_agent_processes(proc_root: Path) -> tuple[dict[int, dict], dict[int, i
         tty = _pts_name(info["tty_nr"])
         if tty is None:
             continue
-        info.update(pid=pid, label=tool[0], busy_fraction=tool[1], tty=tty)
+        info.update(
+            pid=pid, label=tool[0], busy_fraction=tool[1],
+            io_rate=tool[2], wchar=_read_proc_wchar(proc_root, pid), tty=tty,
+        )
         matched[pid] = info
     return matched, parents
 
@@ -1534,21 +1553,24 @@ def read_terminal_sessions(
         if prev is None:
             busy = True
             last_active = now
-            sample_cpu, sample_ts = info["cpu_ticks"], now
+            sample_cpu, sample_io, sample_ts = info["cpu_ticks"], info["wchar"], now
         elif now - prev["ts"] < TERMINAL_SESSION_MIN_SAMPLE_S:
             busy = prev["busy"]
             last_active = prev["last_active"]
-            sample_cpu, sample_ts = prev["cpu"], prev["ts"]
+            sample_cpu, sample_io, sample_ts = prev["cpu"], prev["io"], prev["ts"]
         else:
             elapsed = now - prev["ts"]
             cpu_fraction = max(0, info["cpu_ticks"] - prev["cpu"]) / clk_tck / elapsed
-            busy = cpu_fraction > info["busy_fraction"] or _has_tool_child(
-                proc_root, pid, info["starttime"], clk_tck
+            io_per_s = max(0, info["wchar"] - prev.get("io", 0)) / elapsed
+            busy = (
+                cpu_fraction > info["busy_fraction"]
+                or io_per_s > info["io_rate"]
+                or _has_tool_child(proc_root, pid, info["starttime"], clk_tck)
             )
             last_active = now if busy else prev["last_active"]
-            sample_cpu, sample_ts = info["cpu_ticks"], now
+            sample_cpu, sample_io, sample_ts = info["cpu_ticks"], info["wchar"], now
         next_state[key] = {
-            "cpu": sample_cpu, "ts": sample_ts,
+            "cpu": sample_cpu, "io": sample_io, "ts": sample_ts,
             "last_active": last_active, "busy": busy,
         }
         idle_seconds = 0.0 if busy else now - last_active
