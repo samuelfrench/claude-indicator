@@ -30,7 +30,9 @@ from claude_widget import (
     LoadedModel,
     LocalAISection,
     LocalTokenUsage,
-    LocalTokensRow,
+    OpencodeModelUsage,
+    OpencodeUsage,
+    OpencodeUsageRow,
     MinimaxUsageRow,
     MinimaxUsageSummary,
     MinimaxWindow,
@@ -55,6 +57,8 @@ from claude_widget import (
     read_minimax_api_key,
     read_opencode_deepseek_spend,
     read_opencode_local_tokens,
+    read_opencode_model_breakdown,
+    read_opencode_usage,
     read_opencode_minimax_usage,
     parse_minimax_quota,
     record_deepseek_snapshot,
@@ -340,30 +344,160 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(usage.first_seen, 0)
         self.assertEqual(usage.latest_model, "")
 
-    def test_local_tokens_row_names_opencode_as_its_source(self):
-        row = LocalTokensRow()
-        row.set_data(
-            LocalTokenUsage(
-                today_tokens=12_400_000, today_messages=44,
-                all_time_tokens=50_946_774, all_time_messages=2887,
-                first_seen=1786924800, latest_model="qwen3.6:27b-mtp-ctx32k",
-            )
+    def _sample_opencode_usage(self):
+        return OpencodeUsage(
+            window_tokens=996_500_000 + 4_224_131 + 1_100_000,
+            models=[
+                OpencodeModelUsage(
+                    provider="minimax-coding-plan", model="MiniMax-M3",
+                    tokens=996_500_000, messages=3748, cost=Decimal("0"),
+                    last_used=1787151600,
+                ),
+                OpencodeModelUsage(
+                    provider="ollama", model="qwen3.6:27b-mtp-ctx32k",
+                    tokens=4_224_131, messages=230, cost=Decimal("0"),
+                    last_used=1787151500,
+                ),
+                OpencodeModelUsage(
+                    provider="deepseek", model="deepseek-chat",
+                    tokens=1_100_000, messages=38, cost=Decimal("0.26"),
+                    last_used=1787100000,
+                ),
+            ],
+            local=LocalTokenUsage(
+                today_tokens=4_224_131, today_messages=230,
+                all_time_tokens=51_220_203, all_time_messages=2902,
+                first_seen=1786885971, latest_model="qwen3.6:27b-mtp-ctx32k",
+            ),
         )
 
-        self.assertEqual(row.summary_text(), "DAY 12.4M  ·  ALL 50.9M")
-        self.assertIn("OPENCODE", row.label_text())
-        self.assertIn("OpenCode", row.toolTip())
-        self.assertIn("qwen3.6:27b-mtp-ctx32k", row.toolTip())
+    def test_opencode_row_summarises_window_tokens_and_model_count(self):
+        row = OpencodeUsageRow()
+        row.set_data(self._sample_opencode_usage())
 
-    def test_local_tokens_row_shows_placeholders_before_first_read(self):
-        row = LocalTokensRow()
-        self.assertEqual(row.summary_text(), "DAY —  ·  ALL —")
+        self.assertEqual(row.label_text(), "OPENCODE")
+        self.assertEqual(row.summary_text(), "24H 1.0B  ·  3 MODELS")
 
-    def test_widget_places_local_tokens_row_directly_after_minimax_row(self):
+    def test_opencode_row_lists_each_provider_distinctly_by_model(self):
+        row = OpencodeUsageRow()
+        row.set_data(self._sample_opencode_usage())
+
+        lines = row.model_lines()
+        self.assertEqual(
+            [line[0] for line in lines],
+            ["MiniMax-M3", "qwen3.6:27b-mtp-ctx32k", "deepseek-chat"],
+        )
+        # Each line names the provider so same-family models stay distinguishable.
+        self.assertEqual([line[2] for line in lines], ["minimax", "ollama", "deepseek"])
+        self.assertEqual(lines[0][1], "996.5M")
+        self.assertEqual(lines[2][3], "$0.26")
+
+    def test_opencode_row_caps_the_model_list_and_keeps_the_heaviest(self):
+        usage = self._sample_opencode_usage()
+        usage.models = [
+            OpencodeModelUsage(provider="ollama", model=f"model-{index}",
+                               tokens=1000 - index, messages=1, cost=Decimal("0"),
+                               last_used=1787151600)
+            for index in range(9)
+        ]
+        row = OpencodeUsageRow()
+        row.set_data(usage)
+
+        lines = row.model_lines()
+        self.assertLessEqual(len(lines), 5)
+        self.assertEqual(lines[0][0], "model-0")
+
+    def test_opencode_row_keeps_local_day_and_all_time_visible(self):
+        row = OpencodeUsageRow()
+        row.set_data(self._sample_opencode_usage())
+
+        self.assertEqual(row.local_text(), "DAY 4.2M  ·  ALL 51.2M  ·  since 16 Aug")
+        self.assertIn("51.2M", row.toolTip())
+        self.assertIn("aider", row.toolTip())
+
+    def test_opencode_row_shows_placeholders_before_first_read(self):
+        row = OpencodeUsageRow()
+        self.assertEqual(row.summary_text(), "24H —  ·  — MODELS")
+        self.assertEqual(row.model_lines(), [])
+
+    def test_opencode_model_breakdown_groups_by_provider_and_model(self):
+        now = 1_800_000_000.0
+
+        def tokens(inp, out):
+            return {"input": inp, "output": out, "reasoning": 0,
+                    "cache": {"read": 0, "write": 0}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                rows = [
+                    ("stale", int((now - 25 * 3600) * 1000),
+                     {"role": "assistant", "providerID": "ollama", "modelID": "qwen3.6",
+                      "tokens": tokens(9000, 9000), "cost": 0}),
+                    ("mm1", int((now - 7200) * 1000),
+                     {"role": "assistant", "providerID": "minimax-coding-plan",
+                      "modelID": "MiniMax-M3", "tokens": tokens(100, 50), "cost": 0}),
+                    ("mm2", int((now - 60) * 1000),
+                     {"role": "assistant", "providerID": "minimax-coding-plan",
+                      "modelID": "MiniMax-M3", "tokens": tokens(10, 5), "cost": 0}),
+                    ("ds", int((now - 3600) * 1000),
+                     {"role": "assistant", "providerID": "deepseek",
+                      "modelID": "deepseek-chat", "tokens": tokens(20, 10), "cost": 0.125}),
+                    ("ol", int((now - 120) * 1000),
+                     {"role": "assistant", "providerID": "ollama",
+                      "modelID": "qwen3.6", "tokens": tokens(7, 3), "cost": 0}),
+                    ("user", int((now - 30) * 1000),
+                     {"role": "user", "providerID": "ollama", "modelID": "qwen3.6",
+                      "tokens": tokens(500, 500), "cost": 0}),
+                ]
+                conn.executemany(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    [(rid, created, json.dumps(data)) for rid, created, data in rows],
+                )
+
+            models = read_opencode_model_breakdown(db_path=db_path, now=now)
+
+        self.assertEqual([(m.provider, m.model, m.tokens, m.messages) for m in models], [
+            ("minimax-coding-plan", "MiniMax-M3", 165, 2),
+            ("deepseek", "deepseek-chat", 30, 1),
+            ("ollama", "qwen3.6", 10, 1),
+        ])
+        self.assertEqual(models[1].cost, Decimal("0.125"))
+        self.assertEqual(models[0].last_used, int(now - 60))
+
+    def test_read_opencode_usage_combines_breakdown_with_local_totals(self):
+        now = time.mktime((2026, 8, 19, 12, 0, 0, 0, 0, -1))
+        midnight = time.mktime((2026, 8, 19, 0, 0, 0, 0, 0, -1))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                conn.executemany(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    [
+                        ("a", int((midnight + 60) * 1000), json.dumps(
+                            {"role": "assistant", "providerID": "ollama", "modelID": "qwen3.6",
+                             "tokens": {"input": 10, "output": 5}, "cost": 0})),
+                        ("b", int((now - 60) * 1000), json.dumps(
+                            {"role": "assistant", "providerID": "minimax-coding-plan",
+                             "modelID": "MiniMax-M3", "tokens": {"input": 100, "output": 1},
+                             "cost": 0})),
+                    ],
+                )
+
+            usage = read_opencode_usage(db_path=db_path, now=now)
+
+        self.assertEqual(usage.window_tokens, 116)
+        self.assertEqual([m.model for m in usage.models], ["MiniMax-M3", "qwen3.6"])
+        self.assertEqual(usage.local.today_tokens, 15)
+        self.assertEqual(usage.error, "")
+
+    def test_widget_places_opencode_row_directly_after_minimax_row(self):
         widget = self._make_inert_claude_widget()
         layout = widget._minimax_row.parentWidget().layout()
         self.assertEqual(
-            layout.indexOf(widget._local_tokens_row),
+            layout.indexOf(widget._opencode_row),
             layout.indexOf(widget._minimax_row) + 1,
         )
 
@@ -680,7 +814,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_deepseek_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_minimax_usage", lambda self: None),
-            patch.object(ClaudeWidget, "_refresh_local_tokens", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_opencode_usage", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_ollama", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_comfyui", lambda self: None),
             patch.object(claude_widget, "SmartTodoDialog", dialog_factory),
