@@ -37,6 +37,7 @@ from claude_widget import (
     _parse_codex_app_server_rate_limit,
     _parse_codex_rate_limit_event,
     _parse_model_limits,
+    _normalize_model_name,
     load_last_usage,
     read_codex_rate_limit,
     read_latest_codex_rate_limit,
@@ -168,17 +169,38 @@ class WidgetUiTest(unittest.TestCase):
                 },
                 "is_active": False,
             },
+            {
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 11,
+                "severity": "normal",
+                "resets_at": "2026-07-08T07:59:59+00:00",
+                "scope": {
+                    "model": {"id": "minimax", "display_name": None},
+                    "surface": None,
+                },
+                "is_active": False,
+            },
         ],
     }
 
     def test_parse_model_limits_extracts_model_scoped_entries_only(self):
         limits = _parse_model_limits(self._SCOPED_LIMITS_PAYLOAD)
 
-        self.assertEqual(len(limits), 1)
+        self.assertEqual(len(limits), 2)
         self.assertEqual(limits[0].name, "Fable")
         self.assertEqual(limits[0].window, "7-Day")
         self.assertEqual(limits[0].entry.utilization, 3.0)
         self.assertEqual(limits[0].entry.resets_at, "2026-07-07T07:59:59+00:00")
+        self.assertEqual(limits[1].name, "Minimax")
+        self.assertEqual(limits[1].window, "7-Day")
+        self.assertEqual(limits[1].entry.utilization, 11.0)
+        self.assertEqual(limits[1].entry.resets_at, "2026-07-08T07:59:59+00:00")
+
+    def test_normalize_model_name_titlecases_plain_model_ids(self):
+        self.assertEqual(_normalize_model_name("minimax"), "Minimax")
+        self.assertEqual(_normalize_model_name("claude-opus"), "claude-opus")
+        self.assertEqual(_normalize_model_name("Fable"), "Fable")
 
     def test_fetch_populates_model_limits_from_limits_array(self):
         client = ClaudeUsageClient()
@@ -196,7 +218,7 @@ class WidgetUiTest(unittest.TestCase):
             data = client.fetch()
 
         self.assertEqual(data.error, "")
-        self.assertEqual([ml.name for ml in data.model_limits], ["Fable"])
+        self.assertEqual([ml.name for ml in data.model_limits], ["Fable", "Minimax"])
         self.assertEqual(data.model_name, "fable")
         self.assertEqual(data.model_pct, 3.0)
 
@@ -205,6 +227,9 @@ class WidgetUiTest(unittest.TestCase):
             model_limits=[
                 ModelLimit(
                     name="Fable", window="7-Day", entry=UsageEntry(utilization=3.0)
+                ),
+                ModelLimit(
+                    name="Minimax", window="7-Day", entry=UsageEntry(utilization=11.0)
                 )
             ],
             seven_day_opus=UsageEntry(utilization=55.0),
@@ -212,7 +237,7 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertEqual(
             [(ml.name, ml.entry.utilization) for ml in data.display_model_limits],
-            [("Fable", 3.0), ("Opus", 55.0)],
+            [("Fable", 3.0), ("Minimax", 11.0), ("Opus", 55.0)],
         )
 
         deduped = UsageData(

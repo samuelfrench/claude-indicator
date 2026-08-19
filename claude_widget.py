@@ -1050,6 +1050,15 @@ def _entry_to_dict(e: UsageEntry | None) -> dict | None:
 LIMIT_GROUP_WINDOWS = {"session": "5-Hour", "weekly": "7-Day"}
 
 
+def _normalize_model_name(name: str) -> str:
+    """Normalize model labels while preserving API-provided formatting."""
+    if not name:
+        return ""
+    if " " not in name and "_" not in name and "-" not in name:
+        return name.title()
+    return name
+
+
 def _parse_model_limits(data: dict) -> list[ModelLimit]:
     """Extract model-scoped limits from the /api/oauth/usage `limits` array.
 
@@ -1068,7 +1077,9 @@ def _parse_model_limits(data: dict) -> list[ModelLimit]:
         model = scope.get("model") if isinstance(scope, dict) else None
         if not isinstance(model, dict):
             continue
-        name = model.get("display_name") or model.get("id") or ""
+        name = _normalize_model_name(
+            model.get("display_name") or model.get("id") or ""
+        )
         if not name or name.lower() in seen:
             continue
         group = item.get("group") or ""
