@@ -93,6 +93,14 @@ COMFYUI_URL = "http://127.0.0.1:8188"
 DEEPSEEK_HISTORY_VERSION = 1
 DEEPSEEK_HISTORY_RETENTION_S = 8 * 24 * 3600
 DEEPSEEK_SNAPSHOT_MAX_AGE_S = 15 * 60
+# MiniMax is a subscription coding plan: OpenCode records cost 0 for every
+# message, so the meaningful signals are the plan's own rolling quota windows
+# and the locally recorded token volume.
+MINIMAX_AUTH_PATH = DEEPSEEK_AUTH_PATH
+MINIMAX_QUOTA_URL = "https://api.minimax.io/v1/token_plan/remains"
+MINIMAX_PROVIDER_ID = "minimax-coding-plan"
+MINIMAX_QUOTA_FAMILY = "general"
+MINIMAX_REFRESH_MS = 5 * 60 * 1000  # plan quota endpoint and local token ledger
 
 
 def build_task_compass_icon(size: int = 64) -> QIcon:
@@ -434,6 +442,29 @@ class DeepSeekUsageSummary:
     spend_message_count: int = 0
     spend_error: str = ""
     is_available: bool | None = None
+
+
+@dataclass(frozen=True)
+class MinimaxWindow:
+    used_percent: float
+    resets_at: int
+    usage_count: int
+    total_count: int
+
+
+@dataclass
+class MinimaxUsageSummary:
+    five_hour: MinimaxWindow | None = None
+    weekly: MinimaxWindow | None = None
+    quota_fetched_at: float = 0.0
+    quota_source: str = ""
+    quota_error: str = ""
+    tokens_24h: int = 0
+    message_count: int = 0
+    coverage_s: int = 0
+    model_name: str = ""
+    usage_source: str = ""
+    usage_error: str = ""
 
 
 @dataclass
@@ -887,6 +918,221 @@ def read_deepseek_usage(
             summary.spend_coverage_s = coverage
             summary.spend_currency = currency
             summary.spend_source = "balance"
+    return summary
+
+
+
+def read_minimax_api_key(
+    *, auth_path: Path = MINIMAX_AUTH_PATH, environ: dict | None = None
+) -> str:
+    environment = os.environ if environ is None else environ
+    env_key = environment.get("MINIMAX_API_KEY", "")
+    if isinstance(env_key, str) and env_key.strip():
+        return env_key.strip()
+    data = _read_owned_private_json(auth_path)
+    provider = data.get(MINIMAX_PROVIDER_ID)
+    if not isinstance(provider, dict):
+        raise ValueError("MiniMax credential unavailable")
+    key = provider.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("MiniMax credential unavailable")
+    return key.strip()
+
+
+def _minimax_used_percent(value) -> float:
+    """Convert an API remaining-percent into the widget's utilization scale."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("MiniMax quota percent is invalid")
+    if not 0 <= value <= 100:
+        raise ValueError("MiniMax quota percent is out of range")
+    return float(100 - value)
+
+
+def _minimax_epoch_seconds(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("MiniMax quota window time is invalid")
+    return value // 1000
+
+
+def _minimax_count(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("MiniMax quota count is invalid")
+    return value
+
+
+def parse_minimax_quota(
+    payload: dict, *, family: str = MINIMAX_QUOTA_FAMILY
+) -> tuple[MinimaxWindow, MinimaxWindow]:
+    if not isinstance(payload, dict):
+        raise ValueError("MiniMax quota response schema is invalid")
+    base = payload.get("base_resp")
+    if not isinstance(base, dict) or base.get("status_code") != 0:
+        raise ValueError("MiniMax quota response reported an error")
+    entries = payload.get("model_remains")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("MiniMax quota response has no windows")
+    entry = next(
+        (
+            item
+            for item in entries
+            if isinstance(item, dict) and item.get("model_name") == family
+        ),
+        None,
+    )
+    if entry is None:
+        raise ValueError(f"MiniMax quota response has no {family} window")
+    five_hour = MinimaxWindow(
+        used_percent=_minimax_used_percent(entry.get("current_interval_remaining_percent")),
+        resets_at=_minimax_epoch_seconds(entry.get("end_time")),
+        usage_count=_minimax_count(entry.get("current_interval_usage_count")),
+        total_count=_minimax_count(entry.get("current_interval_total_count")),
+    )
+    weekly = MinimaxWindow(
+        used_percent=_minimax_used_percent(entry.get("current_weekly_remaining_percent")),
+        resets_at=_minimax_epoch_seconds(entry.get("weekly_end_time")),
+        usage_count=_minimax_count(entry.get("current_weekly_usage_count")),
+        total_count=_minimax_count(entry.get("current_weekly_total_count")),
+    )
+    return five_hour, weekly
+
+
+def fetch_minimax_quota(api_key: str) -> tuple[MinimaxWindow, MinimaxWindow]:
+    response = requests.get(
+        MINIMAX_QUOTA_URL,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return parse_minimax_quota(response.json())
+
+
+def read_opencode_minimax_usage(
+    *, db_path: Path = OPENCODE_DB_PATH, now: float | None = None
+) -> tuple[int, int, int, str]:
+    """Return 24h token total, message count, ledger coverage and latest model."""
+    now = time.time() if now is None else now
+    try:
+        metadata = db_path.lstat()
+    except OSError as exc:
+        raise ValueError("OpenCode cost database unavailable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise ValueError("OpenCode cost database is unsafe")
+    cutoff_ms = int((now - 24 * 3600) * 1000)
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=1) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            total, valid, tokens, oldest, model = conn.execute(
+                """
+                WITH parsed AS (
+                  SELECT
+                    time_created,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.role'
+                    ) AS role,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.providerID'
+                    ) AS provider,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.modelID'
+                    ) AS model,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.tokens.input'
+                    ) AS t_input,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.tokens.output'
+                    ) AS t_output,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.tokens.reasoning'
+                    ) AS t_reasoning,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.tokens.cache.read'
+                    ) AS t_cache_read,
+                    json_extract(
+                      CASE WHEN json_valid(data) THEN data ELSE '{}' END,
+                      '$.tokens.cache.write'
+                    ) AS t_cache_write
+                  FROM message
+                ),
+                scoped AS (
+                  SELECT * FROM parsed
+                  WHERE role = 'assistant' AND provider = ?
+                )
+                SELECT
+                  COUNT(*),
+                  SUM(
+                    CASE WHEN
+                      (t_input IS NULL OR (typeof(t_input) IN ('integer','real') AND t_input >= 0))
+                      AND (t_output IS NULL OR (typeof(t_output) IN ('integer','real') AND t_output >= 0))
+                      AND (t_reasoning IS NULL OR (typeof(t_reasoning) IN ('integer','real') AND t_reasoning >= 0))
+                      AND (t_cache_read IS NULL OR (typeof(t_cache_read) IN ('integer','real') AND t_cache_read >= 0))
+                      AND (t_cache_write IS NULL OR (typeof(t_cache_write) IN ('integer','real') AND t_cache_write >= 0))
+                    THEN 1 ELSE 0 END
+                  ),
+                  SUM(
+                    COALESCE(CASE WHEN typeof(t_input) IN ('integer','real') THEN t_input END, 0)
+                    + COALESCE(CASE WHEN typeof(t_output) IN ('integer','real') THEN t_output END, 0)
+                    + COALESCE(CASE WHEN typeof(t_reasoning) IN ('integer','real') THEN t_reasoning END, 0)
+                    + COALESCE(CASE WHEN typeof(t_cache_read) IN ('integer','real') THEN t_cache_read END, 0)
+                    + COALESCE(CASE WHEN typeof(t_cache_write) IN ('integer','real') THEN t_cache_write END, 0)
+                  ),
+                  (SELECT MIN(time_created) FROM scoped),
+                  (SELECT model FROM scoped WHERE model IS NOT NULL
+                   ORDER BY time_created DESC LIMIT 1)
+                FROM scoped
+                WHERE time_created >= ?
+                """,
+                (MINIMAX_PROVIDER_ID, cutoff_ms),
+            ).fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        raise ValueError("OpenCode cost database unavailable") from exc
+    total = int(total or 0)
+    valid = int(valid or 0)
+    if total != valid:
+        raise ValueError("OpenCode MiniMax rows contain invalid token counts")
+    coverage_s = 0 if oldest is None else min(24 * 3600, max(0, int(now - int(oldest) / 1000)))
+    return int(tokens or 0), total, coverage_s, str(model or "")
+
+
+def read_minimax_usage(
+    *,
+    now: float | None = None,
+    auth_path: Path = MINIMAX_AUTH_PATH,
+    db_path: Path = OPENCODE_DB_PATH,
+    environ: dict | None = None,
+) -> MinimaxUsageSummary:
+    now = time.time() if now is None else now
+    summary = MinimaxUsageSummary()
+    try:
+        api_key = read_minimax_api_key(auth_path=auth_path, environ=environ)
+        five_hour, weekly = fetch_minimax_quota(api_key)
+    except (ValueError, OSError, requests.RequestException, json.JSONDecodeError):
+        summary.quota_error = "Plan quota unavailable"
+    else:
+        summary.five_hour = five_hour
+        summary.weekly = weekly
+        summary.quota_fetched_at = now
+        summary.quota_source = "live"
+
+    try:
+        tokens, count, coverage, model = read_opencode_minimax_usage(
+            db_path=db_path, now=now
+        )
+    except ValueError as exc:
+        summary.usage_error = str(exc)
+    else:
+        summary.tokens_24h = tokens
+        summary.message_count = count
+        summary.coverage_s = coverage
+        summary.model_name = model
+        summary.usage_source = "opencode"
     return summary
 
 
@@ -1959,6 +2205,22 @@ class DeepSeekUsageWorker(QThread):
         if self.isInterruptionRequested():
             return
         reader = self._reader or read_deepseek_usage
+        summary = reader()
+        if not self.isInterruptionRequested():
+            self.result.emit(summary)
+
+
+class MinimaxUsageWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        reader = self._reader or read_minimax_usage
         summary = reader()
         if not self.isInterruptionRequested():
             self.result.emit(summary)
@@ -3442,6 +3704,134 @@ class DeepSeekUsageRow(QWidget):
         painter.end()
 
 
+class MinimaxUsageRow(QWidget):
+    """Compact MiniMax coding-plan quota row with local token disclosure."""
+
+    _COLLAPSED_H = 30
+    _EXPANDED_H = 88
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._summary: MinimaxUsageSummary | None = None
+        self._expanded = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, summary: MinimaxUsageSummary | None):
+        self._summary = summary
+        self.setToolTip(self._tooltip(summary))
+        self.update()
+
+    @staticmethod
+    def _window_text(window: MinimaxWindow | None) -> str:
+        return "—" if window is None else f"{window.used_percent:.0f}%"
+
+    def summary_text(self) -> str:
+        summary = self._summary
+        five_hour = self._window_text(summary.five_hour if summary else None)
+        weekly = self._window_text(summary.weekly if summary else None)
+        return f"5H {five_hour}  ·  7D {weekly}"
+
+    def tokens_text(self) -> str:
+        summary = self._summary
+        if summary is None or summary.usage_source != "opencode":
+            return "—"
+        return _fmt_tokens(summary.tokens_24h)
+
+    def _peak_percent(self) -> float:
+        summary = self._summary
+        if summary is None:
+            return 0.0
+        return max(
+            (w.used_percent for w in (summary.five_hour, summary.weekly) if w is not None),
+            default=0.0,
+        )
+
+    def _tooltip(self, summary: MinimaxUsageSummary | None) -> str:
+        if summary is None:
+            return "MiniMax data has not been read yet."
+        lines: list[str] = []
+        if summary.quota_source == "live":
+            lines.append(
+                f"Plan quota: 5-hour window {self._window_text(summary.five_hour)} used, "
+                f"weekly {self._window_text(summary.weekly)} used "
+                f"(live MiniMax /v1/token_plan/remains, {MINIMAX_QUOTA_FAMILY} family)."
+            )
+            if summary.weekly is not None:
+                lines.append(
+                    "Weekly window resets "
+                    + time.strftime("%a %d %b %H:%M", time.localtime(summary.weekly.resets_at))
+                    + "."
+                )
+        if summary.quota_error:
+            lines.append(summary.quota_error + ".")
+        if summary.usage_source == "opencode":
+            coverage = min(24, summary.coverage_s / 3600)
+            lines.append(
+                f"24h tokens: {self.tokens_text()} across {summary.message_count:,} "
+                f"MiniMax assistant messages in the local OpenCode database "
+                f"({coverage:.1f}h ledger coverage)."
+            )
+            lines.append(
+                "The coding plan bills by subscription, so OpenCode records no per-message cost."
+            )
+            if summary.model_name:
+                lines.append(f"Most recent model: {summary.model_name}.")
+        elif summary.usage_error:
+            lines.append(f"24h tokens unavailable: {summary.usage_error}.")
+        return "\n".join(lines)
+
+    def mousePressEvent(self, event):
+        self._expanded = not self._expanded
+        self.setFixedHeight(self._EXPANDED_H if self._expanded else self._COLLAPSED_H)
+        _resize_parent(self)
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        arrow = "▾" if self._expanded else "▸"
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 18, f"MINIMAX {arrow}")
+
+        summary = self._summary
+        right = self.summary_text()
+        if summary is None or summary.quota_source != "live":
+            painter.setPen(QColor(160, 160, 180))
+        else:
+            painter.setPen(_bar_color(self._peak_percent()))
+        fm = painter.fontMetrics()
+        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 18, right)
+
+        if self._expanded:
+            painter.setFont(QFont("sans-serif", 7))
+            painter.setPen(QColor(100, 100, 120))
+            five_hour = summary.five_hour if summary else None
+            weekly = summary.weekly if summary else None
+            five_detail = self._window_text(five_hour)
+            if five_hour is not None:
+                five_detail += "   ·   resets " + time.strftime(
+                    "%H:%M", time.localtime(five_hour.resets_at)
+                )
+            painter.drawText(8, 40, f"5H PLAN     {five_detail}")
+            weekly_detail = self._window_text(weekly)
+            if weekly is not None:
+                weekly_detail += "   ·   resets " + time.strftime(
+                    "%d %b %H:%M", time.localtime(weekly.resets_at)
+                )
+            painter.drawText(8, 58, f"7D PLAN     {weekly_detail}")
+            tokens = f"24H TOKENS  {self.tokens_text()}"
+            if summary and summary.usage_source == "opencode":
+                tokens += f"   ·   {summary.message_count:,} messages"
+                if summary.model_name:
+                    tokens += f"   ·   {summary.model_name}"
+            painter.drawText(8, 76, tokens)
+        painter.end()
+
+
 class LocalAISection(QWidget):
     """Collapsed local Ollama summary with compact model/GPU/ComfyUI details."""
 
@@ -4430,6 +4820,7 @@ class ClaudeWidget(QWidget):
         self._cron_worker: CronJobsFetchWorker | None = None
         self._codex_worker: CodexUsageWorker | None = None
         self._deepseek_worker: DeepSeekUsageWorker | None = None
+        self._minimax_worker: MinimaxUsageWorker | None = None
         self._ollama_worker: OllamaFetchWorker | None = None
         self._comfyui_worker: ComfyUIFetchWorker | None = None
         self._history = UsageHistory()
@@ -4476,6 +4867,7 @@ class ClaudeWidget(QWidget):
             )
         self._refresh_codex_usage()
         self._refresh_deepseek_usage()
+        self._refresh_minimax_usage()
 
         # Initialize graph with persisted history
         if self._history.points:
@@ -4639,6 +5031,10 @@ class ClaudeWidget(QWidget):
         self._deepseek_row = DeepSeekUsageRow()
         layout.addWidget(self._deepseek_row)
 
+        # MiniMax coding-plan quota row
+        self._minimax_row = MinimaxUsageRow()
+        layout.addWidget(self._minimax_row)
+
         # Deploy status row
         self._deploy_row = DeployRow()
         layout.addWidget(self._deploy_row)
@@ -4775,6 +5171,10 @@ class ClaudeWidget(QWidget):
         self._deepseek_timer.timeout.connect(self._refresh_deepseek_usage)
         self._deepseek_timer.start(DEEPSEEK_REFRESH_MS)
 
+        self._minimax_timer = QTimer(self)
+        self._minimax_timer.timeout.connect(self._refresh_minimax_usage)
+        self._minimax_timer.start(MINIMAX_REFRESH_MS)
+
         self._ollama_timer = QTimer(self)
         self._ollama_timer.timeout.connect(self._fetch_ollama)
         self._ollama_timer.start(OLLAMA_REFRESH_MS)
@@ -4787,6 +5187,7 @@ class ClaudeWidget(QWidget):
         self._fetch_usage(force=True)
         self._refresh_codex_usage()
         self._refresh_deepseek_usage()
+        self._refresh_minimax_usage()
         self._fetch_ollama()
         self._fetch_comfyui()
         self._fetch_task_loops()
@@ -5096,6 +5497,19 @@ class ClaudeWidget(QWidget):
         self._deepseek_row.set_data(summary)
         self.adjustSize()
 
+    def _refresh_minimax_usage(self):
+        if self._shutdown_started:
+            return
+        if self._minimax_worker and self._minimax_worker.isRunning():
+            return
+        self._minimax_worker = MinimaxUsageWorker()
+        self._minimax_worker.result.connect(self._on_minimax_usage_read)
+        self._minimax_worker.start()
+
+    def _on_minimax_usage_read(self, summary: MinimaxUsageSummary | None):
+        self._minimax_row.set_data(summary)
+        self.adjustSize()
+
     def _fetch_ollama(self):
         if self._shutdown_started:
             return
@@ -5251,6 +5665,7 @@ class ClaudeWidget(QWidget):
             worker
             for worker in (
                 self._deepseek_worker,
+                self._minimax_worker,
                 self._ollama_worker,
                 self._comfyui_worker,
             )

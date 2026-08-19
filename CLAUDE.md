@@ -13,6 +13,7 @@ DeepSeek API spend/credit, and compact local Ollama/GPU/ComfyUI status.
 - **StatsRow**: Compact custom-painted row with AVG, PEAK, TREND, and EXTRA usage stats
 - **CodexUsageRow**: Reads live Codex rate limits through the local `codex app-server` JSONL protocol (`account/rateLimits/read`), falls back only to unexpired cached `~/.codex/sessions/**/*.jsonl` token-count events at most five minutes old, visibly marks cached values, and combines them with `~/.codex/state_*.sqlite` latest-thread/lifetime totals; renders only the rate-limit windows the server provides
 - **DeepSeekUsageRow**: Sums numeric DeepSeek assistant-message costs from the read-only local OpenCode SQLite ledger for rolling 24-hour spend and reads current credit from official `GET /user/balance` in a background thread
+- **MinimaxUsageRow**: Reads MiniMax coding-plan quota from `GET https://api.minimax.io/v1/token_plan/remains` (`general` family) in a background thread, inverting the API's *remaining* percentages into 5-hour/weekly utilization, and pairs it with 24-hour token volume, message count, and latest model from the read-only local OpenCode SQLite ledger. The plan is a subscription, so OpenCode records `cost = 0` for every MiniMax message and no dollar figure is shown.
 - **LocalAISection**: Collapsed Ollama/GPU summary with expandable loaded-model, GPU/VRAM, ComfyUI, and local-config Ollama task-loop details; it does not query DynamoDB
 - **DeepSeek balance history**: Currency-separated snapshots in `~/.claude/deepseek_balance_history.json` use a strict schema, mode `0600`, fsync, and atomic replacement
 - **Expansion geometry**: Usage History and Ollama are mutually exclusive so
@@ -40,5 +41,8 @@ DeepSeek API spend/credit, and compact local Ollama/GPU/ComfyUI status.
   immediate 24-hour source; protected balance decreases are a marked fallback.
 - Last-known DeepSeek credit is shown for at most 15 minutes and always includes
   its snapshot age; older snapshots remain history-only and are not displayed.
+- MiniMax credentials resolve from `MINIMAX_API_KEY` first, then the same
+  owner-controlled mode-`0600` OpenCode auth file (`minimax-coding-plan.key`);
+  the key reaches only the Authorization header, never history, logs, or tooltips.
 - Clawd task-loop rows remain local-configuration-only. The unified Ollama
   section reuses those results and adds no boto3/DynamoDB polling.

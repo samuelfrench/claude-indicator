@@ -29,6 +29,9 @@ from claude_widget import (
     DeepSeekUsageSummary,
     LoadedModel,
     LocalAISection,
+    MinimaxUsageRow,
+    MinimaxUsageSummary,
+    MinimaxWindow,
     MoneyBalance,
     OllamaStatus,
     SystemMetrics,
@@ -47,7 +50,10 @@ from claude_widget import (
     load_deepseek_history,
     parse_deepseek_balance,
     read_deepseek_api_key,
+    read_minimax_api_key,
     read_opencode_deepseek_spend,
+    read_opencode_minimax_usage,
+    parse_minimax_quota,
     record_deepseek_snapshot,
     save_last_usage,
     UsageData,
@@ -60,6 +66,200 @@ class WidgetUiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    MINIMAX_QUOTA_PAYLOAD = {
+        "model_remains": [
+            {
+                "model_name": "general",
+                "start_time": 1787133600000,
+                "end_time": 1787151600000,
+                "remains_time": 7042618,
+                "current_interval_total_count": 40,
+                "current_interval_usage_count": 3,
+                "current_interval_remaining_percent": 93,
+                "current_interval_status": 1,
+                "weekly_start_time": 1786924800000,
+                "weekly_end_time": 1787529600000,
+                "current_weekly_total_count": 400,
+                "current_weekly_usage_count": 144,
+                "current_weekly_remaining_percent": 64,
+                "current_weekly_status": 1,
+            },
+            {
+                "model_name": "video",
+                "start_time": 1787097600000,
+                "end_time": 1787184000000,
+                "current_interval_total_count": 3,
+                "current_interval_usage_count": 0,
+                "current_interval_remaining_percent": 100,
+                "current_interval_status": 1,
+                "weekly_start_time": 1786924800000,
+                "weekly_end_time": 1787529600000,
+                "current_weekly_total_count": 21,
+                "current_weekly_usage_count": 0,
+                "current_weekly_remaining_percent": 100,
+                "current_weekly_status": 1,
+            },
+        ],
+        "base_resp": {"status_code": 0, "status_msg": "success"},
+    }
+
+    def test_parse_minimax_quota_inverts_remaining_percent_for_general_family(self):
+        five_hour, weekly = parse_minimax_quota(self.MINIMAX_QUOTA_PAYLOAD)
+
+        self.assertEqual(five_hour.used_percent, 7.0)
+        self.assertEqual(five_hour.resets_at, 1787151600)
+        self.assertEqual(five_hour.usage_count, 3)
+        self.assertEqual(five_hour.total_count, 40)
+        self.assertEqual(weekly.used_percent, 36.0)
+        self.assertEqual(weekly.resets_at, 1787529600)
+        self.assertEqual(weekly.usage_count, 144)
+        self.assertEqual(weekly.total_count, 400)
+
+    def test_parse_minimax_quota_rejects_unsuccessful_base_resp(self):
+        payload = json.loads(json.dumps(self.MINIMAX_QUOTA_PAYLOAD))
+        payload["base_resp"] = {"status_code": 1004, "status_msg": "auth failed"}
+        with self.assertRaises(ValueError):
+            parse_minimax_quota(payload)
+
+    def test_parse_minimax_quota_rejects_payload_without_requested_family(self):
+        payload = {
+            "model_remains": [self.MINIMAX_QUOTA_PAYLOAD["model_remains"][1]],
+            "base_resp": {"status_code": 0, "status_msg": "success"},
+        }
+        with self.assertRaises(ValueError):
+            parse_minimax_quota(payload)
+
+    def test_parse_minimax_quota_rejects_out_of_range_percent(self):
+        payload = json.loads(json.dumps(self.MINIMAX_QUOTA_PAYLOAD))
+        payload["model_remains"][0]["current_interval_remaining_percent"] = 150
+        with self.assertRaises(ValueError):
+            parse_minimax_quota(payload)
+
+    def test_parse_minimax_quota_rejects_non_numeric_percent(self):
+        payload = json.loads(json.dumps(self.MINIMAX_QUOTA_PAYLOAD))
+        payload["model_remains"][0]["current_weekly_remaining_percent"] = "64"
+        with self.assertRaises(ValueError):
+            parse_minimax_quota(payload)
+
+    def test_minimax_api_key_prefers_environment_and_reads_protected_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth_path = Path(tmpdir) / "auth.json"
+            auth_path.write_text('{"minimax-coding-plan":{"type":"api","key":"file-key"}}')
+            auth_path.chmod(0o600)
+
+            self.assertEqual(
+                read_minimax_api_key(
+                    auth_path=auth_path, environ={"MINIMAX_API_KEY": "env-key"}
+                ),
+                "env-key",
+            )
+            self.assertEqual(
+                read_minimax_api_key(auth_path=auth_path, environ={}),
+                "file-key",
+            )
+
+            auth_path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                read_minimax_api_key(auth_path=auth_path, environ={})
+
+    def test_opencode_minimax_usage_sums_tokens_for_provider_rows_only(self):
+        now = 1_800_000_000.0
+        def tokens(inp, out, reasoning=0, read=0, write=0):
+            return {
+                "input": inp,
+                "output": out,
+                "reasoning": reasoning,
+                "cache": {"read": read, "write": write},
+            }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                rows = [
+                    ("old", int((now - 25 * 3600) * 1000),
+                     {"role": "assistant", "providerID": "minimax-coding-plan",
+                      "modelID": "MiniMax-M2.5", "tokens": tokens(900, 900)}),
+                    ("a", int((now - 3600) * 1000),
+                     {"role": "assistant", "providerID": "minimax-coding-plan",
+                      "modelID": "MiniMax-M2.5-highspeed", "tokens": tokens(573, 128, 0, 56960, 0)}),
+                    ("b", int((now - 60) * 1000),
+                     {"role": "assistant", "providerID": "minimax-coding-plan",
+                      "modelID": "MiniMax-M3", "tokens": tokens(73, 119, 12, 0, 100)}),
+                    ("user", int((now - 30) * 1000),
+                     {"role": "user", "providerID": "minimax-coding-plan",
+                      "tokens": tokens(500, 500)}),
+                    ("other", int((now - 20) * 1000),
+                     {"role": "assistant", "providerID": "deepseek", "tokens": tokens(400, 400)}),
+                ]
+                conn.executemany(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    [(row_id, created, json.dumps(data)) for row_id, created, data in rows],
+                )
+                conn.execute(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    ("malformed", int((now - 5) * 1000), "{not-json"),
+                )
+
+            total, count, coverage, model = read_opencode_minimax_usage(
+                db_path=db_path, now=now
+            )
+
+        self.assertEqual(total, 573 + 128 + 56960 + 73 + 119 + 12 + 100)
+        self.assertEqual(count, 2)
+        self.assertEqual(coverage, 24 * 3600)
+        self.assertEqual(model, "MiniMax-M3")
+
+    def test_opencode_minimax_usage_rejects_non_numeric_token_counts(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                conn.execute(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    ("bad", int(now * 1000), json.dumps({
+                        "role": "assistant",
+                        "providerID": "minimax-coding-plan",
+                        "modelID": "MiniMax-M3",
+                        "tokens": {"input": "573", "output": 1},
+                    })),
+                )
+            with self.assertRaises(ValueError):
+                read_opencode_minimax_usage(db_path=db_path, now=now)
+
+    def test_minimax_row_renders_window_utilization_and_token_total(self):
+        row = MinimaxUsageRow()
+        row.set_data(
+            MinimaxUsageSummary(
+                five_hour=MinimaxWindow(used_percent=7.0, resets_at=1787151600,
+                                        usage_count=3, total_count=40),
+                weekly=MinimaxWindow(used_percent=36.0, resets_at=1787529600,
+                                     usage_count=144, total_count=400),
+                quota_source="live",
+                tokens_24h=995_128_372,
+                message_count=3734,
+                model_name="MiniMax-M3",
+                usage_source="opencode",
+            )
+        )
+
+        self.assertEqual(row.summary_text(), "5H 7%  ·  7D 36%")
+        self.assertEqual(row.tokens_text(), "995.1M")
+        self.assertIn("MiniMax-M3", row.toolTip())
+
+    def test_minimax_row_shows_placeholder_when_quota_unavailable(self):
+        row = MinimaxUsageRow()
+        row.set_data(MinimaxUsageSummary(quota_error="Plan quota unavailable"))
+
+        self.assertEqual(row.summary_text(), "5H —  ·  7D —")
+        self.assertIn("Plan quota unavailable", row.toolTip())
+
+    def test_widget_places_minimax_row_directly_after_deepseek_row(self):
+        widget = self._make_inert_claude_widget()
+        layout = widget._deepseek_row.parentWidget().layout()
+        deepseek_index = layout.indexOf(widget._deepseek_row)
+        self.assertEqual(layout.indexOf(widget._minimax_row), deepseek_index + 1)
 
     def test_task_loop_status_reads_local_config_without_aws(self):
         config = {
@@ -373,6 +573,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_update_system_metrics", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_deepseek_usage", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_minimax_usage", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_ollama", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_comfyui", lambda self: None),
             patch.object(claude_widget, "SmartTodoDialog", dialog_factory),
