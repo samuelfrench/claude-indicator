@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from ollama_watchdog import (
     STUCK_AFTER_S,
+    restart_command,
     evaluate,
     expiry_lag_s,
     probe_body,
@@ -77,6 +78,20 @@ class EvaluateTest(unittest.TestCase):
         healthy, reason = evaluate(self._payload(120), now=self.NOW, probe=lambda: False)
         self.assertFalse(healthy)
         self.assertIn("probe", reason)
+
+
+class RestartCommandTest(unittest.TestCase):
+    def test_restart_never_waits_on_an_interactive_polkit_prompt(self):
+        # A user-level timer has no tty; a password prompt would hang the unit.
+        command = restart_command({})
+        self.assertIn("--no-ask-password", command)
+        self.assertEqual(command[-2:], ["restart", "ollama"])
+
+    def test_restart_command_is_overridable_for_verification(self):
+        self.assertEqual(
+            restart_command({"OLLAMA_WATCHDOG_RESTART_CMD": "systemctl --user restart dummy"}),
+            ["systemctl", "--user", "restart", "dummy"],
+        )
 
 
 class ProbeBodyTest(unittest.TestCase):

@@ -12,6 +12,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -25,6 +26,16 @@ PROBE_TIMEOUT_S = 60
 # A healthy scheduler evicts within seconds of expiry; allow for poll jitter.
 EXPIRY_GRACE_S = 60
 STUCK_AFTER_S = 15 * 60
+# Run non-interactively: a user-level timer has no tty for a polkit prompt.
+DEFAULT_RESTART_CMD = ["systemctl", "--no-ask-password", "restart", "ollama"]
+
+
+def restart_command(environ: dict) -> list[str]:
+    """The recovery command; overridable so the path can be exercised safely."""
+    override = environ.get("OLLAMA_WATCHDOG_RESTART_CMD", "")
+    if override.strip():
+        return shlex.split(override)
+    return list(DEFAULT_RESTART_CMD)
 
 
 def expiry_lag_s(payload: dict, now: float) -> float | None:
@@ -155,9 +166,8 @@ def main() -> int:
         return 0
 
     log(f"restarting ollama after {STUCK_AFTER_S // 60}m stuck: {reason}")
-    result = subprocess.run(
-        ["systemctl", "restart", "ollama"], capture_output=True, text=True
-    )
+    command = restart_command(os.environ)
+    result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         log(f"restart failed rc={result.returncode}: {result.stderr.strip()}")
         return 1

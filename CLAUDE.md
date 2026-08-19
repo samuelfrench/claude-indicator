@@ -31,6 +31,11 @@ DeepSeek API spend/credit, and compact local Ollama/GPU/ComfyUI status.
   paying for a generation and without extending the model's keep-alive. Installed copies live
   at `/usr/local/bin/ollama-watchdog` and `/etc/systemd/system/ollama-watchdog.{service,timer}`;
   re-run the install command after editing the repo copy.
+  On this host it currently runs as a **user** timer instead (`scripts/user/*`, linked into
+  `~/.config/systemd/user/`), which needs no sudo because polkit lets an active session restart
+  `ollama.service`. The user units run the repo script in place, so edits take effect on the next
+  tick. `OLLAMA_WATCHDOG_RESTART_CMD` overrides the recovery command so the restart path can be
+  exercised against a dummy unit without disturbing ollama.
 
 ## Running
 - May require `LD_LIBRARY_PATH=<path-to-miniconda>/lib` on some systems for xcb-cursor

@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart ollama when its scheduler has been wedged for 15 minutes
+
+[Service]
+Type=oneshot
+Environment=OLLAMA_WATCHDOG_STATE=%t/ollama-watchdog.state
+ExecStart=/home/sam/claude-workspace/claude-indicator/scripts/ollama_watchdog.py
+TimeoutStartSec=120
