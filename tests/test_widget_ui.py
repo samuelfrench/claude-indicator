@@ -29,6 +29,8 @@ from claude_widget import (
     DeepSeekUsageSummary,
     LoadedModel,
     LocalAISection,
+    LocalTokenUsage,
+    LocalTokensRow,
     MinimaxUsageRow,
     MinimaxUsageSummary,
     MinimaxWindow,
@@ -52,6 +54,7 @@ from claude_widget import (
     read_deepseek_api_key,
     read_minimax_api_key,
     read_opencode_deepseek_spend,
+    read_opencode_local_tokens,
     read_opencode_minimax_usage,
     parse_minimax_quota,
     record_deepseek_snapshot,
@@ -260,6 +263,109 @@ class WidgetUiTest(unittest.TestCase):
         layout = widget._deepseek_row.parentWidget().layout()
         deepseek_index = layout.indexOf(widget._deepseek_row)
         self.assertEqual(layout.indexOf(widget._minimax_row), deepseek_index + 1)
+
+    def test_opencode_local_tokens_splits_today_from_all_time(self):
+        # 2026-08-19 12:00:00 local; "today" starts at the local midnight before it.
+        now = time.mktime((2026, 8, 19, 12, 0, 0, 0, 0, -1))
+        midnight = time.mktime((2026, 8, 19, 0, 0, 0, 0, 0, -1))
+
+        def tokens(inp, out, read=0):
+            return {"input": inp, "output": out, "reasoning": 0,
+                    "cache": {"read": read, "write": 0}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                rows = [
+                    ("older", int((midnight - 3 * 86400) * 1000),
+                     {"role": "assistant", "providerID": "ollama",
+                      "modelID": "qwen3.5", "tokens": tokens(1000, 500)}),
+                    ("yesterday", int((midnight - 60) * 1000),
+                     {"role": "assistant", "providerID": "ollama",
+                      "modelID": "qwen3.5", "tokens": tokens(200, 100)}),
+                    ("today_a", int((midnight + 3600) * 1000),
+                     {"role": "assistant", "providerID": "ollama",
+                      "modelID": "qwen3.6", "tokens": tokens(50, 25, 1000)}),
+                    ("today_b", int((now - 60) * 1000),
+                     {"role": "assistant", "providerID": "ollama",
+                      "modelID": "qwen3.6-latest", "tokens": tokens(5, 5)}),
+                    ("remote", int((now - 30) * 1000),
+                     {"role": "assistant", "providerID": "minimax-coding-plan",
+                      "modelID": "MiniMax-M3", "tokens": tokens(900, 900)}),
+                    ("user_turn", int((now - 20) * 1000),
+                     {"role": "user", "providerID": "ollama", "tokens": tokens(7, 7)}),
+                ]
+                conn.executemany(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    [(rid, created, json.dumps(data)) for rid, created, data in rows],
+                )
+
+            usage = read_opencode_local_tokens(db_path=db_path, now=now)
+
+        self.assertEqual(usage.today_tokens, 50 + 25 + 1000 + 5 + 5)
+        self.assertEqual(usage.today_messages, 2)
+        self.assertEqual(usage.all_time_tokens, 1500 + 300 + 1085)
+        self.assertEqual(usage.all_time_messages, 4)
+        self.assertEqual(usage.latest_model, "qwen3.6-latest")
+        self.assertEqual(usage.first_seen, int(midnight - 3 * 86400))
+
+    def test_opencode_local_tokens_rejects_non_numeric_token_counts(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+                conn.execute(
+                    "INSERT INTO message VALUES (?, ?, ?)",
+                    ("bad", int(now * 1000), json.dumps({
+                        "role": "assistant", "providerID": "ollama",
+                        "modelID": "qwen3.6", "tokens": {"input": "5", "output": 1},
+                    })),
+                )
+            with self.assertRaises(ValueError):
+                read_opencode_local_tokens(db_path=db_path, now=now)
+
+    def test_opencode_local_tokens_handles_an_empty_ledger(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "opencode.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE message (id TEXT, time_created INTEGER, data TEXT)")
+
+            usage = read_opencode_local_tokens(db_path=db_path, now=now)
+
+        self.assertEqual(usage.today_tokens, 0)
+        self.assertEqual(usage.all_time_tokens, 0)
+        self.assertEqual(usage.first_seen, 0)
+        self.assertEqual(usage.latest_model, "")
+
+    def test_local_tokens_row_names_opencode_as_its_source(self):
+        row = LocalTokensRow()
+        row.set_data(
+            LocalTokenUsage(
+                today_tokens=12_400_000, today_messages=44,
+                all_time_tokens=50_946_774, all_time_messages=2887,
+                first_seen=1786924800, latest_model="qwen3.6:27b-mtp-ctx32k",
+            )
+        )
+
+        self.assertEqual(row.summary_text(), "DAY 12.4M  ·  ALL 50.9M")
+        self.assertIn("OPENCODE", row.label_text())
+        self.assertIn("OpenCode", row.toolTip())
+        self.assertIn("qwen3.6:27b-mtp-ctx32k", row.toolTip())
+
+    def test_local_tokens_row_shows_placeholders_before_first_read(self):
+        row = LocalTokensRow()
+        self.assertEqual(row.summary_text(), "DAY —  ·  ALL —")
+
+    def test_widget_places_local_tokens_row_directly_after_minimax_row(self):
+        widget = self._make_inert_claude_widget()
+        layout = widget._minimax_row.parentWidget().layout()
+        self.assertEqual(
+            layout.indexOf(widget._local_tokens_row),
+            layout.indexOf(widget._minimax_row) + 1,
+        )
 
     def test_task_loop_status_reads_local_config_without_aws(self):
         config = {
@@ -574,6 +680,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_deepseek_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_minimax_usage", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_local_tokens", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_ollama", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_comfyui", lambda self: None),
             patch.object(claude_widget, "SmartTodoDialog", dialog_factory),
@@ -1502,7 +1609,8 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._local_ai_section.is_expanded())
         self.assertFalse(widget._history_expanded)
-        self.assertLessEqual(widget.height(), 760)
+        # 800px work area less a 10px margin; each provider row costs 30px collapsed.
+        self.assertLessEqual(widget.height(), 790)
 
         widget._toggle_history()
         widget.adjustSize()
@@ -1510,7 +1618,7 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._history_expanded)
         self.assertFalse(widget._local_ai_section.is_expanded())
-        self.assertLessEqual(widget.height(), 760)
+        self.assertLessEqual(widget.height(), 790)
 
     def test_fable_and_max_expansions_reposition_inside_800px_work_area(self):
         widget = self._make_inert_claude_widget(tray_available=False)

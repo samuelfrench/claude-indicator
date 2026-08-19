@@ -101,6 +101,11 @@ MINIMAX_QUOTA_URL = "https://api.minimax.io/v1/token_plan/remains"
 MINIMAX_PROVIDER_ID = "minimax-coding-plan"
 MINIMAX_QUOTA_FAMILY = "general"
 MINIMAX_REFRESH_MS = 5 * 60 * 1000  # plan quota endpoint and local token ledger
+# Local-model token tracking is scoped to the OpenCode ledger on purpose: it is
+# the one place local usage is recorded per message. Other local clients (the
+# clawd-bot runner drives ollama through aider) are outside it and are excluded.
+LOCAL_PROVIDER_ID = "ollama"
+LOCAL_TOKENS_REFRESH_MS = 60 * 1000
 
 
 def build_task_compass_icon(size: int = 64) -> QIcon:
@@ -465,6 +470,17 @@ class MinimaxUsageSummary:
     model_name: str = ""
     usage_source: str = ""
     usage_error: str = ""
+
+
+@dataclass
+class LocalTokenUsage:
+    today_tokens: int = 0
+    today_messages: int = 0
+    all_time_tokens: int = 0
+    all_time_messages: int = 0
+    first_seen: int = 0
+    latest_model: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -1134,6 +1150,99 @@ def read_minimax_usage(
         summary.model_name = model
         summary.usage_source = "opencode"
     return summary
+
+
+
+def read_opencode_local_tokens(
+    *, db_path: Path = OPENCODE_DB_PATH, now: float | None = None
+) -> LocalTokenUsage:
+    """Today and all-time local-model tokens as recorded by OpenCode."""
+    now = time.time() if now is None else now
+    try:
+        metadata = db_path.lstat()
+    except OSError as exc:
+        raise ValueError("OpenCode cost database unavailable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise ValueError("OpenCode cost database is unsafe")
+    local = time.localtime(now)
+    midnight_ms = int(
+        time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
+        * 1000
+    )
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=1) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            row = conn.execute(
+                f"""
+                WITH parsed AS (
+                  SELECT
+                    time_created,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.role') AS role,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.providerID') AS provider,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.modelID') AS model,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.tokens.input') AS t_input,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.tokens.output') AS t_output,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.tokens.reasoning') AS t_reasoning,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.tokens.cache.read') AS t_cache_read,
+                    json_extract(CASE WHEN json_valid(data) THEN data ELSE '{{}}' END, '$.tokens.cache.write') AS t_cache_write
+                  FROM message
+                ),
+                scoped AS (
+                  SELECT *,
+                    COALESCE(CASE WHEN typeof(t_input) IN ('integer','real') THEN t_input END, 0)
+                    + COALESCE(CASE WHEN typeof(t_output) IN ('integer','real') THEN t_output END, 0)
+                    + COALESCE(CASE WHEN typeof(t_reasoning) IN ('integer','real') THEN t_reasoning END, 0)
+                    + COALESCE(CASE WHEN typeof(t_cache_read) IN ('integer','real') THEN t_cache_read END, 0)
+                    + COALESCE(CASE WHEN typeof(t_cache_write) IN ('integer','real') THEN t_cache_write END, 0)
+                    AS tokens,
+                    CASE WHEN
+                      (t_input IS NULL OR (typeof(t_input) IN ('integer','real') AND t_input >= 0))
+                      AND (t_output IS NULL OR (typeof(t_output) IN ('integer','real') AND t_output >= 0))
+                      AND (t_reasoning IS NULL OR (typeof(t_reasoning) IN ('integer','real') AND t_reasoning >= 0))
+                      AND (t_cache_read IS NULL OR (typeof(t_cache_read) IN ('integer','real') AND t_cache_read >= 0))
+                      AND (t_cache_write IS NULL OR (typeof(t_cache_write) IN ('integer','real') AND t_cache_write >= 0))
+                    THEN 1 ELSE 0 END AS valid
+                  FROM parsed
+                  WHERE role = 'assistant' AND provider = ?
+                )
+                SELECT
+                  COUNT(*),
+                  SUM(valid),
+                  SUM(tokens),
+                  SUM(CASE WHEN time_created >= ? THEN tokens ELSE 0 END),
+                  SUM(CASE WHEN time_created >= ? THEN 1 ELSE 0 END),
+                  MIN(time_created),
+                  (SELECT model FROM scoped WHERE model IS NOT NULL
+                   ORDER BY time_created DESC LIMIT 1)
+                FROM scoped
+                """,
+                (LOCAL_PROVIDER_ID, midnight_ms, midnight_ms),
+            ).fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        raise ValueError("OpenCode cost database unavailable") from exc
+
+    total, valid, tokens, today_tokens, today_messages, oldest, model = row
+    total = int(total or 0)
+    if total != int(valid or 0):
+        raise ValueError("OpenCode local rows contain invalid token counts")
+    return LocalTokenUsage(
+        today_tokens=int(today_tokens or 0),
+        today_messages=int(today_messages or 0),
+        all_time_tokens=int(tokens or 0),
+        all_time_messages=total,
+        first_seen=0 if oldest is None else int(int(oldest) / 1000),
+        latest_model=str(model or ""),
+    )
+
+
+def read_local_token_usage(
+    *, db_path: Path = OPENCODE_DB_PATH, now: float | None = None
+) -> LocalTokenUsage:
+    try:
+        return read_opencode_local_tokens(db_path=db_path, now=now)
+    except ValueError as exc:
+        return LocalTokenUsage(error=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -2224,6 +2333,22 @@ class MinimaxUsageWorker(QThread):
         summary = reader()
         if not self.isInterruptionRequested():
             self.result.emit(summary)
+
+
+class LocalTokensWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        reader = self._reader or read_local_token_usage
+        usage = reader()
+        if not self.isInterruptionRequested():
+            self.result.emit(usage)
 
 
 class OllamaFetchWorker(QThread):
@@ -3832,6 +3957,119 @@ class MinimaxUsageRow(QWidget):
         painter.end()
 
 
+class LocalTokensRow(QWidget):
+    """Local-model token volume for today and all time, per the OpenCode ledger."""
+
+    _COLLAPSED_H = 30
+    _EXPANDED_H = 88
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._usage: LocalTokenUsage | None = None
+        self._expanded = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, usage: LocalTokenUsage | None):
+        self._usage = usage
+        self.setToolTip(self._tooltip(usage))
+        self.update()
+
+    def label_text(self) -> str:
+        return "LOCAL (OPENCODE)"
+
+    def summary_text(self) -> str:
+        usage = self._usage
+        if usage is None or usage.error:
+            return "DAY —  ·  ALL —"
+        return (
+            f"DAY {_fmt_tokens(usage.today_tokens)}"
+            f"  ·  ALL {_fmt_tokens(usage.all_time_tokens)}"
+        )
+
+    def _tooltip(self, usage: LocalTokenUsage | None) -> str:
+        if usage is None:
+            return "Local token usage has not been read yet."
+        if usage.error:
+            return f"Local token usage unavailable: {usage.error}."
+        lines = [
+            f"Today: {_fmt_tokens(usage.today_tokens)} tokens across "
+            f"{usage.today_messages:,} local assistant messages (since local midnight).",
+            f"All time: {_fmt_tokens(usage.all_time_tokens)} tokens across "
+            f"{usage.all_time_messages:,} messages.",
+        ]
+        if usage.first_seen:
+            lines.append(
+                "Ledger starts "
+                + time.strftime("%d %b %Y", time.localtime(usage.first_seen))
+                + "."
+            )
+        if usage.latest_model:
+            lines.append(f"Most recent local model: {usage.latest_model}.")
+        lines.append(
+            "Counts the OpenCode ledger's ollama-provider messages only. Local traffic "
+            "from other clients (the clawd-bot runner drives ollama through aider) is "
+            "not recorded there and is not included."
+        )
+        return "\n".join(lines)
+
+    def mousePressEvent(self, event):
+        self._expanded = not self._expanded
+        self.setFixedHeight(self._EXPANDED_H if self._expanded else self._COLLAPSED_H)
+        _resize_parent(self)
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        arrow = "▾" if self._expanded else "▸"
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 18, f"{self.label_text()} {arrow}")
+
+        usage = self._usage
+        right = self.summary_text()
+        painter.setPen(
+            QColor(160, 160, 180)
+            if usage is None or usage.error
+            else QColor(129, 199, 132)
+        )
+        fm = painter.fontMetrics()
+        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 18, right)
+
+        if self._expanded:
+            painter.setFont(QFont("sans-serif", 7))
+            painter.setPen(QColor(100, 100, 120))
+            if usage is None or usage.error:
+                painter.drawText(8, 40, "TODAY       —")
+                painter.drawText(8, 58, "ALL TIME    —")
+                detail = usage.error if usage and usage.error else "not read yet"
+                painter.drawText(8, 76, f"SOURCE      {detail}")
+            else:
+                painter.drawText(
+                    8, 40,
+                    f"TODAY       {_fmt_tokens(usage.today_tokens)}"
+                    f"   ·   {usage.today_messages:,} messages",
+                )
+                since = (
+                    time.strftime("%d %b", time.localtime(usage.first_seen))
+                    if usage.first_seen
+                    else "—"
+                )
+                painter.drawText(
+                    8, 58,
+                    f"ALL TIME    {_fmt_tokens(usage.all_time_tokens)}"
+                    f"   ·   {usage.all_time_messages:,} messages   ·   since {since}",
+                )
+                source = "OpenCode ledger · ollama provider"
+                if usage.latest_model:
+                    source += f"   ·   {usage.latest_model}"
+                painter.drawText(8, 76, f"SOURCE      {source}")
+        painter.end()
+
+
 class LocalAISection(QWidget):
     """Collapsed local Ollama summary with compact model/GPU/ComfyUI details."""
 
@@ -4821,6 +5059,7 @@ class ClaudeWidget(QWidget):
         self._codex_worker: CodexUsageWorker | None = None
         self._deepseek_worker: DeepSeekUsageWorker | None = None
         self._minimax_worker: MinimaxUsageWorker | None = None
+        self._local_tokens_worker: LocalTokensWorker | None = None
         self._ollama_worker: OllamaFetchWorker | None = None
         self._comfyui_worker: ComfyUIFetchWorker | None = None
         self._history = UsageHistory()
@@ -4868,6 +5107,7 @@ class ClaudeWidget(QWidget):
         self._refresh_codex_usage()
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
+        self._refresh_local_tokens()
 
         # Initialize graph with persisted history
         if self._history.points:
@@ -5035,6 +5275,10 @@ class ClaudeWidget(QWidget):
         self._minimax_row = MinimaxUsageRow()
         layout.addWidget(self._minimax_row)
 
+        # Local-model token tracker (OpenCode-recorded ollama traffic)
+        self._local_tokens_row = LocalTokensRow()
+        layout.addWidget(self._local_tokens_row)
+
         # Deploy status row
         self._deploy_row = DeployRow()
         layout.addWidget(self._deploy_row)
@@ -5175,6 +5419,10 @@ class ClaudeWidget(QWidget):
         self._minimax_timer.timeout.connect(self._refresh_minimax_usage)
         self._minimax_timer.start(MINIMAX_REFRESH_MS)
 
+        self._local_tokens_timer = QTimer(self)
+        self._local_tokens_timer.timeout.connect(self._refresh_local_tokens)
+        self._local_tokens_timer.start(LOCAL_TOKENS_REFRESH_MS)
+
         self._ollama_timer = QTimer(self)
         self._ollama_timer.timeout.connect(self._fetch_ollama)
         self._ollama_timer.start(OLLAMA_REFRESH_MS)
@@ -5188,6 +5436,7 @@ class ClaudeWidget(QWidget):
         self._refresh_codex_usage()
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
+        self._refresh_local_tokens()
         self._fetch_ollama()
         self._fetch_comfyui()
         self._fetch_task_loops()
@@ -5510,6 +5759,19 @@ class ClaudeWidget(QWidget):
         self._minimax_row.set_data(summary)
         self.adjustSize()
 
+    def _refresh_local_tokens(self):
+        if self._shutdown_started:
+            return
+        if self._local_tokens_worker and self._local_tokens_worker.isRunning():
+            return
+        self._local_tokens_worker = LocalTokensWorker()
+        self._local_tokens_worker.result.connect(self._on_local_tokens_read)
+        self._local_tokens_worker.start()
+
+    def _on_local_tokens_read(self, usage: LocalTokenUsage | None):
+        self._local_tokens_row.set_data(usage)
+        self.adjustSize()
+
     def _fetch_ollama(self):
         if self._shutdown_started:
             return
@@ -5666,6 +5928,7 @@ class ClaudeWidget(QWidget):
             for worker in (
                 self._deepseek_worker,
                 self._minimax_worker,
+                self._local_tokens_worker,
                 self._ollama_worker,
                 self._comfyui_worker,
             )
