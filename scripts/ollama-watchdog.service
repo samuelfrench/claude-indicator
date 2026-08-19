@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart ollama when its scheduler has been wedged for 15 minutes
+After=ollama.service
+Wants=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ollama-watchdog
+# The check itself must never be the thing that hangs.
+TimeoutStartSec=120

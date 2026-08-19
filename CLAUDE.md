@@ -24,6 +24,14 @@ DeepSeek API spend/credit, and compact local Ollama/GPU/ComfyUI status.
 - **Dynamic plan name**: Title detects CLAUDE MAX (opus present), CLAUDE PRO (sonnet present), or CLAUDE (neither)
 - Token refresh via `https://platform.claude.com/v1/oauth/token` with client_id `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
 
+## Scripts
+- `scripts/ollama_watchdog.py`: systemd-timer watchdog that restarts `ollama` after its
+  scheduler has been wedged for 15 minutes. Detects the 0.32.14 deadlock signature — a model
+  held past its keep-alive expiry, or a no-token load probe that hangs past 60s — without
+  paying for a generation and without extending the model's keep-alive. Installed copies live
+  at `/usr/local/bin/ollama-watchdog` and `/etc/systemd/system/ollama-watchdog.{service,timer}`;
+  re-run the install command after editing the repo copy.
+
 ## Running
 - May require `LD_LIBRARY_PATH=<path-to-miniconda>/lib` on some systems for xcb-cursor
 - Autostart configured at `~/.config/autostart/claude-widget.desktop`

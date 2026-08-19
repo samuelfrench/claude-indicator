@@ -15,3 +15,4 @@
 - [x] Collapse the standalone Ollama indicator into a compact expandable Local AI section in this panel, reusing local GPU and task-loop data and adding Ollama/ComfyUI REST status without DynamoDB polling.
 - [x] Add a DeepSeek row with rolling 24-hour OpenCode-recorded API spend, official current account credit, secure credential fallback, and conservative atomic balance-snapshot estimates.
 - [x] Add a MiniMax row with live coding-plan 5-hour/weekly quota utilization from `GET /v1/token_plan/remains`, 24-hour local OpenCode token volume, message count, and latest model, using the same owner-only credential fallback as DeepSeek.
+- [x] Add an ollama scheduler watchdog: a 5-minute systemd timer that restarts `ollama` once its scheduler has been wedged for 15 minutes, detected via stale keep-alive expiry or a hung no-token load probe.

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the ollama scheduler for a wedge every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=ollama-watchdog.service
+
+[Install]
+WantedBy=timers.target
