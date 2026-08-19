@@ -39,6 +39,7 @@ from claude_widget import (
     _parse_model_limits,
     _normalize_model_name,
     load_last_usage,
+    ModelLimitsWidget,
     read_codex_rate_limit,
     read_latest_codex_rate_limit,
     read_codex_usage_summary,
@@ -118,10 +119,6 @@ class WidgetUiTest(unittest.TestCase):
         self.assertFalse(widget.five_hour_bar.isHidden())
         self.assertFalse(widget.estimate_label.isHidden())
         self.assertFalse(widget.seven_day_bar.isHidden())
-        self.assertEqual(
-            [bar._label for bar in widget.model_bars], ["Sonnet (7-Day)"]
-        )
-        self.assertFalse(widget.model_bars[0].isHidden())
 
         widget.toggle_expanded()
 
@@ -130,7 +127,6 @@ class WidgetUiTest(unittest.TestCase):
         self.assertTrue(widget.five_hour_bar.isHidden())
         self.assertTrue(widget.estimate_label.isHidden())
         self.assertTrue(widget.seven_day_bar.isHidden())
-        self.assertTrue(widget.model_bars[0].isHidden())
 
     _SCOPED_LIMITS_PAYLOAD = {
         "five_hour": {"utilization": 9.0, "resets_at": "2026-07-04T14:39:59+00:00"},
@@ -286,32 +282,28 @@ class WidgetUiTest(unittest.TestCase):
             loaded.model_limits[0].entry.resets_at, "2026-07-07T07:59:59+00:00"
         )
 
-    def test_usage_limits_widget_builds_one_bar_per_model_limit(self):
-        widget = UsageLimitsWidget()
+    def test_model_limits_widget_builds_one_bar_per_model_limit(self):
+        widget = ModelLimitsWidget()
         widget.set_data(
-            UsageData(
-                five_hour=UsageEntry(utilization=9.0),
-                seven_day=UsageEntry(utilization=3.0),
-                model_limits=[
-                    ModelLimit(
-                        name="Fable",
-                        window="7-Day",
-                        entry=UsageEntry(utilization=3.0),
-                    )
-                ],
-            )
+            [
+                ModelLimit(
+                    name="Fable",
+                    window="7-Day",
+                    entry=UsageEntry(utilization=3.0),
+                )
+            ]
         )
 
         self.assertEqual([bar._label for bar in widget.model_bars], ["Fable (7-Day)"])
         self.assertEqual(widget.model_bars[0]._pct, 3.0)
         self.assertFalse(widget.model_bars[0].isHidden())
-        self.assertEqual(widget.height(), 176)
+        self.assertEqual(widget.height(), 66)
 
         widget.toggle_expanded()
         self.assertTrue(widget.model_bars[0].isHidden())
 
-    def test_usage_limits_widget_rebuilds_bars_when_limits_change(self):
-        widget = UsageLimitsWidget()
+    def test_model_limits_widget_rebuilds_bars_when_limits_change(self):
+        widget = ModelLimitsWidget()
         fable = ModelLimit(
             name="Fable", window="7-Day", entry=UsageEntry(utilization=3.0)
         )
@@ -319,19 +311,19 @@ class WidgetUiTest(unittest.TestCase):
             name="Opus", window="7-Day", entry=UsageEntry(utilization=41.0)
         )
 
-        widget.set_data(UsageData(model_limits=[fable]))
+        widget.set_data([fable])
         self.assertEqual([bar._label for bar in widget.model_bars], ["Fable (7-Day)"])
 
-        widget.set_data(UsageData(model_limits=[opus, fable]))
+        widget.set_data([opus, fable])
         self.assertEqual(
             [bar._label for bar in widget.model_bars],
             ["Opus (7-Day)", "Fable (7-Day)"],
         )
-        self.assertEqual(widget.height(), 222)
+        self.assertEqual(widget.height(), 112)
 
-        widget.set_data(UsageData())
+        widget.set_data([])
         self.assertEqual(widget.model_bars, [])
-        self.assertEqual(widget.height(), 130)
+        self.assertEqual(widget.height(), 20)
 
     class _FakeSignal:
         def __init__(self):
@@ -533,20 +525,20 @@ class WidgetUiTest(unittest.TestCase):
         widget = self._make_inert_claude_widget()
         widget.show()
         widget._usage_limits.set_data(UsageData())
+        widget._model_limits.set_data([])
+        widget._model_limits.setVisible(True)
         widget.adjustSize()
         QApplication.processEvents()
         before = widget.height()
 
-        widget._usage_limits.set_data(
-            UsageData(
-                model_limits=[
-                    ModelLimit(
-                        name="Fable",
-                        window="7-Day",
-                        entry=UsageEntry(utilization=3.0),
-                    )
-                ]
-            )
+        widget._model_limits.set_data(
+            [
+                ModelLimit(
+                    name="Fable",
+                    window="7-Day",
+                    entry=UsageEntry(utilization=3.0),
+                )
+            ]
         )
         widget.adjustSize()
         QApplication.processEvents()

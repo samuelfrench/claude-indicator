@@ -2147,10 +2147,6 @@ class UsageLimitsWidget(QWidget):
         self.seven_day_bar = UsageBar("7-Day Window")
         layout.addWidget(self.seven_day_bar)
 
-        # One bar per model-scoped limit (Fable, Opus, ...), built on demand
-        # from UsageData.display_model_limits.
-        self.model_bars: list[UsageBar] = []
-
         self._update_children_visibility()
 
     def is_expanded(self) -> bool:
@@ -2175,9 +2171,73 @@ class UsageLimitsWidget(QWidget):
             data.seven_day.utilization,
             data.seven_day.time_remaining(),
         )
-        self._sync_model_bars(data.display_model_limits)
 
         self.estimate_label.setText(estimate)
+        self._update_children_visibility()
+        self.update()
+
+    def _expanded_height(self) -> int:
+        return (
+            self._HEADER_H
+            + self._SPACING + self._BAR_H       # 5-hour bar
+            + self._SPACING + self._ESTIMATE_H  # pace estimate
+            + self._SPACING + self._BAR_H       # 7-day bar
+        )
+
+    def _update_children_visibility(self):
+        visible = self._expanded
+        self.five_hour_bar.setVisible(visible)
+        self.estimate_label.setVisible(visible and bool(self.estimate_label.text()))
+        self.seven_day_bar.setVisible(visible)
+        self._header.setText("Usage Limits ▾" if visible else "Usage Limits ▸")
+        self.setFixedHeight(self._expanded_height() if visible else self._HEADER_H)
+
+    def mousePressEvent(self, event):
+        self.toggle_expanded()
+        event.accept()
+
+
+class ModelLimitsWidget(QWidget):
+    """Collapsible group containing model-scoped usage limit bars."""
+
+    _HEADER_H = 20
+    _BAR_H = 44
+    _SPACING = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._expanded = True
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self._header = QLabel("Model Limits ▾")
+        self._header.setFixedHeight(self._HEADER_H)
+        self._header.setStyleSheet("color: #666680; font-size: 9px;")
+        layout.addWidget(self._header)
+
+        # One bar per model-scoped limit (e.g., Fable, Minimax).
+        self.model_bars: list[UsageBar] = []
+
+        self._update_children_visibility()
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def toggle_expanded(self):
+        self._expanded = not self._expanded
+        self._update_children_visibility()
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "adjustSize"):
+                parent.adjustSize()
+                break
+            parent = parent.parent() if hasattr(parent, "parent") else None
+
+    def set_data(self, limits: list[ModelLimit]):
+        self._sync_model_bars(limits)
         self._update_children_visibility()
         self.update()
 
@@ -2197,22 +2257,15 @@ class UsageLimitsWidget(QWidget):
             bar.set_data(ml.entry.utilization, ml.entry.time_remaining())
 
     def _expanded_height(self) -> int:
-        base = (
-            self._HEADER_H
-            + self._SPACING + self._BAR_H       # 5-hour bar
-            + self._SPACING + self._ESTIMATE_H  # pace estimate
-            + self._SPACING + self._BAR_H       # 7-day bar
+        return self._HEADER_H + sum(
+            self._SPACING + self._BAR_H for _ in self.model_bars
         )
-        return base + (self._SPACING + self._BAR_H) * len(self.model_bars)
 
     def _update_children_visibility(self):
         visible = self._expanded
-        self.five_hour_bar.setVisible(visible)
-        self.estimate_label.setVisible(visible and bool(self.estimate_label.text()))
-        self.seven_day_bar.setVisible(visible)
         for bar in self.model_bars:
             bar.setVisible(visible)
-        self._header.setText("Usage Limits ▾" if visible else "Usage Limits ▸")
+        self._header.setText("Model Limits ▾" if visible else "Model Limits ▸")
         self.setFixedHeight(self._expanded_height() if visible else self._HEADER_H)
 
     def mousePressEvent(self, event):
@@ -4396,6 +4449,7 @@ class ClaudeWidget(QWidget):
                 self._fetch_usage,
             )
         self._sys_reader = SystemMetricsReader()
+        self._has_fetched_usage = False
 
         self._build_ui()
         self.adjustSize()
@@ -4515,6 +4569,11 @@ class ClaudeWidget(QWidget):
         self._five_hour_bar = self._usage_limits.five_hour_bar
         self._estimate_label = self._usage_limits.estimate_label
         self._seven_day_bar = self._usage_limits.seven_day_bar
+        layout.addSpacing(2)
+
+        self._model_limits = ModelLimitsWidget()
+        self._model_limits.setVisible(False)
+        layout.addWidget(self._model_limits)
         layout.addSpacing(2)
 
         # Graph separator
@@ -4769,6 +4828,7 @@ class ClaudeWidget(QWidget):
 
     def _on_usage_fetched(self, data: UsageData):
         # Rate-limited: set backoff and reschedule, keep previous data on screen
+        self._has_fetched_usage = True
         if data.error == "Rate Limited":
             self._consecutive_429s += 1
             exp_delay = min(
@@ -4860,6 +4920,11 @@ class ClaudeWidget(QWidget):
 
         estimate = self._history.estimated_time_left(data.five_hour.utilization)
         self._usage_limits.set_data(data, estimate=estimate)
+        if self._has_fetched_usage and data.display_model_limits:
+            self._model_limits.setVisible(True)
+            self._model_limits.set_data(data.display_model_limits)
+        else:
+            self._model_limits.setVisible(False)
         self.adjustSize()
 
         # Status line: if rate-limited, show "Stale · next in Xm Ys" countdown,
