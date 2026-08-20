@@ -6057,6 +6057,31 @@ class RestoreSliver(QWidget):
         super().mousePressEvent(event)
 
 
+def _qt_platform_name() -> str:
+    """Name of the live Qt platform plugin ("xcb", "wayland", "offscreen")."""
+    app = QApplication.instance()
+    return app.platformName() if app is not None else ""
+
+
+def _preferred_qt_platform(env) -> str | None:
+    """Platform plugin list to force, or None to let Qt choose.
+
+    The overlay is built on X11 semantics that Wayland does not offer a client:
+    dragging itself around, docking the tabs panel beside itself, staying on
+    top, and driving terminal windows through xdotool. Under a Wayland session
+    XWayland supports all four, so ask for it first and keep the native Wayland
+    plugin only as a fallback (Qt tries the list in order).
+    """
+    if env.get("QT_QPA_PLATFORM"):
+        return None
+    session_is_wayland = (
+        bool(env.get("WAYLAND_DISPLAY")) or env.get("XDG_SESSION_TYPE") == "wayland"
+    )
+    if not session_is_wayland or not env.get("DISPLAY"):
+        return None
+    return "xcb;wayland"
+
+
 class ClaudeWidget(QWidget):
     """Translucent always-on-top widget displaying Claude Max usage."""
 
@@ -6082,6 +6107,7 @@ class ClaudeWidget(QWidget):
         self.destroyed.connect(self._restore_sliver.deleteLater)
 
         self._drag_pos = QPoint()
+        self._system_move_active = False
         self._usage: UsageData | None = load_last_usage()
         self._client = ClaudeUsageClient()
         self._worker: FetchWorker | None = None
@@ -7156,18 +7182,41 @@ class ClaudeWidget(QWidget):
         self.shutdown()
         event.accept()
 
+    def _begin_system_move(self) -> bool:
+        """Hand the drag to the compositor, which Wayland requires.
+
+        A Wayland client cannot set its own top-level position, so the manual
+        move path below is a silent no-op there; xdg_toplevel.move is the only
+        way. X11 keeps the manual path — it is pixel-exact and does not hand
+        the window to the WM's edge snapping.
+        """
+        if not _qt_platform_name().startswith("wayland"):
+            return False
+        handle = self.windowHandle()
+        return handle is not None and handle.startSystemMove()
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._system_move_active = self._begin_system_move()
+        if not self._system_move_active:
+            self._drag_pos = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+        event.accept()
 
     def mouseMoveEvent(self, event):
+        if self._system_move_active:
+            return
         if event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_pos)
             event.accept()
 
 
 def main():
+    forced_platform = _preferred_qt_platform(os.environ)
+    if forced_platform:
+        os.environ["QT_QPA_PLATFORM"] = forced_platform
     app = QApplication(sys.argv)
     app.setApplicationName("Claude Usage Widget")
     app.setQuitOnLastWindowClosed(False)

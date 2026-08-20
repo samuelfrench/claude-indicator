@@ -40,6 +40,13 @@ DeepSeek API spend/credit, and compact local Ollama/GPU/ComfyUI status.
   exercised against a dummy unit without disturbing ollama.
 
 ## Running
+- **Forces XWayland on a Wayland session**: `main()` sets `QT_QPA_PLATFORM=xcb;wayland`
+  when `WAYLAND_DISPLAY`/`XDG_SESSION_TYPE=wayland` is set, a `DISPLAY` exists, and the
+  user has not chosen a platform themselves. A Wayland client cannot position its own
+  top-level window, which breaks drag-to-move, the docked tabs panel, `clamp_to_available_screen`,
+  always-on-top, and the xdotool terminal jump (xdotool cannot see native Wayland surfaces).
+  If it does end up on Wayland anyway, dragging falls back to `QWindow.startSystemMove()`;
+  X11 keeps the manual `move()` drag so the WM's edge snapping never grabs the window.
 - May require `LD_LIBRARY_PATH=<path-to-miniconda>/lib` on some systems for xcb-cursor
 - Autostart configured at `~/.config/autostart/claude-widget.desktop`
 - Dependencies: PySide6, requests

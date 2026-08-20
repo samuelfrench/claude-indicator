@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPointF, Qt, QTimer
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 import claude_widget
@@ -1973,6 +1973,131 @@ class WidgetUiTest(unittest.TestCase):
             timeout_ms = worker.wait.call_args.args[0]
             self.assertGreaterEqual(timeout_ms, 0)
             self.assertLessEqual(timeout_ms, 16_000)
+
+
+class WindowDragTest(unittest.TestCase):
+    """Dragging the frameless overlay must work on Wayland as well as X11."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    class _FakeMouseEvent:
+        def __init__(self, x, y, button=Qt.MouseButton.LeftButton,
+                     buttons=Qt.MouseButton.LeftButton):
+            self._pos = QPointF(x, y)
+            self._button = button
+            self._buttons = buttons
+            self.accepted = False
+
+        def button(self):
+            return self._button
+
+        def buttons(self):
+            return self._buttons
+
+        def globalPosition(self):
+            return self._pos
+
+        def accept(self):
+            self.accepted = True
+
+    def _widget(self, platform_name, system_move_result):
+        widget = WidgetUiTest._make_inert_claude_widget(
+            self, smart_todo_dialog_factory=Mock()
+        )
+        started = []
+
+        class _Handle:
+            def startSystemMove(self):
+                started.append(True)
+                return system_move_result
+
+        widget.windowHandle = lambda: _Handle()
+        patcher = patch.object(
+            claude_widget, "_qt_platform_name", return_value=platform_name
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        moves = []
+        widget.move = lambda *args: moves.append(args)
+        return widget, started, moves
+
+    def test_wayland_press_hands_the_drag_to_the_compositor(self):
+        # Wayland clients cannot position their own top-level windows, so the
+        # manual move path can never work there.
+        widget, started, moves = self._widget("wayland", True)
+
+        widget.mousePressEvent(self._FakeMouseEvent(500, 300))
+        widget.mouseMoveEvent(self._FakeMouseEvent(540, 320))
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual(moves, [])
+
+    def test_wayland_falls_back_to_manual_move_when_compositor_refuses(self):
+        widget, started, moves = self._widget("wayland", False)
+        widget.setGeometry(100, 100, widget.width(), widget.height())
+
+        widget.mousePressEvent(self._FakeMouseEvent(500, 300))
+        widget.mouseMoveEvent(self._FakeMouseEvent(540, 320))
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(moves), 1)
+
+    def test_x11_keeps_the_proven_manual_drag(self):
+        widget, started, moves = self._widget("xcb", True)
+        widget.setGeometry(100, 100, widget.width(), widget.height())
+
+        widget.mousePressEvent(self._FakeMouseEvent(500, 300))
+        widget.mouseMoveEvent(self._FakeMouseEvent(540, 320))
+
+        self.assertEqual(started, [])
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0][0].x(), 140)
+        self.assertEqual(moves[0][0].y(), 120)
+
+    def test_right_button_press_never_starts_a_drag(self):
+        widget, started, moves = self._widget("wayland", True)
+
+        widget.mousePressEvent(
+            self._FakeMouseEvent(
+                500, 300, button=Qt.MouseButton.RightButton,
+                buttons=Qt.MouseButton.RightButton,
+            )
+        )
+
+        self.assertEqual(started, [])
+        self.assertEqual(moves, [])
+
+
+class PreferredQtPlatformTest(unittest.TestCase):
+    """The overlay needs X11 semantics: self-positioning, stay-on-top, xdotool."""
+
+    def test_wayland_session_with_x_display_prefers_xwayland(self):
+        platform = claude_widget._preferred_qt_platform(
+            {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0",
+             "DISPLAY": ":0"}
+        )
+        self.assertEqual(platform, "xcb;wayland")
+
+    def test_explicit_platform_choice_is_respected(self):
+        platform = claude_widget._preferred_qt_platform(
+            {"QT_QPA_PLATFORM": "wayland", "WAYLAND_DISPLAY": "wayland-0",
+             "DISPLAY": ":0"}
+        )
+        self.assertIsNone(platform)
+
+    def test_wayland_session_without_x_display_stays_on_wayland(self):
+        platform = claude_widget._preferred_qt_platform(
+            {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"}
+        )
+        self.assertIsNone(platform)
+
+    def test_x11_session_is_left_alone(self):
+        platform = claude_widget._preferred_qt_platform(
+            {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
+        )
+        self.assertIsNone(platform)
 
 
 if __name__ == "__main__":
