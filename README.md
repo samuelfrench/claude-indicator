@@ -1,7 +1,8 @@
 # Claude Indicator
 
 A translucent Linux desktop widget combining Claude and Codex usage, DeepSeek
-API cost/credit, and local Ollama/GPU/ComfyUI status in one panel.
+API cost/credit, local system activity, and Ollama/GPU/ComfyUI status in one
+panel.
 
 ![Unified Claude, Codex, DeepSeek, and Ollama indicator](docs/images/unified-indicator.png)
 
@@ -16,6 +17,7 @@ API cost/credit, and local Ollama/GPU/ComfyUI status in one panel.
 - **Codex limit percentage** — reads current limits through local `codex app-server`, renders whichever one or two windows are present, and combines them with latest-thread and lifetime totals from local Codex state
 - **DeepSeek spend and credit** — shows OpenCode-recorded DeepSeek cost from the rolling past 24 hours plus current account credit from DeepSeek's official balance endpoint
 - **Embedded Ollama section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
+- **Compact system activity** — shows CPU, RAM, GPU, and download/upload byte rates for the active lowest-metric UP IPv4 default-route interface(s); route or counter changes reset the 3-second sample baseline instead of producing a spike
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
 - **Compact terminal selector** — a 320px docked panel groups live Claude/Codex/OpenCode tabs by status, keeps notes and park state, and selects duplicate-project GNOME Terminal tabs by their exact TTY instead of cycling by title; other emulators use best-effort verified title/key navigation
@@ -34,6 +36,7 @@ The widget displays a dark translucent overlay with:
 - A compact `CODEX` row with current Codex limit percentage and local usage totals
 - A compact `DEEPSEEK` row with `24H` spend and `CREDIT` always visible
 - A collapsed `OLLAMA` row with GPU summary and expandable details
+- A compact `SYSTEM` row with CPU/RAM/GPU and IPv4 default-route download/upload rates; expand it for temperature and an explicit `NET` row
 - `CRON JOBS` row that collapses to one line and expands to show per-job status and timing
 - A compact `TABS` row that opens the docked terminal-session selector
 - Percentage and reset countdown on each bar
@@ -232,7 +235,8 @@ LD_LIBRARY_PATH=/path/to/miniconda3/lib python claude_widget.py
 4. **Reads Codex usage** from local `codex app-server` (`account/rateLimits/read`) plus `~/.codex/state_*.sqlite`; cached session `token_count` events under `~/.codex/sessions/` are visibly marked fallbacks and are accepted only when no more than five minutes old and not past their reset
 5. **Builds cron health** from `crontab -l` plus `journalctl` execution logs, using command equality and local-time schedule prediction
 6. **Scans local TODO files** on a background Qt worker and writes only the marked Indicator Inbox section in `~/TODO.md`
-7. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, collapsible custom rows, and a modeless Smart TODO dialog
+7. **Samples system activity** from `/proc`, selecting the active lowest-metric UP IPv4 default-route interface(s) for network byte rates without summing unrelated virtual interfaces
+8. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, collapsible custom rows, and a modeless Smart TODO dialog
 
 ### Architecture
 
@@ -247,6 +251,7 @@ for the local TODO domain and dialog, with these components:
 | `CodexUsageRow` | Custom-painted summary row backed by live local app-server limits plus local Codex SQLite totals |
 | `DeepSeekUsageRow` | Rolling local OpenCode cost plus official current DeepSeek credit, with source disclosure |
 | `LocalAISection` | Compact expandable Ollama models, GPU/VRAM, ComfyUI, and local task-loop status |
+| `SystemMetricsReader`, `SystemMetricsRow` | Three-second CPU/RAM/GPU summary plus monotonic receive/transmit rates for the active lowest-metric UP IPv4 default route(s), read directly from procfs |
 | `CronJobsWidget` | Collapsible row showing per-job cron health, last run age, and next run estimate |
 | `CronJobsFetchWorker`, `CronJobInfo` | Background worker and model used to parse crontab + journal history |
 | `Cron parsing helpers` | Parsers for `crontab -l`, schedule matching, and journal matching |

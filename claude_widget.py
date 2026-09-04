@@ -3,6 +3,7 @@
 
 import getpass
 import json
+import math
 import os
 import re
 import select
@@ -428,6 +429,10 @@ class SystemMetrics:
     gpu_mem_total_gb: float = 0.0
     gpu_temp: int = 0
     gpu_available: bool = False
+    net_rx_bps: float = 0.0
+    net_tx_bps: float = 0.0
+    net_interfaces: tuple[str, ...] = ()
+    net_available: bool = False
 
 
 @dataclass
@@ -609,11 +614,101 @@ class ComfyUIStatus:
     error: str = ""
 
 
-class SystemMetricsReader:
-    """Reads CPU, RAM, and GPU metrics from /proc and nvidia-smi."""
+def _lowest_metric_default_interfaces(route_text: str) -> tuple[str, ...]:
+    """Return UP, non-reject IPv4 default-route interfaces at best metric."""
+    candidates: list[tuple[int, str]] = []
+    for line in route_text.splitlines():
+        fields = line.split()
+        if len(fields) < 8 or fields[0] == "Iface":
+            continue
+        try:
+            destination = int(fields[1], 16)
+            flags = int(fields[3], 16)
+            metric = int(fields[6], 10)
+            mask = int(fields[7], 16)
+        except ValueError:
+            continue
+        if (
+            destination != 0
+            or mask != 0
+            or metric < 0
+            or not flags & 0x0001  # RTF_UP
+            or flags & 0x0200  # RTF_REJECT
+        ):
+            continue
+        candidates.append((metric, fields[0]))
+    if not candidates:
+        return ()
+    best_metric = min(metric for metric, _ in candidates)
+    return tuple(sorted({iface for metric, iface in candidates if metric == best_metric}))
 
-    def __init__(self):
+
+def _parse_net_dev_bytes(dev_text: str) -> dict[str, tuple[int, int]]:
+    """Parse interface -> (received bytes, transmitted bytes)."""
+    counters: dict[str, tuple[int, int]] = {}
+    for line in dev_text.splitlines():
+        if ":" not in line:
+            continue
+        iface_text, values_text = line.rsplit(":", 1)
+        iface = iface_text.strip()
+        values = values_text.split()
+        if not iface or not iface.isprintable() or len(values) < 16:
+            continue
+        try:
+            received = int(values[0])
+            transmitted = int(values[8])
+        except ValueError:
+            continue
+        if received >= 0 and transmitted >= 0:
+            counters[iface] = (received, transmitted)
+    return counters
+
+
+def format_network_rate(bytes_per_second: float | None, *, compact=False) -> str:
+    """Format a byte rate with stable binary-unit thresholds."""
+    if bytes_per_second is None:
+        return "—"
+    try:
+        rate = float(bytes_per_second)
+    except (TypeError, ValueError):
+        return "—"
+    if rate < 0 or not math.isfinite(rate):
+        return "—"
+    units = (
+        ("B/s", "B/s"),
+        ("KiB/s", "K/s"),
+        ("MiB/s", "M/s"),
+        ("GiB/s", "G/s"),
+        ("TiB/s", "T/s"),
+    )
+    unit_index = 0
+    while rate >= 1024 and unit_index < len(units) - 1:
+        rate /= 1024
+        unit_index += 1
+    if unit_index == len(units) - 1 and rate >= 1000:
+        number = "999+"
+    elif unit_index and rate < 10:
+        number = f"{rate:.1f}"
+    else:
+        number = f"{rate:.0f}"
+    unit = units[unit_index][1 if compact else 0]
+    separator = "" if compact else " "
+    return f"{number}{separator}{unit}"
+
+
+class SystemMetricsReader:
+    """Reads CPU/RAM/network from procfs and GPU data from nvidia-smi."""
+
+    def __init__(
+        self,
+        *,
+        proc_root: Path = Path("/proc"),
+        monotonic=time.monotonic,
+    ):
+        self._proc_root = Path(proc_root)
+        self._monotonic = monotonic
         self._prev_cpu: list[int] | None = None
+        self._prev_network: tuple[tuple[str, ...], int, int, float] | None = None
         self._gpu_available = False
         # Seed CPU baseline
         try:
@@ -630,13 +725,53 @@ class SystemMetricsReader:
         except (FileNotFoundError, subprocess.SubprocessError):
             self._gpu_available = False
 
-    @staticmethod
-    def _read_cpu_times() -> list[int]:
-        with open("/proc/stat") as f:
+    def _read_cpu_times(self) -> list[int]:
+        with open(self._proc_root / "stat") as f:
             line = f.readline()  # first line: cpu  user nice system idle ...
         parts = line.split()
         # user nice system idle iowait irq softirq steal
         return [int(x) for x in parts[1:9]]
+
+    def _read_network(self, metrics: SystemMetrics) -> None:
+        try:
+            route_text = (self._proc_root / "net" / "route").read_text()
+            interfaces = _lowest_metric_default_interfaces(route_text)
+            metrics.net_interfaces = interfaces
+            if not interfaces:
+                self._prev_network = None
+                return
+            dev_text = (self._proc_root / "net" / "dev").read_text()
+            counters = _parse_net_dev_bytes(dev_text)
+            if any(iface not in counters for iface in interfaces):
+                self._prev_network = None
+                return
+            received = sum(counters[iface][0] for iface in interfaces)
+            transmitted = sum(counters[iface][1] for iface in interfaces)
+            observed_at = float(self._monotonic())
+            if not math.isfinite(observed_at):
+                self._prev_network = None
+                return
+        except (OSError, TypeError, ValueError):
+            self._prev_network = None
+            return
+
+        metrics.net_available = True
+        previous = self._prev_network
+        self._prev_network = (
+            interfaces,
+            received,
+            transmitted,
+            observed_at,
+        )
+        if previous is None or previous[0] != interfaces:
+            return
+        elapsed = observed_at - previous[3]
+        received_delta = received - previous[1]
+        transmitted_delta = transmitted - previous[2]
+        if elapsed <= 0 or received_delta < 0 or transmitted_delta < 0:
+            return
+        metrics.net_rx_bps = received_delta / elapsed
+        metrics.net_tx_bps = transmitted_delta / elapsed
 
     def read(self) -> SystemMetrics:
         m = SystemMetrics()
@@ -659,7 +794,7 @@ class SystemMetricsReader:
 
         # RAM
         try:
-            with open("/proc/meminfo") as f:
+            with open(self._proc_root / "meminfo") as f:
                 meminfo = {}
                 for line in f:
                     parts = line.split()
@@ -671,6 +806,10 @@ class SystemMetricsReader:
             m.mem_used_gb = (total_kb - avail_kb) / (1024 * 1024)
         except (OSError, ValueError):
             pass
+
+        # Network. The first sample and every route/counter reset intentionally
+        # report zero so a stale baseline can never become a visible spike.
+        self._read_network(m)
 
         # GPU
         m.gpu_available = self._gpu_available
@@ -6538,10 +6677,10 @@ class CronJobsWidget(QWidget):
 
 
 class SystemMetricsRow(QWidget):
-    """Collapsible row showing CPU, RAM, and GPU system metrics."""
+    """Collapsible row showing CPU, RAM, GPU, and default-route traffic."""
 
     _COLLAPSED_H = 22
-    _EXPANDED_H = 90  # adjusted if no GPU
+    _EXPANDED_H = 110  # adjusted if no GPU
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6552,11 +6691,115 @@ class SystemMetricsRow(QWidget):
 
     def set_data(self, metrics: SystemMetrics):
         self._metrics = metrics
-        eh = self._COLLAPSED_H + 22 * (3 if metrics.gpu_available else 2)
+        eh = self._COLLAPSED_H + 22 * (4 if metrics.gpu_available else 3)
         self._EXPANDED_H = eh
         if self._expanded:
             self.setFixedHeight(self._EXPANDED_H)
+        self._update_network_tooltip(metrics)
         self.update()
+
+    @staticmethod
+    def _memory_percent(metrics: SystemMetrics) -> float:
+        if metrics.mem_total_gb <= 0:
+            return 0.0
+        return metrics.mem_used_gb / metrics.mem_total_gb * 100
+
+    @staticmethod
+    def _expanded_network_text(metrics: SystemMetrics) -> str:
+        if not metrics.net_available:
+            return "Unavailable"
+        return (
+            f"↓ {format_network_rate(metrics.net_rx_bps)}  "
+            f"↑ {format_network_rate(metrics.net_tx_bps)}"
+        )
+
+    def _update_network_tooltip(self, metrics: SystemMetrics) -> None:
+        interfaces = ", ".join(metrics.net_interfaces)
+        if metrics.net_available:
+            status = (
+                f"Network: ↓ download/receive "
+                f"{format_network_rate(metrics.net_rx_bps)}; "
+                f"↑ upload/transmit {format_network_rate(metrics.net_tx_bps)}\n"
+                f"Default-route interface(s): {interfaces}"
+            )
+        elif interfaces:
+            status = (
+                "Network unavailable: default-route counters could not be read\n"
+                f"Selected interface(s): {interfaces}"
+            )
+        else:
+            status = "Network unavailable: no UP IPv4 default route"
+        detail = (
+            f"{status}\nUnits: bytes per second (binary KiB/MiB/GiB)\n"
+            "Source: /proc/net/route + /proc/net/dev, sampled every 3 seconds"
+        )
+        self.setToolTip(detail)
+        self.setAccessibleDescription(detail.replace("\n", "; "))
+
+    @staticmethod
+    def _collapsed_layout(metrics: SystemMetrics, fm, available: int):
+        mem_pct = SystemMetricsRow._memory_percent(metrics)
+        rx = (
+            format_network_rate(metrics.net_rx_bps, compact=True)
+            if metrics.net_available
+            else "—"
+        )
+        tx = (
+            format_network_rate(metrics.net_tx_bps, compact=True)
+            if metrics.net_available
+            else "—"
+        )
+        value_specs = [
+            (f"{metrics.cpu_pct:.0f}%", _bar_color(metrics.cpu_pct)),
+            (f"{mem_pct:.0f}%", _bar_color(mem_pct)),
+        ]
+        if metrics.gpu_available:
+            value_specs.append(
+                (f"{metrics.gpu_pct:.0f}%", _bar_color(metrics.gpu_pct))
+            )
+        value_specs.extend(
+            [
+                (rx, QColor(96, 165, 250)),
+                (tx, QColor(52, 211, 153)),
+            ]
+        )
+        label_options = [
+            (["CPU ", "RAM ", "GPU ", "↓", "↑"], 7),
+            (["CPU", "RAM", "GPU", "↓", "↑"], 2),
+            (["C", "R", "G", "↓", "↑"], 4),
+        ]
+        if not metrics.gpu_available:
+            label_options = [
+                ([labels[0], labels[1], labels[3], labels[4]], gap)
+                for labels, gap in label_options
+            ]
+        for labels, gap in label_options:
+            segments = [
+                (label, value, color)
+                for label, (value, color) in zip(labels, value_specs)
+            ]
+            width = sum(
+                fm.horizontalAdvance(label + value)
+                for label, value, _ in segments
+            ) + gap * (len(segments) - 1)
+            if width <= available or (labels, gap) == label_options[-1]:
+                return segments, gap, width
+
+    @staticmethod
+    def _collapsed_presentation(metrics: SystemMetrics, fm, content_width: int):
+        """Choose a header and signal layout that fit the row's real width."""
+        last = None
+        for header_text in ("SYSTEM ▸", "SYS ▸"):
+            header_width = fm.horizontalAdvance(header_text) + 8
+            available = max(0, content_width - 4 - header_width - 4)
+            segments, gap, used = SystemMetricsRow._collapsed_layout(
+                metrics, fm, available
+            )
+            last = (header_text, header_width, segments, gap, used, available)
+            metric_labels = [label.strip() for label, _, _ in segments[:3]]
+            if used <= available and metric_labels[:2] == ["CPU", "RAM"]:
+                return last
+        return last
 
     def mousePressEvent(self, event):
         self._expanded = not self._expanded
@@ -6591,58 +6834,31 @@ class SystemMetricsRow(QWidget):
 
         # Header: SYSTEM ▸/▾
         p.setPen(QColor(100, 100, 120))
-        p.drawText(4, y, f"SYSTEM {arrow}")
-        header_w = fm.horizontalAdvance(f"SYSTEM {arrow}  ")
-
         if not self._expanded:
-            # Collapsed: inline summary
+            # Collapsed: width-aware inline summary; temperature stays in the
+            # expanded row so CPU/RAM/GPU plus both network directions fit.
+            header_text, header_w, segments, gap, _, _ = (
+                self._collapsed_presentation(m, fm, w)
+            )
+            p.drawText(4, y, header_text)
             x = 4 + header_w
-            mem_pct = (m.mem_used_gb / m.mem_total_gb * 100) if m.mem_total_gb > 0 else 0
-
-            # CPU
-            p.setPen(QColor(100, 100, 120))
-            p.drawText(x, y, "CPU ")
-            x += fm.horizontalAdvance("CPU ")
-            p.setPen(_bar_color(m.cpu_pct))
-            cpu_text = f"{m.cpu_pct:.0f}%"
-            p.drawText(x, y, cpu_text)
-            x += fm.horizontalAdvance(cpu_text) + 8
-
-            # RAM
-            p.setPen(QColor(100, 100, 120))
-            p.drawText(x, y, "RAM ")
-            x += fm.horizontalAdvance("RAM ")
-            p.setPen(_bar_color(mem_pct))
-            ram_text = f"{mem_pct:.0f}%"
-            p.drawText(x, y, ram_text)
-            x += fm.horizontalAdvance(ram_text) + 8
-
-            # GPU
-            if m.gpu_available:
+            for index, (label, value, color) in enumerate(segments):
                 p.setPen(QColor(100, 100, 120))
-                p.drawText(x, y, "GPU ")
-                x += fm.horizontalAdvance("GPU ")
-                p.setPen(_bar_color(m.gpu_pct))
-                gpu_text = f"{m.gpu_pct:.0f}%"
-                p.drawText(x, y, gpu_text)
-
-                # Temp right-aligned
-                temp_text = f"{m.gpu_temp}°C"
-                temp_w = fm.horizontalAdvance(temp_text)
-                if m.gpu_temp >= 80:
-                    p.setPen(QColor(239, 68, 68))  # red
-                elif m.gpu_temp >= 70:
-                    p.setPen(QColor(249, 115, 22))  # orange
-                else:
-                    p.setPen(QColor(180, 180, 200))
-                p.drawText(w - temp_w - 4, y, temp_text)
+                p.drawText(x, y, label)
+                x += fm.horizontalAdvance(label)
+                p.setPen(color)
+                p.drawText(x, y, value)
+                x += fm.horizontalAdvance(value)
+                if index < len(segments) - 1:
+                    x += gap
         else:
             # Expanded: mini progress bars
-            mem_pct = (m.mem_used_gb / m.mem_total_gb * 100) if m.mem_total_gb > 0 else 0
+            p.drawText(4, y, f"SYSTEM {arrow}")
+            mem_pct = self._memory_percent(m)
             bar_h = 8
             bar_radius = 4
             label_w = 32
-            detail_w = 80
+            detail_w = 132 if m.gpu_available else 90
             bar_left = label_w + 4
             bar_right = w - detail_w - 4
             bar_w = bar_right - bar_left
@@ -6652,7 +6868,10 @@ class SystemMetricsRow(QWidget):
                 ("RAM", mem_pct, f"{m.mem_used_gb:.1f}/{m.mem_total_gb:.0f} GB"),
             ]
             if m.gpu_available:
-                gpu_detail = f"{m.gpu_pct:.0f}%  {m.gpu_mem_used_gb:.1f}/{m.gpu_mem_total_gb:.0f} GB  {m.gpu_temp}°C"
+                gpu_detail = (
+                    f"{m.gpu_pct:.0f}% · {m.gpu_mem_used_gb:.1f}/"
+                    f"{m.gpu_mem_total_gb:.0f}G · {m.gpu_temp}°C"
+                )
                 rows.append(("GPU", m.gpu_pct, gpu_detail))
 
             for i, (label, pct, detail) in enumerate(rows):
@@ -6678,6 +6897,20 @@ class SystemMetricsRow(QWidget):
                 # Detail text
                 p.setPen(QColor(180, 180, 200))
                 p.drawText(bar_right + 6, text_y, detail)
+
+            net_row_y = self._COLLAPSED_H + 22 * len(rows)
+            p.setPen(QColor(100, 100, 120))
+            p.drawText(8, net_row_y + 14, "NET")
+            p.setPen(
+                QColor(180, 180, 200)
+                if m.net_available
+                else QColor(120, 120, 150)
+            )
+            p.drawText(
+                bar_left,
+                net_row_y + 14,
+                self._expanded_network_text(m),
+            )
 
         p.end()
 

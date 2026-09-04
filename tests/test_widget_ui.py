@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 import claude_widget
@@ -39,6 +40,7 @@ from claude_widget import (
     MoneyBalance,
     OllamaStatus,
     SystemMetrics,
+    SystemMetricsRow,
     TaskLoopInfo,
     TerminalSession,
     TerminalSessionsSnapshot,
@@ -1937,6 +1939,124 @@ class WidgetUiTest(unittest.TestCase):
         self.assertGreater(section.height(), collapsed)
         self.assertLess(section.height(), 300)
         self.assertIn("no DynamoDB query", section.toolTip())
+
+    def test_system_metrics_row_shows_network_summary_tooltip_and_net_row(self):
+        row = SystemMetricsRow()
+        row.setFixedWidth(320)
+        metrics = SystemMetrics(
+            cpu_pct=76,
+            mem_used_gb=12,
+            mem_total_gb=16,
+            gpu_available=True,
+            gpu_pct=54,
+            gpu_mem_used_gb=8,
+            gpu_mem_total_gb=24,
+            gpu_temp=71,
+            net_available=True,
+            net_rx_bps=1.5 * 1024**2,
+            net_tx_bps=640 * 1024,
+            net_interfaces=("enp12s0",),
+        )
+        row.set_data(metrics)
+
+        self.assertEqual(row.height(), 22)
+        self.assertIn("download/receive 1.5 MiB/s", row.toolTip())
+        self.assertIn("upload/transmit 640 KiB/s", row.toolTip())
+        self.assertIn("enp12s0", row.toolTip())
+        self.assertIn("/proc/net/route + /proc/net/dev", row.toolTip())
+        self.assertIn("bytes per second", row.accessibleDescription())
+        self.assertEqual(
+            row._expanded_network_text(metrics),
+            "↓ 1.5 MiB/s  ↑ 640 KiB/s",
+        )
+
+        class Event:
+            def accept(self):
+                pass
+
+        row.mousePressEvent(Event())
+        self.assertEqual(row.height(), 110)
+        row.grab()  # exercise the explicit GPU-temperature and NET paint rows
+
+    def test_system_metrics_collapsed_layout_fits_panel_with_all_signals(self):
+        row = SystemMetricsRow()
+        metrics = SystemMetrics(
+            cpu_pct=100,
+            mem_used_gb=16,
+            mem_total_gb=16,
+            gpu_available=True,
+            gpu_pct=100,
+            net_available=True,
+            net_rx_bps=999 * 1024**2,
+            net_tx_bps=999 * 1024**2,
+            net_interfaces=("eth0", "eth1"),
+        )
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        fm = QFontMetrics(font)
+        content_width = 300
+
+        header, header_width, segments, _, used, available = (
+            row._collapsed_presentation(metrics, fm, content_width)
+        )
+
+        self.assertLessEqual(used, available)
+        self.assertLessEqual(4 + header_width + used + 4, content_width)
+        self.assertEqual(header, "SYS ▸")
+        labels = [label.strip() for label, _, _ in segments]
+        self.assertEqual(labels, ["CPU", "RAM", "GPU", "↓", "↑"])
+        values = [value for _, value, _ in segments]
+        self.assertEqual(values[-2:], ["999M/s", "999M/s"])
+
+        metrics.net_rx_bps = 1024**8
+        metrics.net_tx_bps = 1024**8
+        _, _, max_layout, _, max_width, max_available = (
+            row._collapsed_presentation(metrics, fm, content_width)
+        )
+        self.assertLessEqual(max_width, max_available)
+        self.assertEqual(
+            [label.strip() for label, _, _ in max_layout],
+            ["CPU", "RAM", "GPU", "↓", "↑"],
+        )
+        self.assertEqual(
+            [value for _, value, _ in max_layout][-2:],
+            ["999+T/s", "999+T/s"],
+        )
+
+        full_header_available = (
+            content_width - 4 - fm.horizontalAdvance("SYSTEM ▸") - 8 - 4
+        )
+        shortest, _, shortest_width = row._collapsed_layout(
+            metrics, fm, full_header_available
+        )
+        self.assertLessEqual(shortest_width, full_header_available)
+        self.assertEqual(
+            [label.strip() for label, _, _ in shortest],
+            ["C", "R", "G", "↓", "↑"],
+        )
+
+    def test_system_metrics_network_unavailable_state_is_explicit(self):
+        row = SystemMetricsRow()
+        metrics = SystemMetrics(net_interfaces=("eth0",))
+        row.set_data(metrics)
+
+        self.assertIn("Network unavailable", row.toolTip())
+        self.assertIn("eth0", row.toolTip())
+        self.assertEqual(row._expanded_network_text(metrics), "Unavailable")
+        font = QFont("sans-serif", 8)
+        segments, _, _ = row._collapsed_layout(
+            metrics,
+            QFontMetrics(font),
+            260,
+        )
+        self.assertEqual([value for _, value, _ in segments][-2:], ["—", "—"])
+
+        class Event:
+            def accept(self):
+                pass
+
+        row.mousePressEvent(Event())
+        self.assertEqual(row.height(), 88)
 
     def test_unified_widget_contains_deepseek_and_local_ai_rows(self):
         widget = self._make_inert_claude_widget(tray_available=False)
