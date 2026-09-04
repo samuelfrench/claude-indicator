@@ -20,6 +20,7 @@ from pathlib import Path
 import requests
 from PySide6.QtCore import (
     QEasingCurve,
+    QEvent,
     QPoint,
     QPropertyAnimation,
     QRectF,
@@ -1667,16 +1668,20 @@ def _terminal_ancestor_pid(pid: int, proc_root: Path = Path("/proc")) -> int | N
 
 
 class XdotoolRunner:
-    """Thin xdotool wrapper so terminal focusing stays testable."""
+    """Thin desktop/terminal wrapper so tab focusing stays testable."""
 
-    def _run(self, *args: str) -> str:
+    def _run_program(self, program: str, *args: str) -> tuple[bool, str]:
         try:
             result = subprocess.run(
-                ["xdotool", *args], capture_output=True, text=True, timeout=5
+                [program, *args], capture_output=True, text=True, timeout=5
             )
         except (OSError, subprocess.SubprocessError):
-            return ""
-        return result.stdout.strip() if result.returncode == 0 else ""
+            return False, ""
+        return result.returncode == 0, result.stdout.strip()
+
+    def _run(self, *args: str) -> str:
+        ok, out = self._run_program("xdotool", *args)
+        return out if ok else ""
 
     def windows_for_pid(self, pid: int) -> list[int]:
         out = self._run("search", "--onlyvisible", "--pid", str(pid))
@@ -1700,31 +1705,248 @@ class XdotoolRunner:
     def send_prev_tab(self) -> None:
         self._run("key", "--clearmodifiers", "ctrl+Prior")
 
+    def _window_property(self, wid: int, name: str) -> str | None:
+        ok, out = self._run_program("xprop", "-id", str(wid), name)
+        if not ok:
+            return None
+        match = re.fullmatch(
+            rf"{re.escape(name)}(?:\([^)]*\))?\s*=\s*\"([^\"]*)\"\s*",
+            out,
+        )
+        return match.group(1) if match else None
 
-def focus_terminal_session(
+    def gtk_action_ref(self, wid: int) -> tuple[str, str] | None:
+        """GTK action-group address exported by a GNOME Terminal window."""
+        bus_name = self._window_property(wid, "_GTK_UNIQUE_BUS_NAME")
+        object_path = self._window_property(wid, "_GTK_WINDOW_OBJECT_PATH")
+        if (
+            bus_name is None
+            or object_path is None
+            or re.fullmatch(r":[0-9]+\.[0-9]+", bus_name) is None
+            or re.fullmatch(r"/org/gnome/Terminal/window/[0-9]+", object_path)
+            is None
+        ):
+            return None
+        return bus_name, object_path
+
+    def gtk_active_tab(self, action_ref: tuple[str, str]) -> int | None:
+        bus_name, object_path = action_ref
+        ok, out = self._run_program(
+            "gdbus",
+            "call",
+            "--session",
+            "--dest",
+            bus_name,
+            "--object-path",
+            object_path,
+            "--method",
+            "org.gtk.Actions.Describe",
+            "active-tab",
+        )
+        if not ok:
+            return None
+        match = re.search(r"signature 'i',\s*\[<(-?[0-9]+)>\]", out)
+        return int(match.group(1)) if match else None
+
+    def set_gtk_active_tab(
+        self, action_ref: tuple[str, str], index: int
+    ) -> bool:
+        bus_name, object_path = action_ref
+        ok, _ = self._run_program(
+            "gdbus",
+            "call",
+            "--session",
+            "--dest",
+            bus_name,
+            "--object-path",
+            object_path,
+            "--method",
+            "org.gtk.Actions.SetState",
+            "active-tab",
+            f"<{int(index)}>",
+            "{}",
+        )
+        return ok
+
+    @staticmethod
+    def _write_tty_control(tty: str, payload: bytes) -> bool:
+        # The tty comes from /proc, but validate it again at the mutation
+        # boundary so this can never become an arbitrary device/path write.
+        if re.fullmatch(r"pts/(0|[1-9][0-9]*)", tty) is None:
+            return False
+        flags = os.O_WRONLY | os.O_NOCTTY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            fd = os.open(Path("/dev") / tty, flags)
+            try:
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(fd, remaining)
+                    if written <= 0:
+                        return False
+                    remaining = remaining[written:]
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+        return True
+
+    def set_terminal_title(self, tty: str, marker: str, *, save: bool) -> bool:
+        if re.fullmatch(r"CLAUDE-INDICATOR-TAB-[0-9]+-[0-9]+-[0-9]+", marker) is None:
+            return False
+        prefix = b"\x1b[22;0t" if save else b""
+        return self._write_tty_control(
+            tty, prefix + b"\x1b]0;" + marker.encode("ascii") + b"\x07"
+        )
+
+    def restore_terminal_title(self, tty: str) -> bool:
+        return self._write_tty_control(tty, b"\x1b[23;0t")
+
+
+def _terminal_title_marker(session: TerminalSession) -> str | None:
+    """Unambiguous, control-free marker derived only from numeric identity."""
+    key_match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", session.key)
+    tty_match = re.fullmatch(r"pts/(0|[1-9][0-9]*)", session.tty)
+    if (
+        key_match is None
+        or tty_match is None
+        or int(key_match.group(1)) != session.pid
+    ):
+        return None
+    return (
+        f"CLAUDE-INDICATOR-TAB-{session.pid}-{key_match.group(2)}-"
+        f"{tty_match.group(1)}"
+    )
+
+
+def _restore_gtk_tab(
+    runner, action_ref: tuple[str, str], original_index: int, settle: float
+) -> bool:
+    if not runner.set_gtk_active_tab(action_ref, original_index):
+        return False
+    if settle:
+        time.sleep(settle)
+    return runner.gtk_active_tab(action_ref) == original_index
+
+
+def _focus_gnome_terminal_session(
     session: TerminalSession,
+    windows: list[int],
+    runner,
     *,
-    runner=None,
-    proc_root: Path = Path("/proc"),
-    max_tabs: int = 24,
-    settle: float = 0.12,
+    max_tabs: int,
+    settle: float,
+    marker_attempts: int,
 ) -> tuple[bool, str]:
-    """Best-effort jump to the terminal tab hosting this agent session.
+    """Select a GNOME Terminal tab by proving it owns ``session.tty``.
 
-    Matches the session's project name against window titles first (shells
-    and agent CLIs set the title to the working directory). When the tab is
-    not the active one, its title is invisible, so the fallback activates the
-    terminal window and cycles tabs until the title matches, stopping early
-    if focus is lost or cycling has no effect.
+    GNOME Terminal exposes its zero-based active tab through the window's GTK
+    action group. A temporary title written directly to the target pts is the
+    identity proof; project/window titles are deliberately ignored because
+    several tabs can have the same working directory. Every nonmatching
+    window is restored to its exact original active index.
     """
-    if runner is None:
-        runner = XdotoolRunner()
-    term_pid = _terminal_ancestor_pid(session.pid, proc_root)
-    if term_pid is None:
-        return False, "no terminal emulator ancestor found"
-    windows = runner.windows_for_pid(term_pid)
-    if not windows:
-        return False, "the terminal emulator has no visible windows"
+    marker = _terminal_title_marker(session)
+    if marker is None:
+        return False, "invalid numeric session or pts identity"
+
+    action_windows: list[tuple[int, tuple[str, str]]] = []
+    try:
+        for wid in windows:
+            action_ref = runner.gtk_action_ref(wid)
+            if action_ref is None:
+                return False, "GNOME Terminal GTK active-tab action unavailable"
+            action_windows.append((wid, action_ref))
+    except Exception as exc:
+        return False, f"GNOME Terminal GTK action discovery failed: {exc}"
+
+    title_saved = False
+    outcome = (False, f"no GNOME Terminal tab owns {session.tty}")
+    try:
+        title_saved = runner.set_terminal_title(session.tty, marker, save=True)
+        if not title_saved:
+            return False, f"could not mark /dev/{session.tty}"
+
+        for wid, action_ref in action_windows:
+            original_index = runner.gtk_active_tab(action_ref)
+            if original_index is None:
+                outcome = (False, "GNOME Terminal active-tab state unreadable")
+                break
+
+            matched = False
+            scan_failed = ""
+            for index in range(max(0, max_tabs)):
+                if not runner.set_gtk_active_tab(action_ref, index):
+                    scan_failed = "GNOME Terminal active-tab selection failed"
+                    break
+                if settle:
+                    time.sleep(settle)
+                selected_index = runner.gtk_active_tab(action_ref)
+                if selected_index is None:
+                    scan_failed = "GNOME Terminal active-tab state unreadable"
+                    break
+                if selected_index != index:
+                    # SetState leaves the state unchanged for an out-of-range
+                    # index, which gives us a bounded tab count without keys.
+                    break
+
+                for _ in range(max(1, marker_attempts)):
+                    if not runner.set_terminal_title(
+                        session.tty, marker, save=False
+                    ):
+                        scan_failed = f"could not refresh /dev/{session.tty} marker"
+                        break
+                    if settle:
+                        time.sleep(settle)
+                    if runner.window_name(wid) == marker:
+                        matched = True
+                        break
+                if matched or scan_failed:
+                    break
+
+            if matched:
+                runner.activate(wid)
+                if runner.active_window() == wid:
+                    outcome = (
+                        True,
+                        f"selected exact {session.tty} tab {runner.gtk_active_tab(action_ref)} "
+                        f"in window {wid}",
+                    )
+                    break
+                scan_failed = "exact tab selected but terminal window would not activate"
+
+            if not _restore_gtk_tab(runner, action_ref, original_index, settle):
+                outcome = (
+                    False,
+                    f"{scan_failed or 'tab not found'}; original tab index did not restore",
+                )
+                break
+            if scan_failed:
+                outcome = (False, scan_failed)
+                break
+    except Exception as exc:
+        outcome = (False, f"GNOME Terminal exact-tab selection failed: {exc}")
+    finally:
+        if title_saved:
+            try:
+                title_restored = runner.restore_terminal_title(session.tty)
+            except Exception:
+                title_restored = False
+            if not title_restored:
+                outcome = (False, f"temporary title on /dev/{session.tty} did not restore")
+    return outcome
+
+
+def _focus_terminal_session_by_title(
+    session: TerminalSession,
+    windows: list[int],
+    runner,
+    *,
+    max_tabs: int,
+    settle: float,
+) -> tuple[bool, str]:
+    """Compatibility path for terminal emulators without a tab-selection API."""
     target = session.project.lower()
 
     for wid in windows:
@@ -1749,11 +1971,10 @@ def focus_terminal_session(
                 break
             new_title = runner.window_name(wid).lower()
             if new_title == title:
-                break  # cycling has no effect: single tab or keys ignored
+                break
             title = new_title
         if target and target in title:
             return True, f"tab found by cycling window {wid}"
-        # No match here: undo every tab switch so the window is left as found.
         for _ in range(sent):
             if runner.active_window() != wid:
                 break
@@ -1763,6 +1984,47 @@ def focus_terminal_session(
 
     runner.activate(windows[0])
     return False, "tab title never matched; activated the terminal window"
+
+
+def focus_terminal_session(
+    session: TerminalSession,
+    *,
+    runner=None,
+    proc_root: Path = Path("/proc"),
+    max_tabs: int = 24,
+    settle: float = 0.012,
+    marker_attempts: int = 3,
+) -> tuple[bool, str]:
+    """Jump to the terminal tab hosting this agent session.
+
+    GNOME Terminal is selected deterministically through its GTK action state
+    and an exact target-pts marker. Other emulators retain the older title/key
+    compatibility path because they do not expose that API.
+    """
+    if runner is None:
+        runner = XdotoolRunner()
+    term_pid = _terminal_ancestor_pid(session.pid, proc_root)
+    if term_pid is None:
+        return False, "no terminal emulator ancestor found"
+    windows = runner.windows_for_pid(term_pid)
+    if not windows:
+        return False, "the terminal emulator has no visible windows"
+    terminal_info = _read_proc_stat(proc_root / str(term_pid) / "stat")
+    if (
+        terminal_info is not None
+        and terminal_info["comm"].startswith("gnome-terminal")
+    ):
+        return _focus_gnome_terminal_session(
+            session,
+            windows,
+            runner,
+            max_tabs=max_tabs,
+            settle=settle,
+            marker_attempts=marker_attempts,
+        )
+    return _focus_terminal_session_by_title(
+        session, windows, runner, max_tabs=max_tabs, settle=settle
+    )
 
 
 class TerminalFocusWorker(QThread):
@@ -4834,10 +5096,11 @@ class TerminalTabsPanel(QWidget):
     note_changed = Signal(str, str)
     navigate_requested = Signal(str)
     close_requested = Signal()
+    drag_requested = Signal(QPoint)
 
-    PANEL_WIDTH = 420
-    _CARD_H = 88
-    _MIN_H = 180
+    PANEL_WIDTH = 320
+    _CARD_H = 62
+    _MIN_H = 150
 
     def __init__(self):
         super().__init__()
@@ -4854,30 +5117,42 @@ class TerminalTabsPanel(QWidget):
         self._pending: tuple | None = None
         self._cards: list[dict] = []
         self._group_labels: list[str] = []
+        self._drag_global: QPoint | None = None
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 12, 16, 12)
-        outer.setSpacing(6)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(4)
 
-        header = QHBoxLayout()
-        self._header_label = QLabel("TERMINAL TABS")
-        header_font = QFont("sans-serif", 10)
+        self._header = QWidget()
+        self._register_drag_handle(self._header)
+        header = QHBoxLayout(self._header)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        self._header_label = QLabel("TABS")
+        self._register_drag_handle(self._header_label)
+        header_font = QFont("sans-serif", 9)
         header_font.setWeight(QFont.Weight.Bold)
-        header_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        header_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.8)
         self._header_label.setFont(header_font)
         self._header_label.setStyleSheet("color: #d4a574;")
+        self._header_label.setToolTip(
+            "Drag to move the tabs panel and Claude Indicator together"
+        )
         header.addWidget(self._header_label)
         header.addStretch()
-        close_btn = QLabel("✕")
-        close_btn.setStyleSheet("color: #666680; font-size: 13px; padding: 0 4px;")
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.mousePressEvent = lambda _: self.close_requested.emit()
-        header.addWidget(close_btn)
-        outer.addLayout(header)
-
-        hint = QLabel("park a tab to silence it · notes persist per session")
-        hint.setStyleSheet("color: #666680; font-size: 9px;")
-        outer.addWidget(hint)
+        self._close_btn = QPushButton("✕")
+        self._close_btn.setAccessibleName("Close terminal tabs panel")
+        self._close_btn.setFixedWidth(22)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setStyleSheet(
+            "QPushButton { color: #666680; background: transparent; border: none;"
+            " font-size: 12px; padding: 0 3px; }"
+            "QPushButton:hover { color: #aaaac0; }"
+        )
+        self._close_btn.clicked.connect(self.close_requested.emit)
+        header.addWidget(self._close_btn)
+        outer.addWidget(self._header)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -4890,9 +5165,10 @@ class TerminalTabsPanel(QWidget):
             "QScrollArea > QWidget > QWidget { background: transparent; }"
         )
         self._cards_host = QWidget()
+        self._register_drag_handle(self._cards_host)
         self._cards_layout = QVBoxLayout(self._cards_host)
         self._cards_layout.setContentsMargins(0, 0, 0, 0)
-        self._cards_layout.setSpacing(6)
+        self._cards_layout.setSpacing(4)
         self._scroll.setWidget(self._cards_host)
         outer.addWidget(self._scroll)
 
@@ -4918,7 +5194,7 @@ class TerminalTabsPanel(QWidget):
         self._snapshot = snapshot
         self._notes = notes
         self._header_label.setText(
-            f"TERMINAL TABS — {_terminal_summary_text(snapshot)}"
+            f"TABS · {_terminal_summary_text(snapshot)}"
         )
         while self._cards_layout.count():
             item = self._cards_layout.takeAt(0)
@@ -4930,7 +5206,8 @@ class TerminalTabsPanel(QWidget):
         sessions = _ordered_terminal_sessions(snapshot)
         if not sessions:
             empty = QLabel("no claude / codex / opencode session holds a terminal")
-            empty.setStyleSheet("color: #8888a0; font-size: 10px; padding: 12px;")
+            self._register_drag_handle(empty)
+            empty.setStyleSheet("color: #8888a0; font-size: 9px; padding: 8px;")
             self._cards_layout.addWidget(empty)
         current_group = None
         for session in sessions:
@@ -4938,10 +5215,11 @@ class TerminalTabsPanel(QWidget):
             if group != current_group:
                 current_group = group
                 header = QLabel(group)
+                self._register_drag_handle(header)
                 color = _terminal_status_color(session).name()
                 header.setStyleSheet(
-                    f"color: {color}; font-size: 9px; font-weight: bold;"
-                    " letter-spacing: 1px; padding: 4px 2px 0 2px;"
+                    f"color: {color}; font-size: 8px; font-weight: bold;"
+                    " letter-spacing: 1px; padding: 2px 2px 0 2px;"
                 )
                 self._group_labels.append(group)
                 self._cards_layout.addWidget(header)
@@ -4953,49 +5231,56 @@ class TerminalTabsPanel(QWidget):
 
     def _build_card(self, session: TerminalSession, note: str) -> QWidget:
         card = QFrame()
+        self._register_drag_handle(card)
         card.setFixedHeight(self._CARD_H)
         accent = _terminal_status_color(session).name()
+        status_text = _terminal_status_text(session)
+        detail = (
+            f"{session.tool} · {session.project} · {status_text}\n"
+            f"{session.cwd or '?'} · {session.tty} · pid {session.pid}"
+        )
+        card.setToolTip(detail)
+        card.setAccessibleName(f"{session.tool} terminal tab: {session.project}")
+        card.setAccessibleDescription(detail.replace("\n", "; "))
         card.setStyleSheet(
-            "QFrame { background: rgba(35, 35, 50, 150); border-radius: 8px;"
+            "QFrame { background: rgba(35, 35, 50, 150); border-radius: 7px;"
             f" border-left: 3px solid {accent}; }}"
             "QLabel { background: transparent; border: none; }"
         )
         v = QVBoxLayout(card)
-        v.setContentsMargins(10, 6, 10, 6)
-        v.setSpacing(2)
+        v.setContentsMargins(8, 4, 8, 4)
+        v.setSpacing(3)
 
         key = session.key
         top = QHBoxLayout()
         tool = QLabel(session.tool)
         tool_color = _TERMINAL_TOOL_COLORS.get(session.tool, QColor(150, 150, 170))
         tool.setStyleSheet(
-            f"color: {tool_color.name()}; font-size: 9px; font-weight: bold;"
+            f"color: {tool_color.name()}; font-size: 8px; font-weight: bold;"
         )
         tool.setCursor(Qt.CursorShape.PointingHandCursor)
         tool.mousePressEvent = lambda _e, k=key: self.navigate_requested.emit(k)
         top.addWidget(tool)
         name = QLabel(session.project)
         name.setStyleSheet(
-            "color: #d8d8e8; font-size: 12px; font-weight: bold; padding-left: 4px;"
+            "color: #d8d8e8; font-size: 10px; font-weight: bold; padding-left: 2px;"
         )
         name.setCursor(Qt.CursorShape.PointingHandCursor)
-        name.setToolTip("Jump to this terminal tab")
+        name.setToolTip(detail)
+        name.setAccessibleName(f"Open {session.project} terminal tab")
+        name.setAccessibleDescription(detail.replace("\n", "; "))
         name.mousePressEvent = lambda _e, k=key: self.navigate_requested.emit(k)
         top.addWidget(name)
         top.addStretch()
-        status = QLabel(_terminal_status_text(session))
+        status = QLabel(status_text)
         status_color = _terminal_status_color(session)
         status.setStyleSheet(
-            f"color: {status_color.name()}; font-size: 10px; font-weight: bold;"
+            f"color: {status_color.name()}; font-size: 8px; font-weight: bold;"
             f" background: rgba({status_color.red()}, {status_color.green()},"
-            f" {status_color.blue()}, 40); border-radius: 4px; padding: 2px 8px;"
+            f" {status_color.blue()}, 40); border-radius: 4px; padding: 1px 5px;"
         )
         top.addWidget(status)
         v.addLayout(top)
-
-        where = QLabel(f"{session.cwd or '?'}  ·  {session.tty}  ·  pid {session.pid}")
-        where.setStyleSheet("color: #8888a0; font-size: 9px;")
-        v.addWidget(where)
 
         bottom = QHBoxLayout()
         note_edit = QLineEdit(note)
@@ -5003,7 +5288,7 @@ class TerminalTabsPanel(QWidget):
         note_edit.setStyleSheet(
             "QLineEdit { background: rgba(20, 20, 30, 180); color: #c8c8dc;"
             " border: 1px solid rgba(100, 100, 120, 60); border-radius: 4px;"
-            " font-size: 10px; padding: 3px 6px; }"
+            " font-size: 9px; padding: 2px 5px; }"
         )
         bottom.addWidget(note_edit, 1)
         park_btn = QPushButton("UNPARK" if session.parked else "PARK")
@@ -5011,7 +5296,7 @@ class TerminalTabsPanel(QWidget):
         park_btn.setStyleSheet(
             "QPushButton { background: rgba(60, 60, 85, 180); color: #b0b0c8;"
             " border: none; border-radius: 4px; font-size: 9px;"
-            " font-weight: bold; padding: 4px 10px; }"
+            " font-weight: bold; padding: 3px 7px; }"
             "QPushButton:hover { background: rgba(90, 90, 125, 200); }"
         )
         bottom.addWidget(park_btn)
@@ -5034,7 +5319,9 @@ class TerminalTabsPanel(QWidget):
         return card
 
     def _sync_height(self, session_count: int, group_count: int = 0):
-        content = 70 + max(1, session_count) * (self._CARD_H + 6) + group_count * 20
+        content = (
+            38 + max(1, session_count) * (self._CARD_H + 4) + group_count * 16
+        )
         available_h = None
         screen = QApplication.primaryScreen()
         if screen is not None:
@@ -5092,6 +5379,59 @@ class TerminalTabsPanel(QWidget):
                 self._notes.pop(key, None)
             self.note_changed.emit(key, text)
         self.flush_pending()
+
+    # -- drag handle --------------------------------------------------------
+
+    def _register_drag_handle(self, widget: QWidget):
+        widget.setProperty("terminalTabsDragHandle", True)
+        widget.setCursor(Qt.CursorShape.SizeAllCursor)
+        widget.installEventFilter(self)
+
+    def _handle_drag_event(self, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+            self._drag_global = event.globalPosition().toPoint()
+            event.accept()
+            return True
+        if event.type() == QEvent.Type.MouseMove:
+            if (
+                self._drag_global is None
+                or not (event.buttons() & Qt.MouseButton.LeftButton)
+            ):
+                return False
+            current = event.globalPosition().toPoint()
+            delta = current - self._drag_global
+            self._drag_global = current
+            if not delta.isNull():
+                self.drag_requested.emit(delta)
+            event.accept()
+            return True
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            if self._drag_global is None:
+                return False
+            self._drag_global = None
+            event.accept()
+            return True
+        return False
+
+    def eventFilter(self, watched, event):
+        if watched.property("terminalTabsDragHandle"):
+            if self._handle_drag_event(event):
+                return True
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event):
+        if not self._handle_drag_event(event):
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._handle_drag_event(event):
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if not self._handle_drag_event(event):
+            super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -6148,6 +6488,7 @@ class ClaudeWidget(QWidget):
         self._tabs_panel.note_changed.connect(self._on_session_note_changed)
         self._tabs_panel.navigate_requested.connect(self._on_session_navigate)
         self._tabs_panel.close_requested.connect(self._toggle_tabs_panel)
+        self._tabs_panel.drag_requested.connect(self._on_tabs_panel_dragged)
         self._terminal_focus_worker: TerminalFocusWorker | None = None
         self._tabs_panel_closing = False
         self._tabs_panel_anim = QPropertyAnimation(self._tabs_panel, b"pos", self)
@@ -6979,6 +7320,19 @@ class ClaudeWidget(QWidget):
             # while the animation runs); snap to the current dock position.
             self._tabs_panel.move(self._panel_positions()[0])
 
+    def _on_tabs_panel_dragged(self, delta: QPoint):
+        """Move the main-window anchor; its move keeps the panel docked."""
+        if delta.isNull() or not self._tabs_panel.isVisible():
+            return
+        self._tabs_panel_anim.stop()
+        self._tabs_panel_closing = False
+        self._terminal_sessions_row.set_panel_open(True)
+        self.move(self.pos() + delta)
+        # Hidden widgets do not consistently receive moveEvent on every Qt
+        # backend. Snap explicitly so panel dragging also works in sliver mode.
+        self._tabs_panel.move(self._panel_positions()[0])
+        self._tabs_panel.raise_()
+
     def moveEvent(self, event):
         super().moveEvent(event)
         panel = getattr(self, "_tabs_panel", None)
@@ -7087,6 +7441,9 @@ class ClaudeWidget(QWidget):
             return
         self._restore_sliver.hide()
         self.show()
+        if self._tabs_panel.isVisible():
+            self._tabs_panel.move(self._panel_positions()[0])
+            self._tabs_panel.raise_()
         self.raise_()
         self.activateWindow()
 
@@ -7106,7 +7463,7 @@ class ClaudeWidget(QWidget):
             self._terminal_sessions_row.set_panel_open(False)
 
     def collapse_to_sliver(self):
-        """Replace the full panel with a visible tab on the nearest screen edge."""
+        """Hide the main panel but keep the terminal selector usable."""
         if self._shutdown_started:
             return
         screen = QApplication.screenAt(self.frameGeometry().center())
@@ -7121,10 +7478,15 @@ class ClaudeWidget(QWidget):
             available.bottom() - self._restore_sliver.height() + 1,
         )
         left = available.right() - self._restore_sliver.width() + 1
-        self._hide_tabs_panel()
+        self._tabs_panel_anim.stop()
+        self._tabs_panel_closing = False
+        self._terminal_sessions_row.set_panel_open(True)
+        self._tabs_panel.move(self._panel_positions()[0])
+        self._tabs_panel.show()
         self.hide()
         self._restore_sliver.move(left, top)
         self._restore_sliver.show()
+        self._tabs_panel.raise_()
         self._restore_sliver.raise_()
 
     def _restore_from_sliver(self):
@@ -7132,11 +7494,20 @@ class ClaudeWidget(QWidget):
         self.show()
         self.adjustSize()
         self.clamp_to_available_screen()
+        if self._tabs_panel.isVisible():
+            self._tabs_panel_anim.stop()
+            self._tabs_panel_closing = False
+            self._tabs_panel.move(self._panel_positions()[0])
+            self._tabs_panel.raise_()
         self.raise_()
         self.activateWindow()
 
     def _toggle_from_tray(self):
-        if self.isVisible():
+        if (
+            self.isVisible()
+            or self._tabs_panel.isVisible()
+            or self._restore_sliver.isVisible()
+        ):
             self.hide_to_tray()
         else:
             self._show_from_tray()

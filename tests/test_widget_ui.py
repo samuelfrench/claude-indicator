@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 import claude_widget
@@ -932,6 +932,20 @@ class WidgetUiTest(unittest.TestCase):
         anim.setCurrentTime(anim.duration())
         self.assertFalse(widget._tabs_panel.isVisible())
 
+    def test_dragging_tabs_panel_moves_main_anchor_and_keeps_both_docked(self):
+        widget = self._make_inert_claude_widget()
+        widget.show()
+        widget.move(500, 40)
+        widget._toggle_tabs_panel()
+        widget._tabs_panel_anim.setCurrentTime(widget._tabs_panel_anim.duration())
+        original = widget.pos()
+
+        widget._tabs_panel.drag_requested.emit(QPoint(27, 19))
+
+        self.assertEqual(widget.pos(), original + QPoint(27, 19))
+        self.assertEqual(widget._tabs_panel.pos(), widget._panel_positions()[0])
+        self.assertTrue(widget._tabs_panel.isVisible())
+
     def test_navigate_request_spawns_a_focus_worker_for_that_session(self):
         widget = self._make_inert_claude_widget()
         session = self._terminal_session(key="5:5")
@@ -1164,6 +1178,9 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertFalse(widget.isVisible())
         self.assertTrue(widget._restore_sliver.isVisible())
+        self.assertTrue(widget._tabs_panel.isVisible())
+        self.assertTrue(widget._terminal_sessions_row._panel_open)
+        self.assertEqual(widget._tabs_panel.pos(), widget._panel_positions()[0])
         self.assertEqual(widget._restore_sliver.frameGeometry().right(), available.right())
         self.assertEqual(widget._restore_sliver.frameGeometry().top(), available.top() + 40)
         self.assertEqual(widget._restore_sliver.toolTip(), "Expand Claude Indicator")
@@ -1173,6 +1190,21 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertFalse(widget._restore_sliver.isVisible())
         self.assertTrue(widget.isVisible())
+        self.assertTrue(widget._tabs_panel.isVisible())
+        self.assertEqual(widget._tabs_panel.pos(), widget._panel_positions()[0])
+
+    def test_tray_toggle_hides_selector_and_sliver_when_main_is_collapsed(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        widget.show()
+        widget.collapse_to_sliver()
+        self.assertTrue(widget._tabs_panel.isVisible())
+        self.assertTrue(widget._restore_sliver.isVisible())
+
+        widget._toggle_from_tray()
+
+        self.assertFalse(widget.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        self.assertFalse(widget._restore_sliver.isVisible())
 
     def test_claude_close_event_uses_hide_to_tray(self):
         widget = self._make_inert_claude_widget(tray_available=True)

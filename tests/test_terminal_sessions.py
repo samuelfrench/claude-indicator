@@ -7,7 +7,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtWidgets import QApplication, QLabel
 
 from claude_widget import (
     TERMINAL_SESSION_ATTENTION_IDLE_S,
@@ -399,6 +400,66 @@ class TerminalTabsPanelTest(unittest.TestCase):
 
         self.assertEqual(received, ["2:1"])
 
+    def test_panel_and_cards_are_compact_without_a_visible_cwd_row(self):
+        panel = self._panel()
+        card = panel._card("2:1")
+
+        self.assertEqual(panel.width(), 320)
+        self.assertEqual(card["widget"].height(), 62)
+        self.assertLess(panel.height(), 400)
+        visible_labels = [
+            label.text() for label in card["widget"].findChildren(QLabel)
+        ]
+        self.assertNotIn("/home/sam/demo", visible_labels)
+        self.assertIn("/home/sam/demo", card["widget"].toolTip())
+        self.assertIn("pts/2", card["widget"].accessibleDescription())
+        self.assertIn("pid 2", card["widget"].accessibleDescription())
+
+    def test_header_drag_emits_incremental_anchor_delta(self):
+        panel = self._panel()
+        deltas = []
+        panel.drag_requested.connect(deltas.append)
+
+        class PointerEvent:
+            def __init__(self, event_type, point, *, pressed=True):
+                self._type = event_type
+                self._point = QPointF(point)
+                self._pressed = pressed
+                self.accepted = False
+
+            def type(self):
+                return self._type
+
+            def button(self):
+                return Qt.MouseButton.LeftButton
+
+            def buttons(self):
+                return (
+                    Qt.MouseButton.LeftButton
+                    if self._pressed
+                    else Qt.MouseButton.NoButton
+                )
+
+            def globalPosition(self):
+                return self._point
+
+            def accept(self):
+                self.accepted = True
+
+        self.assertTrue(panel._header_label.property("terminalTabsDragHandle"))
+        press = PointerEvent(QEvent.Type.MouseButtonPress, QPoint(100, 100))
+        move = PointerEvent(QEvent.Type.MouseMove, QPoint(124, 113))
+        release = PointerEvent(
+            QEvent.Type.MouseButtonRelease, QPoint(124, 113), pressed=False
+        )
+
+        self.assertTrue(panel.eventFilter(panel._header_label, press))
+        self.assertTrue(panel.eventFilter(panel._header_label, move))
+        self.assertTrue(panel.eventFilter(panel._header_label, release))
+
+        self.assertEqual(deltas, [QPoint(24, 13)])
+        self.assertIsNone(panel._drag_global)
+
 
 class _FakeXdotool:
     """Two terminal windows; window 20 cycles its tab titles as a ring."""
@@ -441,18 +502,118 @@ class _FakeXdotool:
             self.titles[20] = self.ring[self.pos]
 
 
+class _FakeGnomeActions:
+    """GTK active-tab model with duplicate human titles in every tab."""
+
+    def __init__(
+        self,
+        *,
+        target=(20, 2),
+        original=None,
+        tab_counts=None,
+        marker_visible_after=2,
+        action_available=True,
+        fail_set=None,
+        active_follows=True,
+    ):
+        self.windows = [10, 20]
+        self.target = target
+        self.original = dict(original or {10: 1, 20: 0})
+        self.indices = dict(self.original)
+        self.tab_counts = dict(tab_counts or {10: 2, 20: 4})
+        self.marker_visible_after = marker_visible_after
+        self.action_available = action_available
+        self.fail_set = fail_set
+        self.active_follows = active_follows
+        self.marker = ""
+        self.marker_refreshes = 0
+        self.title_calls = []
+        self.title_restored = False
+        self.activated = []
+        self.set_history = []
+        self.next_sent = 0
+        self.prev_sent = 0
+        self._active = None
+
+    def windows_for_pid(self, pid):
+        return list(self.windows)
+
+    def gtk_action_ref(self, wid):
+        if not self.action_available:
+            return None
+        return ":1.102", f"/org/gnome/Terminal/window/{wid}"
+
+    @staticmethod
+    def _wid(action_ref):
+        return int(action_ref[1].rsplit("/", 1)[1])
+
+    def gtk_active_tab(self, action_ref):
+        return self.indices[self._wid(action_ref)]
+
+    def set_gtk_active_tab(self, action_ref, index):
+        wid = self._wid(action_ref)
+        self.set_history.append((wid, index))
+        if self.fail_set == (wid, index):
+            return False
+        if 0 <= index < self.tab_counts[wid]:
+            self.indices[wid] = index
+        return True
+
+    def set_terminal_title(self, tty, marker, *, save):
+        self.title_calls.append((tty, marker, save))
+        self.marker = marker
+        if not save and self.target is not None:
+            wid, index = self.target
+            if self.indices.get(wid) == index:
+                self.marker_refreshes += 1
+        return True
+
+    def restore_terminal_title(self, tty):
+        self.title_restored = True
+        self.marker = ""
+        return True
+
+    def window_name(self, wid):
+        if (
+            self.target is not None
+            and (wid, self.indices[wid]) == self.target
+            and self.marker_refreshes >= self.marker_visible_after
+        ):
+            return self.marker
+        return "coffee-explorer"
+
+    def activate(self, wid):
+        self.activated.append(wid)
+        if self.active_follows:
+            self._active = wid
+
+    def active_window(self):
+        return self._active
+
+    def send_next_tab(self):
+        self.next_sent += 1
+
+    def send_prev_tab(self):
+        self.prev_sent += 1
+
+
 class FocusTerminalSessionTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.proc = Path(self._tmp.name)
-        # claude(100) -> bash(50) -> gnome-terminal-(40)
+        # claude(100) -> bash(50) -> xterm(40). Tests that exercise GNOME's
+        # exact path replace the emulator comm explicitly.
         make_proc(self.proc, 100, "claude", ppid=50, tty_nr=PTS3)
         make_proc(self.proc, 50, "bash", ppid=40)
-        make_proc(self.proc, 40, "gnome-terminal-", ppid=1)
+        make_proc(self.proc, 40, "xterm", ppid=1)
+
+    def _use_gnome_terminal(self):
+        stat_path = self.proc / "40" / "stat"
+        stat_path.write_text(stat_path.read_text().replace("(xterm)", "(gnome-terminal-)"))
 
     def _session_(self, project="coffee-explorer"):
-        return _session(key="100:1", pid=100, project=project)
+        return _session(key="100:1", pid=100, project=project, tty="pts/3")
 
     def test_ancestor_walk_finds_the_terminal_emulator(self):
         self.assertEqual(_terminal_ancestor_pid(100, self.proc), 40)
@@ -513,6 +674,83 @@ class FocusTerminalSessionTest(unittest.TestCase):
         # Every cycling key was undone: both windows show their original tab.
         self.assertEqual(runner.prev_sent, runner.next_sent)
         self.assertEqual(runner.titles[20], "aaa")
+
+    def test_gnome_selects_exact_tty_despite_duplicate_project_titles(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(target=(20, 2), marker_visible_after=2)
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertTrue(ok, detail)
+        self.assertIn("exact pts/3 tab 2", detail)
+        self.assertEqual(runner.activated, [20])
+        self.assertEqual(runner.indices[10], 1)  # nonmatching window restored
+        self.assertEqual(runner.indices[20], 2)  # exact target remains selected
+        self.assertGreaterEqual(runner.marker_refreshes, 2)
+        self.assertTrue(runner.title_restored)
+        self.assertEqual(runner.next_sent, 0)
+        self.assertEqual(runner.prev_sent, 0)
+
+    def test_gnome_failure_restores_every_index_and_title_without_keys(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(target=None)
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc,
+            settle=0, max_tabs=8,
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("no GNOME Terminal tab owns pts/3", detail)
+        self.assertEqual(runner.indices, runner.original)
+        self.assertEqual(runner.activated, [])
+        self.assertTrue(runner.title_restored)
+        self.assertEqual((runner.next_sent, runner.prev_sent), (0, 0))
+
+    def test_gnome_action_failure_is_fail_closed_and_restores_index(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(target=None, fail_set=(20, 1))
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("selection failed", detail)
+        self.assertEqual(runner.indices, runner.original)
+        self.assertEqual(runner.activated, [])
+        self.assertTrue(runner.title_restored)
+        self.assertEqual((runner.next_sent, runner.prev_sent), (0, 0))
+
+    def test_gnome_without_gtk_action_does_not_use_ambiguous_title_fallback(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(action_available=False)
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("GTK active-tab action unavailable", detail)
+        self.assertEqual(runner.activated, [])
+        self.assertEqual(runner.title_calls, [])
+        self.assertEqual((runner.next_sent, runner.prev_sent), (0, 0))
+
+    def test_gnome_rejects_non_numeric_session_identity_before_tty_write(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions()
+        session = self._session_()
+        session.key = "100:not-numeric"
+
+        ok, detail = focus_terminal_session(
+            session, runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("invalid numeric session", detail)
+        self.assertEqual(runner.title_calls, [])
 
 
 if __name__ == "__main__":
