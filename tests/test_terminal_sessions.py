@@ -485,6 +485,7 @@ class _FakeXdotool:
         self.activated.append(wid)
         if self.active_follows:
             self._active = wid
+        return self.active_follows
 
     def active_window(self):
         return self._active
@@ -586,6 +587,7 @@ class _FakeGnomeActions:
         self.activated.append(wid)
         if self.active_follows:
             self._active = wid
+        return self.active_follows
 
     def active_window(self):
         return self._active
@@ -723,6 +725,19 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertEqual(runner.activated, [])
         self.assertTrue(runner.title_restored)
         self.assertEqual((runner.next_sent, runner.prev_sent), (0, 0))
+
+    def test_gnome_activation_failure_restores_the_previously_active_tab(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(target=(20, 2), active_follows=False)
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("would not activate", detail)
+        self.assertEqual(runner.indices, runner.original)
+        self.assertTrue(runner.title_restored)
 
     def test_gnome_without_gtk_action_does_not_use_ambiguous_title_fallback(self):
         self._use_gnome_terminal()

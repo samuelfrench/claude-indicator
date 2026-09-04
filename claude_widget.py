@@ -1690,8 +1690,11 @@ class XdotoolRunner:
     def window_name(self, wid: int) -> str:
         return self._run("getwindowname", str(wid))
 
-    def activate(self, wid: int) -> None:
-        self._run("windowactivate", "--sync", str(wid))
+    def activate(self, wid: int) -> bool:
+        ok, _ = self._run_program(
+            "xdotool", "windowactivate", "--sync", str(wid)
+        )
+        return ok
 
     def active_window(self) -> int | None:
         out = self._run("getactivewindow")
@@ -1898,7 +1901,17 @@ def _focus_gnome_terminal_session(
                         scan_failed = f"could not refresh /dev/{session.tty} marker"
                         break
                     if settle:
-                        time.sleep(settle)
+                        time.sleep(settle / 2)
+                    # A busy VTE can redraw its OSC title within a few
+                    # milliseconds. Double-pulse each bounded check so the
+                    # marker survives long enough for the X title read.
+                    if not runner.set_terminal_title(
+                        session.tty, marker, save=False
+                    ):
+                        scan_failed = f"could not refresh /dev/{session.tty} marker"
+                        break
+                    if settle:
+                        time.sleep(settle / 2)
                     if runner.window_name(wid) == marker:
                         matched = True
                         break
@@ -1906,8 +1919,12 @@ def _focus_gnome_terminal_session(
                     break
 
             if matched:
-                runner.activate(wid)
-                if runner.active_window() == wid:
+                activation_requested = runner.activate(wid)
+                active_window = runner.active_window()
+                if (
+                    activation_requested is not False
+                    and (active_window is None or active_window == wid)
+                ):
                     outcome = (
                         True,
                         f"selected exact {session.tty} tab {runner.gtk_active_tab(action_ref)} "
@@ -1933,6 +1950,10 @@ def _focus_gnome_terminal_session(
                 title_restored = runner.restore_terminal_title(session.tty)
             except Exception:
                 title_restored = False
+            if title_restored and settle:
+                # VTE consumes control sequences asynchronously; do not hand
+                # control back while the temporary marker is still painted.
+                time.sleep(max(settle, 0.05))
             if not title_restored:
                 outcome = (False, f"temporary title on /dev/{session.tty} did not restore")
     return outcome
@@ -1993,7 +2014,7 @@ def focus_terminal_session(
     proc_root: Path = Path("/proc"),
     max_tabs: int = 24,
     settle: float = 0.012,
-    marker_attempts: int = 3,
+    marker_attempts: int = 8,
 ) -> tuple[bool, str]:
     """Jump to the terminal tab hosting this agent session.
 
