@@ -142,6 +142,10 @@ TERMINAL_SESSION_TOOLS = (
 TERMINAL_SESSIONS_STATE_PATH = Path.home() / ".claude" / "terminal_sessions.json"
 TERMINAL_SESSIONS_REFRESH_MS = 5 * 1000
 TERMINAL_SESSION_ATTENTION_IDLE_S = 120
+TERMINAL_TITLE_MAX_BYTES = 80
+TERMINAL_TITLE_CLEANUP_ATTEMPTS = 8
+TERMINAL_TITLE_CLEAN_OBSERVATIONS = 2
+TERMINAL_TITLE_CLEANUP_INTERVAL_S = 0.025
 # Children forked this long after the session started are running tools (the
 # MCP/shell helpers every session spawns at launch all start almost at once),
 # so a quiet parent waiting on a subprocess still counts as working.
@@ -1806,6 +1810,16 @@ class XdotoolRunner:
     def restore_terminal_title(self, tty: str) -> bool:
         return self._write_tty_control(tty, b"\x1b[23;0t")
 
+    def set_terminal_safe_title(self, tty: str, title: str) -> bool:
+        encoded = title.encode("utf-8")
+        if (
+            not title
+            or len(encoded) > TERMINAL_TITLE_MAX_BYTES
+            or any(not char.isprintable() for char in title)
+        ):
+            return False
+        return self._write_tty_control(tty, b"\x1b]0;" + encoded + b"\x07")
+
 
 def _terminal_title_marker(session: TerminalSession) -> str | None:
     """Unambiguous, control-free marker derived only from numeric identity."""
@@ -1821,6 +1835,18 @@ def _terminal_title_marker(session: TerminalSession) -> str | None:
         f"CLAUDE-INDICATOR-TAB-{session.pid}-{key_match.group(2)}-"
         f"{tty_match.group(1)}"
     )
+
+
+def _sanitized_terminal_title(project: str) -> str:
+    """Bounded printable OSC title; strips every possible control terminator."""
+    printable = "".join(
+        char if char.isprintable() else " " for char in str(project)[:512]
+    )
+    candidate = " ".join(printable.split()) or "terminal"
+    candidate = candidate.encode("utf-8")[:TERMINAL_TITLE_MAX_BYTES].decode(
+        "utf-8", "ignore"
+    ).strip()
+    return candidate or "terminal"
 
 
 def _terminal_session_identity_error(
@@ -2016,36 +2042,62 @@ def _focus_gnome_terminal_session(
     finally:
         title_problem = ""
         if title_saved:
-            current_identity_error = _terminal_session_identity_error(
-                session, proc_root
-            )
-            if current_identity_error:
-                title_restored = False
-                title_problem = current_identity_error
-            else:
+            safe_title = _sanitized_terminal_title(session.project)
+            if safe_title == marker:
+                safe_title = "terminal"
+            current_identity_error = _terminal_session_identity_error(session, proc_root)
+            if not current_identity_error:
+                # Pop our VTE title save first, but do not trust the stack as
+                # the final cleanup: an active TUI may have pushed/popped or
+                # redrawn titles while the exact-tab scan was in progress.
                 try:
-                    title_restored = runner.restore_terminal_title(session.tty)
+                    runner.restore_terminal_title(session.tty)
                 except Exception:
-                    title_restored = False
-            if title_restored and settle:
-                # VTE consumes control sequences asynchronously; do not hand
-                # control back while the temporary marker is still painted.
-                time.sleep(max(settle, 0.05))
-            if title_restored:
+                    pass
+
+            clean_observations = 0
+            cleanup_pause = (
+                0.0
+                if settle <= 0
+                else min(
+                    0.05,
+                    max(settle, TERMINAL_TITLE_CLEANUP_INTERVAL_S),
+                )
+            )
+            for _ in range(TERMINAL_TITLE_CLEANUP_ATTEMPTS):
+                current_identity_error = _terminal_session_identity_error(
+                    session, proc_root
+                )
+                if current_identity_error:
+                    title_problem = current_identity_error
+                    break
                 try:
-                    marker_remains = any(
+                    safe_title_written = runner.set_terminal_safe_title(
+                        session.tty, safe_title
+                    )
+                except Exception:
+                    safe_title_written = False
+                if not safe_title_written:
+                    clean_observations = 0
+                    continue
+                if cleanup_pause:
+                    time.sleep(cleanup_pause)
+                try:
+                    marker_visible = any(
                         runner.window_name(wid) == marker
                         for wid, _, _ in action_windows
                     )
                 except Exception:
-                    marker_remains = True
-                if marker_remains:
-                    title_problem = (
-                        f"temporary title on /dev/{session.tty} remained visible"
-                    )
-            else:
-                title_problem = title_problem or (
-                    f"temporary title on /dev/{session.tty} did not restore"
+                    marker_visible = True
+                clean_observations = 0 if marker_visible else clean_observations + 1
+                if clean_observations >= TERMINAL_TITLE_CLEAN_OBSERVATIONS:
+                    break
+            if (
+                not title_problem
+                and clean_observations < TERMINAL_TITLE_CLEAN_OBSERVATIONS
+            ):
+                title_problem = (
+                    f"temporary title on /dev/{session.tty} could not be cleared"
                 )
         if title_problem:
             outcome = (False, title_problem)

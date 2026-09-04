@@ -521,7 +521,9 @@ class _FakeGnomeActions:
         raise_set=None,
         active_follows=True,
         title_restore_ok=True,
-        marker_sticks=False,
+        pop_restores_marker=False,
+        safe_title_ok=True,
+        persistent_marker=False,
     ):
         self.windows = list(windows or [10, 20])
         self.target = target
@@ -536,10 +538,14 @@ class _FakeGnomeActions:
         self.raise_set = raise_set
         self.active_follows = active_follows
         self.title_restore_ok = title_restore_ok
-        self.marker_sticks = marker_sticks
+        self.pop_restores_marker = pop_restores_marker
+        self.safe_title_ok = safe_title_ok
+        self.persistent_marker = persistent_marker
         self.marker = ""
+        self.saved_marker = ""
         self.marker_refreshes = 0
         self.title_calls = []
+        self.safe_title_calls = []
         self.title_restored = False
         self.activated = []
         self.set_history = []
@@ -581,6 +587,7 @@ class _FakeGnomeActions:
     def set_terminal_title(self, tty, marker, *, save):
         self.title_calls.append((tty, marker, save))
         self.marker = marker
+        self.saved_marker = marker
         if not save and self.target is not None:
             wid, index = self.target
             if self.indices.get(wid) == index:
@@ -589,9 +596,17 @@ class _FakeGnomeActions:
 
     def restore_terminal_title(self, tty):
         self.title_restored = True
-        if self.title_restore_ok and not self.marker_sticks:
-            self.marker = ""
+        if self.title_restore_ok:
+            self.marker = self.saved_marker if self.pop_restores_marker else ""
         return self.title_restore_ok
+
+    def set_terminal_safe_title(self, tty, title):
+        self.safe_title_calls.append((tty, title))
+        if not self.safe_title_ok:
+            return False
+        if not self.persistent_marker:
+            self.marker = title
+        return True
 
     def window_name(self, wid):
         if (
@@ -599,6 +614,8 @@ class _FakeGnomeActions:
             and (wid, self.indices[wid]) == self.target
             and self.marker_refreshes >= self.marker_visible_after
         ):
+            if self.persistent_marker:
+                return self.saved_marker
             return self.marker
         return "coffee-explorer"
 
@@ -778,7 +795,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertEqual(runner.indices, runner.original)
         self.assertTrue(runner.title_restored)
 
-    def test_gnome_title_restore_failure_rolls_back_matched_target(self):
+    def test_gnome_failed_title_pop_is_recovered_by_explicit_safe_title(self):
         self._use_gnome_terminal()
         runner = _FakeGnomeActions(
             target=(20, 2), title_restore_ok=False
@@ -788,22 +805,57 @@ class FocusTerminalSessionTest(unittest.TestCase):
             self._session_(), runner=runner, proc_root=self.proc, settle=0
         )
 
-        self.assertFalse(ok)
-        self.assertIn("title", detail)
-        self.assertIn("did not restore", detail)
-        self.assertEqual(runner.indices, runner.original)
+        self.assertTrue(ok, detail)
+        self.assertEqual(runner.indices[20], 2)
+        self.assertGreaterEqual(len(runner.safe_title_calls), 2)
 
-    def test_gnome_visible_marker_after_restore_rolls_back_matched_target(self):
+    def test_gnome_pop_that_restores_marker_is_explicitly_cleared(self):
         self._use_gnome_terminal()
-        runner = _FakeGnomeActions(target=(20, 2), marker_sticks=True)
+        runner = _FakeGnomeActions(
+            target=(20, 2), pop_restores_marker=True
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(runner.marker, "coffee-explorer")
+        self.assertGreaterEqual(len(runner.safe_title_calls), 2)
+
+    def test_gnome_persistent_cleanup_failure_rolls_back_matched_target(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            target=(20, 2), persistent_marker=True
+        )
 
         ok, detail = focus_terminal_session(
             self._session_(), runner=runner, proc_root=self.proc, settle=0
         )
 
         self.assertFalse(ok)
-        self.assertIn("remained visible", detail)
+        self.assertIn("could not be cleared", detail)
         self.assertEqual(runner.indices, runner.original)
+
+    def test_gnome_cleanup_sanitizes_and_caps_project_title(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(target=(20, 2))
+        session = self._session_()
+        session.project = "safe\x1b]0;INJECT\x07\n" + "é" * 100
+
+        ok, detail = focus_terminal_session(
+            session, runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertTrue(ok, detail)
+        safe_title = runner.safe_title_calls[0][1]
+        self.assertTrue(safe_title)
+        self.assertLessEqual(len(safe_title.encode("utf-8")), 80)
+        self.assertTrue(all(char.isprintable() for char in safe_title))
+        self.assertNotIn("\x1b", safe_title)
+        self.assertNotIn("\x07", safe_title)
+        self.assertNotIn("\n", safe_title)
+        self.assertNotIn("INJECT", detail)
 
     def test_gnome_activation_failure_restores_the_previously_active_tab(self):
         self._use_gnome_terminal()
