@@ -1823,6 +1823,23 @@ def _terminal_title_marker(session: TerminalSession) -> str | None:
     )
 
 
+def _terminal_session_identity_error(
+    session: TerminalSession, proc_root: Path
+) -> str:
+    """Explain why a sampled session is no longer the same live process/pts."""
+    key_match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", session.key)
+    if key_match is None or int(key_match.group(1)) != session.pid:
+        return "invalid numeric session identity"
+    info = _read_proc_stat(proc_root / str(session.pid) / "stat")
+    if info is None:
+        return "terminal session exited before exact selection"
+    if info["starttime"] != int(key_match.group(2)):
+        return "terminal session start time changed before exact selection"
+    if _pts_name(info["tty_nr"]) != session.tty:
+        return "terminal session pts changed before exact selection"
+    return ""
+
+
 def _restore_gtk_tab(
     runner, action_ref: tuple[str, str], original_index: int, settle: float
 ) -> bool:
@@ -1841,6 +1858,7 @@ def _focus_gnome_terminal_session(
     max_tabs: int,
     settle: float,
     marker_attempts: int,
+    proc_root: Path,
 ) -> tuple[bool, str]:
     """Select a GNOME Terminal tab by proving it owns ``session.tty``.
 
@@ -1854,108 +1872,191 @@ def _focus_gnome_terminal_session(
     if marker is None:
         return False, "invalid numeric session or pts identity"
 
-    action_windows: list[tuple[int, tuple[str, str]]] = []
+    action_refs: list[tuple[int, tuple[str, str]]] = []
     try:
         for wid in windows:
             action_ref = runner.gtk_action_ref(wid)
-            if action_ref is None:
-                return False, "GNOME Terminal GTK active-tab action unavailable"
-            action_windows.append((wid, action_ref))
+            # GNOME can expose auxiliary/dialog windows under the terminal
+            # server PID. Only actual terminal windows export active-tab.
+            if action_ref is not None:
+                action_refs.append((wid, action_ref))
     except Exception as exc:
         return False, f"GNOME Terminal GTK action discovery failed: {exc}"
+    if not action_refs:
+        return False, "no GNOME Terminal window exposes the GTK active-tab action"
+
+    action_windows: list[tuple[int, tuple[str, str], int]] = []
+    try:
+        for wid, action_ref in action_refs:
+            original_index = runner.gtk_active_tab(action_ref)
+            if original_index is not None:
+                action_windows.append((wid, action_ref, original_index))
+    except Exception as exc:
+        return False, f"GNOME Terminal active-tab state read failed: {exc}"
+    if not action_windows:
+        return False, "no GNOME Terminal window exposes a readable active-tab action"
+
+    identity_error = _terminal_session_identity_error(session, proc_root)
+    if identity_error:
+        return False, identity_error
 
     title_saved = False
+    mutated_windows: set[int] = set()
     outcome = (False, f"no GNOME Terminal tab owns {session.tty}")
+
+    def restore_mutated_windows() -> list[int]:
+        failed: list[int] = []
+        for wid, action_ref, original_index in reversed(action_windows):
+            if wid not in mutated_windows:
+                continue
+            try:
+                restored = _restore_gtk_tab(
+                    runner, action_ref, original_index, settle
+                )
+            except Exception:
+                restored = False
+            if restored:
+                mutated_windows.discard(wid)
+            else:
+                failed.append(wid)
+        return failed
+
+    def refresh_marker(*, save: bool) -> bool:
+        return (
+            not _terminal_session_identity_error(session, proc_root)
+            and runner.set_terminal_title(session.tty, marker, save=save)
+        )
+
     try:
-        title_saved = runner.set_terminal_title(session.tty, marker, save=True)
+        title_saved = refresh_marker(save=True)
         if not title_saved:
-            return False, f"could not mark /dev/{session.tty}"
-
-        for wid, action_ref in action_windows:
-            original_index = runner.gtk_active_tab(action_ref)
-            if original_index is None:
-                outcome = (False, "GNOME Terminal active-tab state unreadable")
-                break
-
-            matched = False
-            scan_failed = ""
-            for index in range(max(0, max_tabs)):
-                if not runner.set_gtk_active_tab(action_ref, index):
-                    scan_failed = "GNOME Terminal active-tab selection failed"
-                    break
-                if settle:
-                    time.sleep(settle)
-                selected_index = runner.gtk_active_tab(action_ref)
-                if selected_index is None:
-                    scan_failed = "GNOME Terminal active-tab state unreadable"
-                    break
-                if selected_index != index:
-                    # SetState leaves the state unchanged for an out-of-range
-                    # index, which gives us a bounded tab count without keys.
-                    break
-
-                for _ in range(max(1, marker_attempts)):
-                    if not runner.set_terminal_title(
-                        session.tty, marker, save=False
-                    ):
-                        scan_failed = f"could not refresh /dev/{session.tty} marker"
+            outcome = (False, f"could not safely mark /dev/{session.tty}")
+        else:
+            for wid, action_ref, original_index in action_windows:
+                matched = False
+                matched_index = None
+                scan_failed = ""
+                for index in range(max(0, max_tabs)):
+                    # Treat even a failed/raising setter as potentially
+                    # mutating; rollback is safe when it did not change state.
+                    mutated_windows.add(wid)
+                    if not runner.set_gtk_active_tab(action_ref, index):
+                        scan_failed = "GNOME Terminal active-tab selection failed"
                         break
                     if settle:
-                        time.sleep(settle / 2)
-                    # A busy VTE can redraw its OSC title within a few
-                    # milliseconds. Double-pulse each bounded check so the
-                    # marker survives long enough for the X title read.
-                    if not runner.set_terminal_title(
-                        session.tty, marker, save=False
-                    ):
-                        scan_failed = f"could not refresh /dev/{session.tty} marker"
+                        time.sleep(settle)
+                    selected_index = runner.gtk_active_tab(action_ref)
+                    if selected_index is None:
+                        scan_failed = "GNOME Terminal active-tab state unreadable"
                         break
-                    if settle:
-                        time.sleep(settle / 2)
-                    if runner.window_name(wid) == marker:
-                        matched = True
+                    if selected_index != index:
+                        # SetState leaves the state unchanged for an out-of-range
+                        # index, which gives us a bounded tab count without keys.
                         break
-                if matched or scan_failed:
-                    break
 
-            if matched:
-                activation_requested = runner.activate(wid)
-                active_window = runner.active_window()
-                if (
-                    activation_requested is not False
-                    and (active_window is None or active_window == wid)
-                ):
+                    for _ in range(max(1, marker_attempts)):
+                        if not refresh_marker(save=False):
+                            scan_failed = (
+                                f"could not safely refresh /dev/{session.tty} marker"
+                            )
+                            break
+                        if settle:
+                            time.sleep(settle / 2)
+                        # A busy VTE can redraw its OSC title within a few
+                        # milliseconds. Double-pulse each bounded check so the
+                        # marker survives long enough for the X title read.
+                        if not refresh_marker(save=False):
+                            scan_failed = (
+                                f"could not safely refresh /dev/{session.tty} marker"
+                            )
+                            break
+                        if settle:
+                            time.sleep(settle / 2)
+                        if runner.window_name(wid) == marker:
+                            matched = True
+                            matched_index = selected_index
+                            break
+                    if matched or scan_failed:
+                        break
+
+                if matched:
+                    activation_requested = runner.activate(wid)
+                    active_window = runner.active_window()
+                    if activation_requested is True and active_window == wid:
+                        outcome = (
+                            True,
+                            f"selected exact {session.tty} tab {matched_index} "
+                            f"in window {wid}",
+                        )
+                        break
+                    scan_failed = (
+                        "exact tab selected but terminal window would not activate"
+                    )
+
+                try:
+                    restored = _restore_gtk_tab(
+                        runner, action_ref, original_index, settle
+                    )
+                except Exception:
+                    restored = False
+                if restored:
+                    mutated_windows.discard(wid)
+                else:
                     outcome = (
-                        True,
-                        f"selected exact {session.tty} tab {runner.gtk_active_tab(action_ref)} "
-                        f"in window {wid}",
+                        False,
+                        f"{scan_failed or 'tab not found'}; original tab index "
+                        "did not restore",
                     )
                     break
-                scan_failed = "exact tab selected but terminal window would not activate"
-
-            if not _restore_gtk_tab(runner, action_ref, original_index, settle):
-                outcome = (
-                    False,
-                    f"{scan_failed or 'tab not found'}; original tab index did not restore",
-                )
-                break
-            if scan_failed:
-                outcome = (False, scan_failed)
-                break
+                if scan_failed:
+                    outcome = (False, scan_failed)
+                    break
     except Exception as exc:
         outcome = (False, f"GNOME Terminal exact-tab selection failed: {exc}")
     finally:
+        title_problem = ""
         if title_saved:
-            try:
-                title_restored = runner.restore_terminal_title(session.tty)
-            except Exception:
+            current_identity_error = _terminal_session_identity_error(
+                session, proc_root
+            )
+            if current_identity_error:
                 title_restored = False
+                title_problem = current_identity_error
+            else:
+                try:
+                    title_restored = runner.restore_terminal_title(session.tty)
+                except Exception:
+                    title_restored = False
             if title_restored and settle:
                 # VTE consumes control sequences asynchronously; do not hand
                 # control back while the temporary marker is still painted.
                 time.sleep(max(settle, 0.05))
-            if not title_restored:
-                outcome = (False, f"temporary title on /dev/{session.tty} did not restore")
+            if title_restored:
+                try:
+                    marker_remains = any(
+                        runner.window_name(wid) == marker
+                        for wid, _, _ in action_windows
+                    )
+                except Exception:
+                    marker_remains = True
+                if marker_remains:
+                    title_problem = (
+                        f"temporary title on /dev/{session.tty} remained visible"
+                    )
+            else:
+                title_problem = title_problem or (
+                    f"temporary title on /dev/{session.tty} did not restore"
+                )
+        if title_problem:
+            outcome = (False, title_problem)
+        if not outcome[0]:
+            failed_rollbacks = restore_mutated_windows()
+            if failed_rollbacks:
+                outcome = (
+                    False,
+                    f"{outcome[1]}; original tab index rollback failed for "
+                    + ", ".join(str(wid) for wid in failed_rollbacks),
+                )
     return outcome
 
 
@@ -1967,17 +2068,16 @@ def _focus_terminal_session_by_title(
     max_tabs: int,
     settle: float,
 ) -> tuple[bool, str]:
-    """Compatibility path for terminal emulators without a tab-selection API."""
+    """Best-effort compatibility for emulators without a tab-selection API."""
     target = session.project.lower()
 
     for wid in windows:
         if target and target in runner.window_name(wid).lower():
-            runner.activate(wid)
-            return True, f"window title matched {session.project}"
+            if runner.activate(wid) is True and runner.active_window() == wid:
+                return True, f"window title matched {session.project}"
 
     for wid in windows:
-        runner.activate(wid)
-        if runner.active_window() != wid:
+        if runner.activate(wid) is not True or runner.active_window() != wid:
             continue
         title = runner.window_name(wid).lower()
         sent = 0
@@ -2004,7 +2104,7 @@ def _focus_terminal_session_by_title(
                 time.sleep(settle)
 
     runner.activate(windows[0])
-    return False, "tab title never matched; activated the terminal window"
+    return False, "best-effort tab title never matched"
 
 
 def focus_terminal_session(
@@ -2042,6 +2142,7 @@ def focus_terminal_session(
             max_tabs=max_tabs,
             settle=settle,
             marker_attempts=marker_attempts,
+            proc_root=proc_root,
         )
     return _focus_terminal_session_by_title(
         session, windows, runner, max_tabs=max_tabs, settle=settle
@@ -7312,11 +7413,25 @@ class ClaudeWidget(QWidget):
         """(open, tucked-away) positions; the panel slides between them."""
         open_x = self.x() - self._tabs_panel.width()
         hidden_x = self.x()
-        screen = QApplication.primaryScreen()
-        if screen is not None and open_x < screen.availableGeometry().left():
-            open_x = self.x() + self.width()
-            hidden_x = self.x() + self.width() - self._tabs_panel.width()
-        return QPoint(open_x, self.y()), QPoint(hidden_x, self.y())
+        screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None and self._tabs_panel.isVisible():
+            screen = QApplication.screenAt(
+                self._tabs_panel.frameGeometry().center()
+            )
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        open_y = self.y()
+        if screen is not None:
+            available = screen.availableGeometry()
+            if open_x < available.left():
+                open_x = self.x() + self.width()
+                hidden_x = self.x() + self.width() - self._tabs_panel.width()
+            max_y = max(
+                available.top(),
+                available.bottom() - self._tabs_panel.height() + 1,
+            )
+            open_y = min(max(open_y, available.top()), max_y)
+        return QPoint(open_x, open_y), QPoint(hidden_x, open_y)
 
     def _slide_tabs_panel(self, opening: bool):
         panel, anim = self._tabs_panel, self._tabs_panel_anim

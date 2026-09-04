@@ -510,22 +510,33 @@ class _FakeGnomeActions:
         self,
         *,
         target=(20, 2),
+        windows=None,
         original=None,
         tab_counts=None,
         marker_visible_after=2,
         action_available=True,
+        unavailable_windows=(),
+        no_active_tab_windows=(),
         fail_set=None,
+        raise_set=None,
         active_follows=True,
+        title_restore_ok=True,
+        marker_sticks=False,
     ):
-        self.windows = [10, 20]
+        self.windows = list(windows or [10, 20])
         self.target = target
         self.original = dict(original or {10: 1, 20: 0})
         self.indices = dict(self.original)
         self.tab_counts = dict(tab_counts or {10: 2, 20: 4})
         self.marker_visible_after = marker_visible_after
         self.action_available = action_available
+        self.unavailable_windows = set(unavailable_windows)
+        self.no_active_tab_windows = set(no_active_tab_windows)
         self.fail_set = fail_set
+        self.raise_set = raise_set
         self.active_follows = active_follows
+        self.title_restore_ok = title_restore_ok
+        self.marker_sticks = marker_sticks
         self.marker = ""
         self.marker_refreshes = 0
         self.title_calls = []
@@ -540,7 +551,7 @@ class _FakeGnomeActions:
         return list(self.windows)
 
     def gtk_action_ref(self, wid):
-        if not self.action_available:
+        if not self.action_available or wid in self.unavailable_windows:
             return None
         return ":1.102", f"/org/gnome/Terminal/window/{wid}"
 
@@ -549,11 +560,18 @@ class _FakeGnomeActions:
         return int(action_ref[1].rsplit("/", 1)[1])
 
     def gtk_active_tab(self, action_ref):
-        return self.indices[self._wid(action_ref)]
+        wid = self._wid(action_ref)
+        if wid in self.no_active_tab_windows:
+            return None
+        return self.indices[wid]
 
     def set_gtk_active_tab(self, action_ref, index):
         wid = self._wid(action_ref)
         self.set_history.append((wid, index))
+        if self.raise_set == (wid, index):
+            if 0 <= index < self.tab_counts[wid]:
+                self.indices[wid] = index
+            raise RuntimeError("simulated GTK setter failure")
         if self.fail_set == (wid, index):
             return False
         if 0 <= index < self.tab_counts[wid]:
@@ -571,8 +589,9 @@ class _FakeGnomeActions:
 
     def restore_terminal_title(self, tty):
         self.title_restored = True
-        self.marker = ""
-        return True
+        if self.title_restore_ok and not self.marker_sticks:
+            self.marker = ""
+        return self.title_restore_ok
 
     def window_name(self, wid):
         if (
@@ -615,7 +634,9 @@ class FocusTerminalSessionTest(unittest.TestCase):
         stat_path.write_text(stat_path.read_text().replace("(xterm)", "(gnome-terminal-)"))
 
     def _session_(self, project="coffee-explorer"):
-        return _session(key="100:1", pid=100, project=project, tty="pts/3")
+        return _session(
+            key="100:100000", pid=100, project=project, tty="pts/3"
+        )
 
     def test_ancestor_walk_finds_the_terminal_emulator(self):
         self.assertEqual(_terminal_ancestor_pid(100, self.proc), 40)
@@ -658,6 +679,20 @@ class FocusTerminalSessionTest(unittest.TestCase):
         )
 
         self.assertFalse(ok)
+        self.assertEqual(runner.next_sent, 0)
+
+    def test_title_match_does_not_succeed_when_activation_fails(self):
+        runner = _FakeXdotool(
+            titles={10: "Terminal", 20: "coffee-explorer"},
+            active_follows=False,
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("best-effort", detail)
         self.assertEqual(runner.next_sent, 0)
 
     def test_failed_cycling_restores_the_original_tab(self):
@@ -726,6 +761,50 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertTrue(runner.title_restored)
         self.assertEqual((runner.next_sent, runner.prev_sent), (0, 0))
 
+    def test_gnome_exception_after_mutation_rolls_back_original_index(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            target=None,
+            original={10: 1, 20: 2},
+            raise_set=(20, 1),
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("exact-tab selection failed", detail)
+        self.assertEqual(runner.indices, runner.original)
+        self.assertTrue(runner.title_restored)
+
+    def test_gnome_title_restore_failure_rolls_back_matched_target(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            target=(20, 2), title_restore_ok=False
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("title", detail)
+        self.assertIn("did not restore", detail)
+        self.assertEqual(runner.indices, runner.original)
+
+    def test_gnome_visible_marker_after_restore_rolls_back_matched_target(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(target=(20, 2), marker_sticks=True)
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("remained visible", detail)
+        self.assertEqual(runner.indices, runner.original)
+
     def test_gnome_activation_failure_restores_the_previously_active_tab(self):
         self._use_gnome_terminal()
         runner = _FakeGnomeActions(target=(20, 2), active_follows=False)
@@ -748,10 +827,41 @@ class FocusTerminalSessionTest(unittest.TestCase):
         )
 
         self.assertFalse(ok)
-        self.assertIn("GTK active-tab action unavailable", detail)
+        self.assertIn("no GNOME Terminal window", detail)
         self.assertEqual(runner.activated, [])
         self.assertEqual(runner.title_calls, [])
         self.assertEqual((runner.next_sent, runner.prev_sent), (0, 0))
+
+    def test_gnome_skips_auxiliary_window_without_active_tab_action(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            target=(20, 2), no_active_tab_windows={10}
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(runner.activated, [20])
+        self.assertFalse(any(wid == 10 for wid, _ in runner.set_history))
+
+    def test_gnome_selects_target_in_a_single_tab_window(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            windows=[20],
+            target=(20, 0),
+            original={20: 0},
+            tab_counts={20: 1},
+            marker_visible_after=1,
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertTrue(ok, detail)
+        self.assertIn("tab 0", detail)
 
     def test_gnome_rejects_non_numeric_session_identity_before_tty_write(self):
         self._use_gnome_terminal()
@@ -766,6 +876,28 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("invalid numeric session", detail)
         self.assertEqual(runner.title_calls, [])
+
+    def test_gnome_revalidates_start_time_and_tty_before_title_write(self):
+        self._use_gnome_terminal()
+        cases = (
+            ("100:99999", "pts/3", "start time changed"),
+            ("100:100000", "pts/4", "pts changed"),
+        )
+        for key, tty, expected in cases:
+            with self.subTest(key=key, tty=tty):
+                runner = _FakeGnomeActions()
+                session = self._session_()
+                session.key = key
+                session.tty = tty
+
+                ok, detail = focus_terminal_session(
+                    session, runner=runner, proc_root=self.proc, settle=0
+                )
+
+                self.assertFalse(ok)
+                self.assertIn(expected, detail)
+                self.assertEqual(runner.title_calls, [])
+                self.assertEqual(runner.set_history, [])
 
 
 if __name__ == "__main__":

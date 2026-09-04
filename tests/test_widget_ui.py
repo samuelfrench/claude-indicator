@@ -946,6 +946,48 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(widget._tabs_panel.pos(), widget._panel_positions()[0])
         self.assertTrue(widget._tabs_panel.isVisible())
 
+    def test_tabs_panel_open_and_tucked_positions_clamp_above_bottom_edge(self):
+        widget = self._make_inert_claude_widget()
+        widget._tabs_panel.setFixedHeight(300)
+        available = QApplication.primaryScreen().availableGeometry()
+        widget.move(500, available.bottom() - 10)
+
+        open_pos, tucked_pos = widget._panel_positions()
+
+        expected_y = available.bottom() - widget._tabs_panel.height() + 1
+        self.assertEqual(open_pos.y(), expected_y)
+        self.assertEqual(tucked_pos.y(), expected_y)
+        self.assertGreaterEqual(open_pos.y(), available.top())
+
+    def test_hidden_anchor_drag_keeps_selector_visible_and_restores_docked(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        widget._tabs_panel.setFixedHeight(300)
+        available = QApplication.primaryScreen().availableGeometry()
+        widget.show()
+        widget.move(500, available.bottom() - widget.height() + 1)
+        widget.collapse_to_sliver()
+        anchor_before = widget.pos()
+
+        widget._tabs_panel.drag_requested.emit(QPoint(0, 500))
+
+        self.assertFalse(widget.isVisible())
+        self.assertTrue(widget._tabs_panel.isVisible())
+        self.assertEqual(widget.pos(), anchor_before + QPoint(0, 500))
+        self.assertGreaterEqual(widget._tabs_panel.y(), available.top())
+        self.assertLessEqual(
+            widget._tabs_panel.frameGeometry().bottom(), available.bottom()
+        )
+
+        widget._restore_sliver.restore_requested.emit()
+        QApplication.processEvents()
+
+        self.assertTrue(widget.isVisible())
+        self.assertTrue(widget._tabs_panel.isVisible())
+        self.assertEqual(widget._tabs_panel.pos(), widget._panel_positions()[0])
+        self.assertLessEqual(
+            widget._tabs_panel.frameGeometry().bottom(), available.bottom()
+        )
+
     def test_navigate_request_spawns_a_focus_worker_for_that_session(self):
         widget = self._make_inert_claude_widget()
         session = self._terminal_session(key="5:5")

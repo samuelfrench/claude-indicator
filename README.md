@@ -18,7 +18,8 @@ API cost/credit, and local Ollama/GPU/ComfyUI status in one panel.
 - **Embedded Ollama section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
-- **Recoverable minimize** — the header minimize button collapses the panel to a small always-on-top tab at the right screen edge; click the tab to expand it again, or use the tray menu
+- **Compact terminal selector** — a 320px docked panel groups live Claude/Codex/OpenCode tabs by status, keeps notes and park state, and selects duplicate-project GNOME Terminal tabs by their exact TTY instead of cycling by title; other emulators use best-effort verified title/key navigation
+- **Docked drag and recoverable minimize** — drag either the main widget or the selector header/background to move them together; minimizing hides the main usage panel but leaves the terminal selector and right-edge restore sliver usable, while tray hide hides every surface
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
 - **Live countdown timers** — shows time remaining until each window resets
 - **Always-on-top translucent widget** — frameless, draggable, stays visible over other windows
@@ -34,6 +35,7 @@ The widget displays a dark translucent overlay with:
 - A compact `DEEPSEEK` row with `24H` spend and `CREDIT` always visible
 - A collapsed `OLLAMA` row with GPU summary and expandable details
 - `CRON JOBS` row that collapses to one line and expands to show per-job status and timing
+- A compact `TABS` row that opens the docked terminal-session selector
 - Percentage and reset countdown on each bar
 - Last-updated timestamp and manual refresh button
 
@@ -194,7 +196,9 @@ pip install -r requirements.txt
 python claude_widget.py
 ```
 
-The widget appears in the top-right corner of your primary screen. Drag it to reposition. Click the **X** to close or **⟳** to force a refresh.
+The widget appears in the top-right corner of your primary screen. Drag the main
+widget or the open terminal selector's header/background to reposition the
+docked pair. Click the **X** to close or **⟳** to force a refresh.
 
 ### Autostart on Login
 
