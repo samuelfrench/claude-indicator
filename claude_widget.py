@@ -433,6 +433,7 @@ class SystemMetrics:
     net_tx_bps: float = 0.0
     net_interfaces: tuple[str, ...] = ()
     net_available: bool = False
+    net_error: str = ""
 
 
 @dataclass
@@ -682,10 +683,10 @@ def format_network_rate(bytes_per_second: float | None, *, compact=False) -> str
         ("TiB/s", "T/s"),
     )
     unit_index = 0
-    while rate >= 1024 and unit_index < len(units) - 1:
+    while rate >= 1023.5 and unit_index < len(units) - 1:
         rate /= 1024
         unit_index += 1
-    if unit_index == len(units) - 1 and rate >= 1000:
+    if unit_index == len(units) - 1 and rate >= 999.5:
         number = "999+"
     elif unit_index and rate < 10:
         number = f"{rate:.1f}"
@@ -708,7 +709,9 @@ class SystemMetricsReader:
         self._proc_root = Path(proc_root)
         self._monotonic = monotonic
         self._prev_cpu: list[int] | None = None
-        self._prev_network: tuple[tuple[str, ...], int, int, float] | None = None
+        self._prev_network: (
+            tuple[tuple[str, ...], dict[str, tuple[int, int]], float] | None
+        ) = None
         self._gpu_available = False
         # Seed CPU baseline
         try:
@@ -735,23 +738,39 @@ class SystemMetricsReader:
     def _read_network(self, metrics: SystemMetrics) -> None:
         try:
             route_text = (self._proc_root / "net" / "route").read_text()
-            interfaces = _lowest_metric_default_interfaces(route_text)
-            metrics.net_interfaces = interfaces
-            if not interfaces:
-                self._prev_network = None
-                return
+        except (OSError, UnicodeError):
+            metrics.net_error = "route-read"
+            self._prev_network = None
+            return
+
+        interfaces = _lowest_metric_default_interfaces(route_text)
+        metrics.net_interfaces = interfaces
+        if not interfaces:
+            self._prev_network = None
+            return
+
+        try:
             dev_text = (self._proc_root / "net" / "dev").read_text()
-            counters = _parse_net_dev_bytes(dev_text)
-            if any(iface not in counters for iface in interfaces):
-                self._prev_network = None
-                return
-            received = sum(counters[iface][0] for iface in interfaces)
-            transmitted = sum(counters[iface][1] for iface in interfaces)
+        except (OSError, UnicodeError):
+            metrics.net_error = "counter-read"
+            self._prev_network = None
+            return
+
+        counters = _parse_net_dev_bytes(dev_text)
+        if any(iface not in counters for iface in interfaces):
+            metrics.net_error = "counter-missing"
+            self._prev_network = None
+            return
+        selected_counters = {iface: counters[iface] for iface in interfaces}
+
+        try:
             observed_at = float(self._monotonic())
-            if not math.isfinite(observed_at):
-                self._prev_network = None
-                return
         except (OSError, TypeError, ValueError):
+            metrics.net_error = "clock-read"
+            self._prev_network = None
+            return
+        if not math.isfinite(observed_at):
+            metrics.net_error = "clock-read"
             self._prev_network = None
             return
 
@@ -759,17 +778,29 @@ class SystemMetricsReader:
         previous = self._prev_network
         self._prev_network = (
             interfaces,
-            received,
-            transmitted,
+            selected_counters,
             observed_at,
         )
         if previous is None or previous[0] != interfaces:
             return
-        elapsed = observed_at - previous[3]
-        received_delta = received - previous[1]
-        transmitted_delta = transmitted - previous[2]
-        if elapsed <= 0 or received_delta < 0 or transmitted_delta < 0:
+        elapsed = observed_at - previous[2]
+        if elapsed <= 0:
             return
+        previous_counters = previous[1]
+        if any(
+            selected_counters[iface][0] < previous_counters[iface][0]
+            or selected_counters[iface][1] < previous_counters[iface][1]
+            for iface in interfaces
+        ):
+            return
+        received_delta = sum(
+            selected_counters[iface][0] - previous_counters[iface][0]
+            for iface in interfaces
+        )
+        transmitted_delta = sum(
+            selected_counters[iface][1] - previous_counters[iface][1]
+            for iface in interfaces
+        )
         metrics.net_rx_bps = received_delta / elapsed
         metrics.net_tx_bps = transmitted_delta / elapsed
 
@@ -6688,6 +6719,8 @@ class SystemMetricsRow(QWidget):
         self._metrics: SystemMetrics | None = None
         self.setFixedHeight(self._COLLAPSED_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName("System metrics")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_data(self, metrics: SystemMetrics):
         self._metrics = metrics
@@ -6722,6 +6755,18 @@ class SystemMetricsRow(QWidget):
                 f"↑ upload/transmit {format_network_rate(metrics.net_tx_bps)}\n"
                 f"Default-route interface(s): {interfaces}"
             )
+        elif metrics.net_error == "route-read":
+            status = "Network unavailable: /proc/net/route could not be read"
+        elif metrics.net_error == "counter-read":
+            status = "Network unavailable: /proc/net/dev could not be read"
+        elif metrics.net_error == "counter-missing":
+            status = (
+                "Network unavailable: selected interface counters are missing "
+                "from /proc/net/dev\n"
+                f"Selected interface(s): {interfaces}"
+            )
+        elif metrics.net_error == "clock-read":
+            status = "Network unavailable: monotonic sample clock could not be read"
         elif interfaces:
             status = (
                 "Network unavailable: default-route counters could not be read\n"
@@ -6801,7 +6846,7 @@ class SystemMetricsRow(QWidget):
                 return last
         return last
 
-    def mousePressEvent(self, event):
+    def _toggle_expanded(self) -> None:
         self._expanded = not self._expanded
         if self._expanded:
             self.setFixedHeight(self._EXPANDED_H)
@@ -6814,7 +6859,21 @@ class SystemMetricsRow(QWidget):
                 parent.adjustSize()
                 break
             parent = parent.parent() if hasattr(parent, "parent") else None
+
+    def mousePressEvent(self, event):
+        self._toggle_expanded()
         event.accept()
+
+    def keyPressEvent(self, event):
+        if event.key() in (
+            Qt.Key.Key_Space,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            self._toggle_expanded()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event):
         m = self._metrics

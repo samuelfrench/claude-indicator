@@ -169,12 +169,36 @@ class SystemMetricsNetworkReaderTest(unittest.TestCase):
             (100.0, 50.0),
         )
 
+    def test_one_interface_reset_cannot_be_masked_by_another_growth(self):
+        routes = (
+            ROUTE_HEADER
+            + route_line("eth0", metric=100)
+            + route_line("eth1", metric=100)
+        )
+        self._write(routes, {"eth0": (1000, 1000), "eth1": (1000, 1000)})
+        reader = self._reader()
+        reader.read()
+
+        self.clock.value = 12.0
+        self._write(routes, {"eth0": (100, 100), "eth1": (2900, 2900)})
+        reset = reader.read()
+        self.assertEqual((reset.net_rx_bps, reset.net_tx_bps), (0.0, 0.0))
+
+        self.clock.value = 14.0
+        self._write(routes, {"eth0": (300, 500), "eth1": (3100, 3300)})
+        recovered = reader.read()
+        self.assertEqual(
+            (recovered.net_rx_bps, recovered.net_tx_bps),
+            (200.0, 400.0),
+        )
+
     def test_missing_route_or_selected_counter_is_honestly_unavailable(self):
         self._write(ROUTE_HEADER, {"eth0": (10, 20)})
         reader = self._reader()
         no_route = reader.read()
         self.assertFalse(no_route.net_available)
         self.assertEqual(no_route.net_interfaces, ())
+        self.assertEqual(no_route.net_error, "")
 
         self.clock.value = 13.0
         routes = ROUTE_HEADER + route_line("eth0")
@@ -182,8 +206,27 @@ class SystemMetricsNetworkReaderTest(unittest.TestCase):
         missing_counter = reader.read()
         self.assertFalse(missing_counter.net_available)
         self.assertEqual(missing_counter.net_interfaces, ("eth0",))
+        self.assertEqual(missing_counter.net_error, "counter-missing")
 
         self.clock.value = 16.0
+        self._write(routes, {"eth0": (50000, 80000)})
+        recovered = reader.read()
+        self.assertTrue(recovered.net_available)
+        self.assertEqual((recovered.net_rx_bps, recovered.net_tx_bps), (0.0, 0.0))
+
+    def test_route_read_failure_is_explicit_and_clears_baseline(self):
+        routes = ROUTE_HEADER + route_line("eth0")
+        self._write(routes, {"eth0": (100, 200)})
+        reader = self._reader()
+        reader.read()
+
+        (self.proc / "net" / "route").unlink()
+        failed = reader.read()
+        self.assertFalse(failed.net_available)
+        self.assertEqual(failed.net_interfaces, ())
+        self.assertEqual(failed.net_error, "route-read")
+
+        self.clock.value = 12.0
         self._write(routes, {"eth0": (50000, 80000)})
         recovered = reader.read()
         self.assertTrue(recovered.net_available)
@@ -215,6 +258,20 @@ class NetworkRateFormatterTest(unittest.TestCase):
         self.assertEqual(
             format_network_rate(1.5 * 1024**2, compact=True),
             "1.5M/s",
+        )
+
+    def test_formatter_promotes_and_caps_fractional_boundaries(self):
+        self.assertEqual(format_network_rate(1023.49), "1023 B/s")
+        self.assertEqual(format_network_rate(1023.5), "1.0 KiB/s")
+        self.assertEqual(
+            format_network_rate(1023.5 * 1024, compact=True),
+            "1.0M/s",
+        )
+        capped_rate = 999.5 * 1024**4
+        self.assertEqual(format_network_rate(capped_rate), "999+ TiB/s")
+        self.assertEqual(
+            format_network_rate(capped_rate, compact=True),
+            "999+T/s",
         )
 
     def test_formatter_marks_invalid_rates_unavailable(self):

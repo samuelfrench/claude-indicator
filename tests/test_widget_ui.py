@@ -2037,11 +2037,15 @@ class WidgetUiTest(unittest.TestCase):
 
     def test_system_metrics_network_unavailable_state_is_explicit(self):
         row = SystemMetricsRow()
-        metrics = SystemMetrics(net_interfaces=("eth0",))
+        metrics = SystemMetrics(
+            net_interfaces=("eth0",),
+            net_error="counter-missing",
+        )
         row.set_data(metrics)
 
         self.assertIn("Network unavailable", row.toolTip())
         self.assertIn("eth0", row.toolTip())
+        self.assertIn("/proc/net/dev", row.toolTip())
         self.assertEqual(row._expanded_network_text(metrics), "Unavailable")
         font = QFont("sans-serif", 8)
         segments, _, _ = row._collapsed_layout(
@@ -2057,6 +2061,39 @@ class WidgetUiTest(unittest.TestCase):
 
         row.mousePressEvent(Event())
         self.assertEqual(row.height(), 88)
+
+        route_failure = SystemMetrics(net_error="route-read")
+        row.set_data(route_failure)
+        self.assertIn("/proc/net/route could not be read", row.toolTip())
+        self.assertNotIn("no UP IPv4 default route", row.toolTip())
+
+    def test_system_metrics_row_is_focusable_and_keyboard_expandable(self):
+        row = SystemMetricsRow()
+        row.set_data(SystemMetrics(gpu_available=True))
+
+        self.assertEqual(row.accessibleName(), "System metrics")
+        self.assertEqual(row.focusPolicy(), Qt.FocusPolicy.StrongFocus)
+
+        class KeyEvent:
+            def __init__(self, key):
+                self._key = key
+                self.accepted = False
+
+            def key(self):
+                return self._key
+
+            def accept(self):
+                self.accepted = True
+
+        space = KeyEvent(Qt.Key.Key_Space)
+        row.keyPressEvent(space)
+        self.assertTrue(space.accepted)
+        self.assertEqual(row.height(), 110)
+
+        enter = KeyEvent(Qt.Key.Key_Return)
+        row.keyPressEvent(enter)
+        self.assertTrue(enter.accepted)
+        self.assertEqual(row.height(), 22)
 
     def test_unified_widget_contains_deepseek_and_local_ai_rows(self):
         widget = self._make_inert_claude_widget(tray_available=False)
