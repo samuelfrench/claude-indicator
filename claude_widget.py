@@ -2105,6 +2105,11 @@ def _focus_gnome_terminal_session(
                     scan_failed = (
                         "exact tab selected but terminal window would not activate"
                     )
+                    outcome = (False, scan_failed)
+                    # Keep the proven tab selected through title cleanup. The
+                    # transaction rollback below restores it afterward unless
+                    # cleanup observes a readable external index change.
+                    break
 
                 try:
                     restored = _restore_gtk_tab(
@@ -2114,8 +2119,6 @@ def _focus_gnome_terminal_session(
                     restored = False
                 if restored:
                     mutated_windows.discard(wid)
-                    if matched:
-                        matched_state = None
                 else:
                     outcome = (
                         False,

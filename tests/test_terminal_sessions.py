@@ -979,7 +979,11 @@ class FocusTerminalSessionTest(unittest.TestCase):
 
     def test_gnome_activation_failure_restores_the_previously_active_tab(self):
         self._use_gnome_terminal()
-        runner = _FakeGnomeActions(target=(20, 2), active_follows=False)
+        runner = _FakeGnomeActions(
+            target=(20, 2),
+            active_follows=False,
+            restored_title="custom terminal title",
+        )
 
         ok, detail = focus_terminal_session(
             self._session_(), runner=runner, proc_root=self.proc, settle=0
@@ -989,6 +993,9 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertIn("would not activate", detail)
         self.assertEqual(runner.indices, runner.original)
         self.assertTrue(runner.title_restored)
+        self.assertEqual(runner.marker, "custom terminal title")
+        self.assertEqual(runner.safe_title_calls, [])
+        self.assertEqual(runner.closed_tty_handles, [runner.tty_handle])
 
     def test_gnome_without_gtk_action_does_not_use_ambiguous_title_fallback(self):
         self._use_gnome_terminal()
