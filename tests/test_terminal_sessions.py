@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from claude_widget import (
     TerminalSessionsRow,
     TerminalSessionsSnapshot,
     TerminalTabsPanel,
+    XdotoolRunner,
     _terminal_ancestor_pid,
     focus_terminal_session,
     load_terminal_state,
@@ -522,8 +524,12 @@ class _FakeGnomeActions:
         active_follows=True,
         title_restore_ok=True,
         pop_restores_marker=False,
+        restored_title="",
         safe_title_ok=True,
         persistent_marker=False,
+        final_index_race=None,
+        final_foreground=None,
+        on_activate=None,
     ):
         self.windows = list(windows or [10, 20])
         self.target = target
@@ -539,11 +545,19 @@ class _FakeGnomeActions:
         self.active_follows = active_follows
         self.title_restore_ok = title_restore_ok
         self.pop_restores_marker = pop_restores_marker
+        self.restored_title = restored_title
         self.safe_title_ok = safe_title_ok
         self.persistent_marker = persistent_marker
+        self.final_index_race = final_index_race
+        self.final_foreground = final_foreground
+        self.on_activate = on_activate
         self.marker = ""
         self.saved_marker = ""
         self.marker_refreshes = 0
+        self.tty_handle = object()
+        self.open_tty_calls = []
+        self.closed_tty_handles = []
+        self.write_tty_handles = []
         self.title_calls = []
         self.safe_title_calls = []
         self.title_restored = False
@@ -552,6 +566,7 @@ class _FakeGnomeActions:
         self.next_sent = 0
         self.prev_sent = 0
         self._active = None
+        self.active_window_reads = 0
 
     def windows_for_pid(self, pid):
         return list(self.windows)
@@ -584,8 +599,22 @@ class _FakeGnomeActions:
             self.indices[wid] = index
         return True
 
-    def set_terminal_title(self, tty, marker, *, save):
-        self.title_calls.append((tty, marker, save))
+    def open_terminal_tty(self, tty):
+        self.open_tty_calls.append(tty)
+        return self.tty_handle
+
+    def close_terminal_tty(self, tty_handle):
+        self.closed_tty_handles.append(tty_handle)
+        return tty_handle is self.tty_handle
+
+    def _record_tty_write(self, tty_handle):
+        self.write_tty_handles.append(tty_handle)
+        return tty_handle is self.tty_handle
+
+    def set_terminal_title(self, tty_handle, marker, *, save):
+        if not self._record_tty_write(tty_handle):
+            return False
+        self.title_calls.append(("pts/3", marker, save))
         self.marker = marker
         self.saved_marker = marker
         if not save and self.target is not None:
@@ -594,14 +623,22 @@ class _FakeGnomeActions:
                 self.marker_refreshes += 1
         return True
 
-    def restore_terminal_title(self, tty):
+    def restore_terminal_title(self, tty_handle):
+        if not self._record_tty_write(tty_handle):
+            return False
         self.title_restored = True
         if self.title_restore_ok:
-            self.marker = self.saved_marker if self.pop_restores_marker else ""
+            self.marker = (
+                self.saved_marker
+                if self.pop_restores_marker
+                else self.restored_title
+            )
         return self.title_restore_ok
 
-    def set_terminal_safe_title(self, tty, title):
-        self.safe_title_calls.append((tty, title))
+    def set_terminal_safe_title(self, tty_handle, title):
+        if not self._record_tty_write(tty_handle):
+            return False
+        self.safe_title_calls.append(("pts/3", title))
         if not self.safe_title_ok:
             return False
         if not self.persistent_marker:
@@ -623,9 +660,17 @@ class _FakeGnomeActions:
         self.activated.append(wid)
         if self.active_follows:
             self._active = wid
+        if self.on_activate is not None:
+            self.on_activate()
         return self.active_follows
 
     def active_window(self):
+        self.active_window_reads += 1
+        if self.active_window_reads >= 2:
+            if self.final_index_race is not None and self.target is not None:
+                self.indices[self.target[0]] = self.final_index_race
+            if self.final_foreground is not None:
+                return self.final_foreground
         return self._active
 
     def send_next_tab(self):
@@ -744,8 +789,45 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertEqual(runner.indices[20], 2)  # exact target remains selected
         self.assertGreaterEqual(runner.marker_refreshes, 2)
         self.assertTrue(runner.title_restored)
+        self.assertEqual(runner.safe_title_calls, [])
+        self.assertEqual(runner.open_tty_calls, ["pts/3"])
+        self.assertEqual(runner.closed_tty_handles, [runner.tty_handle])
+        self.assertTrue(
+            all(handle is runner.tty_handle for handle in runner.write_tty_handles)
+        )
         self.assertEqual(runner.next_sent, 0)
         self.assertEqual(runner.prev_sent, 0)
+
+    def test_gnome_final_third_index_race_fails_without_overwriting_it(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            target=(20, 2), final_index_race=3
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("changed before final selection commit", detail)
+        self.assertEqual(runner.indices[10], runner.original[10])
+        self.assertEqual(runner.indices[20], 3)
+        self.assertEqual(runner.closed_tty_handles, [runner.tty_handle])
+
+    def test_gnome_final_foreground_race_rolls_back_selector_owned_index(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            target=(20, 2), final_foreground=99
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("lost foreground before final selection commit", detail)
+        self.assertEqual(runner.indices, runner.original)
+        self.assertEqual(runner.closed_tty_handles, [runner.tty_handle])
 
     def test_gnome_failure_restores_every_index_and_title_without_keys(self):
         self._use_gnome_terminal()
@@ -794,6 +876,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertIn("exact-tab selection failed", detail)
         self.assertEqual(runner.indices, runner.original)
         self.assertTrue(runner.title_restored)
+        self.assertEqual(runner.closed_tty_handles, [runner.tty_handle])
 
     def test_gnome_failed_title_pop_is_recovered_by_explicit_safe_title(self):
         self._use_gnome_terminal()
@@ -823,6 +906,20 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertEqual(runner.marker, "coffee-explorer")
         self.assertGreaterEqual(len(runner.safe_title_calls), 2)
 
+    def test_gnome_clean_pop_preserves_restored_custom_title(self):
+        self._use_gnome_terminal()
+        runner = _FakeGnomeActions(
+            target=(20, 2), restored_title="custom terminal title"
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(runner.marker, "custom terminal title")
+        self.assertEqual(runner.safe_title_calls, [])
+
     def test_gnome_persistent_cleanup_failure_rolls_back_matched_target(self):
         self._use_gnome_terminal()
         runner = _FakeGnomeActions(
@@ -839,7 +936,9 @@ class FocusTerminalSessionTest(unittest.TestCase):
 
     def test_gnome_cleanup_sanitizes_and_caps_project_title(self):
         self._use_gnome_terminal()
-        runner = _FakeGnomeActions(target=(20, 2))
+        runner = _FakeGnomeActions(
+            target=(20, 2), pop_restores_marker=True
+        )
         session = self._session_()
         session.project = "safe\x1b]0;INJECT\x07\n" + "é" * 100
 
@@ -856,6 +955,27 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertNotIn("\x07", safe_title)
         self.assertNotIn("\n", safe_title)
         self.assertNotIn("INJECT", detail)
+
+    def test_gnome_process_exit_after_match_cleans_held_tty_and_rolls_back(self):
+        self._use_gnome_terminal()
+        stat_path = self.proc / "100" / "stat"
+        runner = _FakeGnomeActions(
+            target=(20, 2), on_activate=stat_path.unlink
+        )
+
+        ok, detail = focus_terminal_session(
+            self._session_(), runner=runner, proc_root=self.proc, settle=0
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("session exited", detail)
+        self.assertEqual(runner.marker, "")
+        self.assertEqual(runner.indices, runner.original)
+        self.assertEqual(runner.open_tty_calls, ["pts/3"])
+        self.assertEqual(runner.closed_tty_handles, [runner.tty_handle])
+        self.assertTrue(
+            all(handle is runner.tty_handle for handle in runner.write_tty_handles)
+        )
 
     def test_gnome_activation_failure_restores_the_previously_active_tab(self):
         self._use_gnome_terminal()
@@ -949,7 +1069,25 @@ class FocusTerminalSessionTest(unittest.TestCase):
                 self.assertFalse(ok)
                 self.assertIn(expected, detail)
                 self.assertEqual(runner.title_calls, [])
+                self.assertEqual(runner.open_tty_calls, [])
                 self.assertEqual(runner.set_history, [])
+
+    @patch("claude_widget.os.close")
+    @patch("claude_widget.os.fstat")
+    @patch("claude_widget.os.open", return_value=41)
+    def test_runner_rejects_pts_descriptor_with_wrong_device_identity(
+        self, open_mock, fstat_mock, close_mock
+    ):
+        fstat_mock.return_value = Mock(
+            st_mode=stat.S_IFCHR | 0o620,
+            st_rdev=os.makedev(136, 4),
+        )
+
+        handle = XdotoolRunner.open_terminal_tty("pts/3")
+
+        self.assertIsNone(handle)
+        open_mock.assert_called_once()
+        close_mock.assert_called_once_with(41)
 
 
 if __name__ == "__main__":

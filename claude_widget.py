@@ -1775,42 +1775,94 @@ class XdotoolRunner:
         )
         return ok
 
+    @dataclass
+    class _HeldTerminalTty:
+        fd: int
+        tty: str
+        device: int
+
     @staticmethod
-    def _write_tty_control(tty: str, payload: bytes) -> bool:
-        # The tty comes from /proc, but validate it again at the mutation
-        # boundary so this can never become an arbitrary device/path write.
-        if re.fullmatch(r"pts/(0|[1-9][0-9]*)", tty) is None:
-            return False
+    def open_terminal_tty(tty: str):
+        """Open one verified pts device for the whole selection transaction."""
+        match = re.fullmatch(r"pts/(0|[1-9][0-9]*)", tty)
+        if match is None:
+            return None
+        pts_number = int(match.group(1))
+        major = 136 + pts_number // 256
+        minor = pts_number % 256
+        if major > 143:
+            return None
+        expected_device = os.makedev(major, minor)
         flags = os.O_WRONLY | os.O_NOCTTY
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
         try:
             fd = os.open(Path("/dev") / tty, flags)
-            try:
-                remaining = memoryview(payload)
-                while remaining:
-                    written = os.write(fd, remaining)
-                    if written <= 0:
-                        return False
-                    remaining = remaining[written:]
-            finally:
+            opened = os.fstat(fd)
+            if not stat.S_ISCHR(opened.st_mode) or opened.st_rdev != expected_device:
                 os.close(fd)
+                return None
+        except OSError:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return None
+        return XdotoolRunner._HeldTerminalTty(fd, tty, expected_device)
+
+    @staticmethod
+    def close_terminal_tty(tty_handle) -> bool:
+        if not isinstance(tty_handle, XdotoolRunner._HeldTerminalTty):
+            return False
+        fd, tty_handle.fd = tty_handle.fd, -1
+        if fd < 0:
+            return False
+        try:
+            os.close(fd)
         except OSError:
             return False
         return True
 
-    def set_terminal_title(self, tty: str, marker: str, *, save: bool) -> bool:
+    @staticmethod
+    def _write_tty_control(tty_handle, payload: bytes) -> bool:
+        if (
+            not isinstance(tty_handle, XdotoolRunner._HeldTerminalTty)
+            or tty_handle.fd < 0
+        ):
+            return False
+        try:
+            opened = os.fstat(tty_handle.fd)
+            if (
+                not stat.S_ISCHR(opened.st_mode)
+                or opened.st_rdev != tty_handle.device
+            ):
+                return False
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(tty_handle.fd, remaining)
+                if written <= 0:
+                    return False
+                remaining = remaining[written:]
+        except OSError:
+            return False
+        return True
+
+    def set_terminal_title(self, tty_handle, marker: str, *, save: bool) -> bool:
         if re.fullmatch(r"CLAUDE-INDICATOR-TAB-[0-9]+-[0-9]+-[0-9]+", marker) is None:
             return False
         prefix = b"\x1b[22;0t" if save else b""
         return self._write_tty_control(
-            tty, prefix + b"\x1b]0;" + marker.encode("ascii") + b"\x07"
+            tty_handle, prefix + b"\x1b]0;" + marker.encode("ascii") + b"\x07"
         )
 
-    def restore_terminal_title(self, tty: str) -> bool:
-        return self._write_tty_control(tty, b"\x1b[23;0t")
+    def restore_terminal_title(self, tty_handle) -> bool:
+        return self._write_tty_control(tty_handle, b"\x1b[23;0t")
 
-    def set_terminal_safe_title(self, tty: str, title: str) -> bool:
+    def set_terminal_safe_title(self, tty_handle, title: str) -> bool:
         encoded = title.encode("utf-8")
         if (
             not title
@@ -1818,7 +1870,9 @@ class XdotoolRunner:
             or any(not char.isprintable() for char in title)
         ):
             return False
-        return self._write_tty_control(tty, b"\x1b]0;" + encoded + b"\x07")
+        return self._write_tty_control(
+            tty_handle, b"\x1b]0;" + encoded + b"\x07"
+        )
 
 
 def _terminal_title_marker(session: TerminalSession) -> str | None:
@@ -1925,9 +1979,16 @@ def _focus_gnome_terminal_session(
     identity_error = _terminal_session_identity_error(session, proc_root)
     if identity_error:
         return False, identity_error
+    try:
+        tty_handle = runner.open_terminal_tty(session.tty)
+    except Exception:
+        tty_handle = None
+    if tty_handle is None:
+        return False, f"could not safely open /dev/{session.tty}"
 
     title_saved = False
     mutated_windows: set[int] = set()
+    matched_state: tuple[int, tuple[str, str], int] | None = None
     outcome = (False, f"no GNOME Terminal tab owns {session.tty}")
 
     def restore_mutated_windows() -> list[int]:
@@ -1950,8 +2011,28 @@ def _focus_gnome_terminal_session(
     def refresh_marker(*, save: bool) -> bool:
         return (
             not _terminal_session_identity_error(session, proc_root)
-            and runner.set_terminal_title(session.tty, marker, save=save)
+            and runner.set_terminal_title(tty_handle, marker, save=save)
         )
+
+    def observe_matched_title() -> str:
+        """Return clean/marker/changed without exposing the observed title."""
+        if matched_state is None:
+            return "changed"
+        wid, action_ref, matched_index = matched_state
+        try:
+            current_index = runner.gtk_active_tab(action_ref)
+        except Exception:
+            return "changed"
+        if current_index != matched_index:
+            # Once the exact target was selected, a different readable index
+            # is external state. Never overwrite it during failure rollback.
+            if current_index is not None:
+                mutated_windows.discard(wid)
+            return "changed"
+        try:
+            return "marker" if runner.window_name(wid) == marker else "clean"
+        except Exception:
+            return "changed"
 
     try:
         title_saved = refresh_marker(save=True)
@@ -1963,6 +2044,12 @@ def _focus_gnome_terminal_session(
                 matched_index = None
                 scan_failed = ""
                 for index in range(max(0, max_tabs)):
+                    identity_error = _terminal_session_identity_error(
+                        session, proc_root
+                    )
+                    if identity_error:
+                        scan_failed = identity_error
+                        break
                     # Treat even a failed/raising setter as potentially
                     # mutating; rollback is safe when it did not change state.
                     mutated_windows.add(wid)
@@ -1989,8 +2076,7 @@ def _focus_gnome_terminal_session(
                         if settle:
                             time.sleep(settle / 2)
                         # A busy VTE can redraw its OSC title within a few
-                        # milliseconds. Double-pulse each bounded check so the
-                        # marker survives long enough for the X title read.
+                        # milliseconds. Double-pulse each bounded check.
                         if not refresh_marker(save=False):
                             scan_failed = (
                                 f"could not safely refresh /dev/{session.tty} marker"
@@ -2006,6 +2092,7 @@ def _focus_gnome_terminal_session(
                         break
 
                 if matched:
+                    matched_state = (wid, action_ref, matched_index)
                     activation_requested = runner.activate(wid)
                     active_window = runner.active_window()
                     if activation_requested is True and active_window == wid:
@@ -2027,6 +2114,8 @@ def _focus_gnome_terminal_session(
                     restored = False
                 if restored:
                     mutated_windows.discard(wid)
+                    if matched:
+                        matched_state = None
                 else:
                     outcome = (
                         False,
@@ -2041,74 +2130,140 @@ def _focus_gnome_terminal_session(
         outcome = (False, f"GNOME Terminal exact-tab selection failed: {exc}")
     finally:
         title_problem = ""
-        if title_saved:
-            safe_title = _sanitized_terminal_title(session.project)
-            if safe_title == marker:
-                safe_title = "terminal"
-            current_identity_error = _terminal_session_identity_error(session, proc_root)
-            if not current_identity_error:
-                # Pop our VTE title save first, but do not trust the stack as
-                # the final cleanup: an active TUI may have pushed/popped or
-                # redrawn titles while the exact-tab scan was in progress.
-                try:
-                    runner.restore_terminal_title(session.tty)
-                except Exception:
-                    pass
-
-            clean_observations = 0
-            cleanup_pause = (
-                0.0
-                if settle <= 0
-                else min(
-                    0.05,
-                    max(settle, TERMINAL_TITLE_CLEANUP_INTERVAL_S),
-                )
-            )
-            for _ in range(TERMINAL_TITLE_CLEANUP_ATTEMPTS):
+        try:
+            if title_saved:
                 current_identity_error = _terminal_session_identity_error(
                     session, proc_root
                 )
-                if current_identity_error:
-                    title_problem = current_identity_error
-                    break
+                if current_identity_error and outcome[0]:
+                    outcome = (False, current_identity_error)
+
                 try:
-                    safe_title_written = runner.set_terminal_safe_title(
-                        session.tty, safe_title
-                    )
+                    popped = runner.restore_terminal_title(tty_handle) is True
                 except Exception:
-                    safe_title_written = False
-                if not safe_title_written:
-                    clean_observations = 0
-                    continue
-                if cleanup_pause:
-                    time.sleep(cleanup_pause)
-                try:
-                    marker_visible = any(
-                        runner.window_name(wid) == marker
-                        for wid, _, _ in action_windows
-                    )
-                except Exception:
-                    marker_visible = True
-                clean_observations = 0 if marker_visible else clean_observations + 1
-                if clean_observations >= TERMINAL_TITLE_CLEAN_OBSERVATIONS:
-                    break
-            if (
-                not title_problem
-                and clean_observations < TERMINAL_TITLE_CLEAN_OBSERVATIONS
-            ):
-                title_problem = (
-                    f"temporary title on /dev/{session.tty} could not be cleared"
+                    popped = False
+
+                cleanup_pause = min(
+                    0.05,
+                    max(settle, TERMINAL_TITLE_CLEANUP_INTERVAL_S),
                 )
-        if title_problem:
+                clean_observations = 0
+                if popped and matched_state is not None:
+                    for _ in range(TERMINAL_TITLE_CLEAN_OBSERVATIONS):
+                        time.sleep(cleanup_pause)
+                        if observe_matched_title() != "clean":
+                            clean_observations = 0
+                            break
+                        clean_observations += 1
+
+                if clean_observations < TERMINAL_TITLE_CLEAN_OBSERVATIONS:
+                    safe_title = _sanitized_terminal_title(session.project)
+                    if safe_title == marker:
+                        safe_title = "terminal"
+                    clean_observations = 0
+                    for _ in range(TERMINAL_TITLE_CLEANUP_ATTEMPTS):
+                        try:
+                            safe_title_written = (
+                                runner.set_terminal_safe_title(
+                                    tty_handle, safe_title
+                                )
+                                is True
+                            )
+                        except Exception:
+                            safe_title_written = False
+                        if not safe_title_written:
+                            clean_observations = 0
+                            continue
+                        time.sleep(cleanup_pause)
+                        if matched_state is not None:
+                            title_state = observe_matched_title()
+                        else:
+                            try:
+                                title_state = (
+                                    "marker"
+                                    if any(
+                                        runner.window_name(wid) == marker
+                                        for wid, _, _ in action_windows
+                                    )
+                                    else "clean"
+                                )
+                            except Exception:
+                                title_state = "changed"
+                        clean_observations = (
+                            clean_observations + 1
+                            if title_state == "clean"
+                            else 0
+                        )
+                        if (
+                            clean_observations
+                            >= TERMINAL_TITLE_CLEAN_OBSERVATIONS
+                        ):
+                            break
+                if clean_observations < TERMINAL_TITLE_CLEAN_OBSERVATIONS:
+                    title_problem = (
+                        f"temporary title on /dev/{session.tty} could not be "
+                        "cleared"
+                    )
+        except Exception:
+            title_problem = (
+                f"temporary title on /dev/{session.tty} could not be cleared"
+            )
+        finally:
+            try:
+                tty_closed = runner.close_terminal_tty(tty_handle) is True
+            except Exception:
+                tty_closed = False
+        if not tty_closed:
+            outcome = (False, f"held /dev/{session.tty} descriptor did not close")
+        elif title_problem:
             outcome = (False, title_problem)
-        if not outcome[0]:
-            failed_rollbacks = restore_mutated_windows()
-            if failed_rollbacks:
+
+    # Cleanup is part of the transaction. Commit success only while the exact
+    # same GTK index is still selected in the same foreground window.
+    if outcome[0] and matched_state is None:
+        outcome = (False, "exact tab state missing before final selection commit")
+    elif outcome[0]:
+        current_identity_error = _terminal_session_identity_error(
+            session, proc_root
+        )
+        if current_identity_error:
+            outcome = (False, current_identity_error)
+        else:
+            wid, action_ref, matched_index = matched_state
+            try:
+                active_window = runner.active_window()
+            except Exception:
+                active_window = None
+            try:
+                final_index = runner.gtk_active_tab(action_ref)
+            except Exception:
+                final_index = None
+            if final_index is not None and final_index != matched_index:
+                mutated_windows.discard(wid)
                 outcome = (
                     False,
-                    f"{outcome[1]}; original tab index rollback failed for "
-                    + ", ".join(str(wid) for wid in failed_rollbacks),
+                    "exact tab changed before final selection commit",
                 )
+            elif final_index != matched_index:
+                outcome = (
+                    False,
+                    "exact tab state unreadable before final selection commit",
+                )
+            elif active_window != wid:
+                outcome = (
+                    False,
+                    "terminal window lost foreground before final selection "
+                    "commit",
+                )
+
+    if not outcome[0]:
+        failed_rollbacks = restore_mutated_windows()
+        if failed_rollbacks:
+            outcome = (
+                False,
+                f"{outcome[1]}; original tab index rollback failed for "
+                + ", ".join(str(wid) for wid in failed_rollbacks),
+            )
     return outcome
 
 
