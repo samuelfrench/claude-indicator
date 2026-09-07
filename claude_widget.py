@@ -116,6 +116,18 @@ MINIMAX_QUOTA_URL = "https://api.minimax.io/v1/token_plan/remains"
 MINIMAX_PROVIDER_ID = "minimax-coding-plan"
 MINIMAX_QUOTA_FAMILY = "general"
 MINIMAX_REFRESH_MS = 5 * 60 * 1000  # plan quota endpoint and local token ledger
+# OpenCode Go is a $10/month dollar-metered subscription: $12 of usage per
+# rolling 5-hour window, $30 weekly, $60 monthly. The Go usage endpoint reports
+# each window's utilization percent plus the time it resets.
+OPENCODE_GO_AUTH_PATH = DEEPSEEK_AUTH_PATH
+OPENCODE_GO_PROVIDER_ID = "opencode-go"
+OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+OPENCODE_GO_WINDOW_LIMITS = {
+    "rolling": Decimal("12"),
+    "weekly": Decimal("30"),
+    "monthly": Decimal("60"),
+}
+OPENCODE_GO_REFRESH_MS = 5 * 60 * 1000  # usage endpoint; limits move slowly
 # Local-model token tracking is scoped to the OpenCode ledger on purpose: it is
 # the one place local usage is recorded per message. Other local clients (the
 # clawd-bot runner drives ollama through aider) are outside it and are excluded.
@@ -127,6 +139,7 @@ OPENCODE_PROVIDER_LABELS = (
     ("minimax-coding-plan", "minimax"),
     ("deepseek", "deepseek"),
     ("ollama", "ollama"),
+    ("opencode-go", "go"),
 )
 OPENCODE_MODEL_LINES = 5
 # Agent CLI sessions on terminal tabs: a process from this table with a
@@ -521,6 +534,32 @@ class MinimaxUsageSummary:
     model_name: str = ""
     usage_source: str = ""
     usage_error: str = ""
+
+
+@dataclass
+class OpencodeGoWindow:
+    status: str = ""
+    used_percent: float = 0.0
+    resets_at: int = 0
+    limit_dollars: Decimal = Decimal("0")
+
+    @property
+    def used_dollars(self) -> Decimal:
+        return (
+            self.limit_dollars
+            * Decimal(str(self.used_percent))
+            / Decimal("100")
+        ).quantize(Decimal("0.01"))
+
+
+@dataclass
+class OpencodeGoUsageSummary:
+    rolling: OpencodeGoWindow | None = None
+    weekly: OpencodeGoWindow | None = None
+    monthly: OpencodeGoWindow | None = None
+    fetched_at: float = 0.0
+    source: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -1274,6 +1313,109 @@ def fetch_minimax_quota(api_key: str) -> tuple[MinimaxWindow, MinimaxWindow]:
     )
     response.raise_for_status()
     return parse_minimax_quota(response.json())
+
+
+def read_opencode_go_api_key(
+    *, auth_path: Path = OPENCODE_GO_AUTH_PATH, environ: dict | None = None
+) -> str:
+    environment = os.environ if environ is None else environ
+    env_key = environment.get("OPENCODE_GO_API_KEY", "")
+    if isinstance(env_key, str) and env_key.strip():
+        return env_key.strip()
+    data = _read_owned_private_json(auth_path)
+    provider = data.get(OPENCODE_GO_PROVIDER_ID)
+    if not isinstance(provider, dict):
+        raise ValueError("OpenCode Go credential unavailable")
+    key = provider.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("OpenCode Go credential unavailable")
+    return key.strip()
+
+
+def _opencode_go_used_percent(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("OpenCode Go usage percent is invalid")
+    if not 0 <= value <= 100:
+        raise ValueError("OpenCode Go usage percent is out of range")
+    return float(value)
+
+
+def _opencode_go_resets_at(value) -> int:
+    if not isinstance(value, str):
+        raise ValueError("OpenCode Go reset time is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("OpenCode Go reset time is invalid")
+    epoch = int(parsed.timestamp())
+    if epoch <= 0:
+        raise ValueError("OpenCode Go reset time is invalid")
+    return epoch
+
+
+def parse_opencode_go_usage(
+    payload: dict,
+) -> tuple[OpencodeGoWindow, OpencodeGoWindow, OpencodeGoWindow]:
+    if not isinstance(payload, dict):
+        raise ValueError("OpenCode Go usage response schema is invalid")
+    if payload.get("type") == "error":
+        error = payload.get("error")
+        message = error.get("message") if isinstance(error, dict) else "unknown error"
+        raise ValueError(f"OpenCode Go usage request failed: {message}")
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        raise ValueError("OpenCode Go usage response has no usage windows")
+    windows: list[OpencodeGoWindow] = []
+    for name in ("rolling", "weekly", "monthly"):
+        entry = usage.get(name)
+        if not isinstance(entry, dict):
+            raise ValueError(f"OpenCode Go usage response has no {name} window")
+        status = entry.get("status")
+        if status not in ("ok", "rate-limited"):
+            raise ValueError(f"OpenCode Go {name} status is invalid")
+        windows.append(
+            OpencodeGoWindow(
+                status=status,
+                used_percent=_opencode_go_used_percent(entry.get("percent")),
+                resets_at=_opencode_go_resets_at(entry.get("resetsAt")),
+                limit_dollars=OPENCODE_GO_WINDOW_LIMITS[name],
+            )
+        )
+    return windows[0], windows[1], windows[2]
+
+
+def fetch_opencode_go_usage(
+    api_key: str,
+) -> tuple[OpencodeGoWindow, OpencodeGoWindow, OpencodeGoWindow]:
+    response = requests.get(
+        OPENCODE_GO_USAGE_URL,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return parse_opencode_go_usage(response.json())
+
+
+def read_opencode_go_usage(
+    *,
+    now: float | None = None,
+    auth_path: Path = OPENCODE_GO_AUTH_PATH,
+    environ: dict | None = None,
+) -> OpencodeGoUsageSummary:
+    now = time.time() if now is None else now
+    summary = OpencodeGoUsageSummary()
+    try:
+        api_key = read_opencode_go_api_key(auth_path=auth_path, environ=environ)
+        rolling, weekly, monthly = fetch_opencode_go_usage(api_key)
+    except (ValueError, OSError, requests.RequestException, json.JSONDecodeError):
+        summary.error = "Go usage unavailable"
+    else:
+        summary.rolling = rolling
+        summary.weekly = weekly
+        summary.monthly = monthly
+        summary.fetched_at = now
+        summary.source = "live"
+    return summary
 
 
 def read_opencode_minimax_usage(
@@ -3637,6 +3779,22 @@ class MinimaxUsageWorker(QThread):
             self.result.emit(summary)
 
 
+class OpencodeGoUsageWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        reader = self._reader or read_opencode_go_usage
+        summary = reader()
+        if not self.isInterruptionRequested():
+            self.result.emit(summary)
+
+
 class OpencodeUsageWorker(QThread):
     result = Signal(object)
 
@@ -5256,6 +5414,139 @@ class MinimaxUsageRow(QWidget):
                 if summary.model_name:
                     tokens += f"   ·   {summary.model_name}"
             painter.drawText(8, 76, tokens)
+        painter.end()
+
+
+class OpencodeGoUsageRow(QWidget):
+    """Compact OpenCode Go subscription usage row: 5-hour/weekly/monthly dollar windows."""
+
+    _COLLAPSED_H = 30
+    _EXPANDED_H = 88
+
+    _WINDOW_ORDER = ("rolling", "weekly", "monthly")
+    _WINDOW_LABELS = {"rolling": "5H", "weekly": "7D", "monthly": "30D"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._summary: OpencodeGoUsageSummary | None = None
+        self._expanded = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, summary: OpencodeGoUsageSummary | None):
+        self._summary = summary
+        self.setToolTip(self._tooltip(summary))
+        self.update()
+
+    def _window(self, name: str, summary: OpencodeGoUsageSummary | None) -> OpencodeGoWindow | None:
+        if summary is None:
+            return None
+        return {"rolling": summary.rolling, "weekly": summary.weekly, "monthly": summary.monthly}[name]
+
+    @staticmethod
+    def _window_text(window: OpencodeGoWindow | None) -> str:
+        if window is None:
+            return "—"
+        text = f"{window.used_percent:.0f}%"
+        return f"{text}!" if window.status == "rate-limited" else text
+
+    def summary_text(self) -> str:
+        summary = self._summary
+        parts = [
+            f"{label} {self._window_text(self._window(name, summary))}"
+            for name, label in self._WINDOW_LABELS.items()
+        ]
+        return "  ·  ".join(parts)
+
+    def _peak_percent(self) -> float:
+        summary = self._summary
+        if summary is None:
+            return 0.0
+        return max(
+            (
+                window.used_percent
+                for window in (summary.rolling, summary.weekly, summary.monthly)
+                if window is not None
+            ),
+            default=0.0,
+        )
+
+    def _window_detail(self, window: OpencodeGoWindow | None) -> str:
+        if window is None:
+            return "—"
+        text = (
+            f"{self._window_text(window)}"
+            f"   ·   {_money_text(window.used_dollars, 'USD')}/{_money_text(window.limit_dollars, 'USD')}"
+        )
+        text += "   ·   resets " + time.strftime(
+            "%d %b %H:%M", time.localtime(window.resets_at)
+        )
+        return text
+
+    def _tooltip(self, summary: OpencodeGoUsageSummary | None) -> str:
+        if summary is None:
+            return "OpenCode Go data has not been read yet."
+        lines: list[str] = []
+        if summary.source == "live":
+            lines.append(
+                "Go plan quota (live OpenCode /zen/go/v1/usage): "
+                + ", ".join(
+                    f"{label} {self._window_text(self._window(name, summary))}"
+                    for name, label in self._WINDOW_LABELS.items()
+                )
+                + "."
+            )
+            lines.append(
+                "Limits are dollar-metered: $12 per 5-hour window, $30 weekly, "
+                "$60 monthly on the $10/month subscription."
+            )
+            for name, label in self._WINDOW_LABELS.items():
+                window = self._window(name, summary)
+                if window is not None:
+                    lines.append(
+                        f"{label} window: {_money_text(window.used_dollars, 'USD')} of "
+                        f"{_money_text(window.limit_dollars, 'USD')} used; resets "
+                        + time.strftime("%a %d %b %H:%M", time.localtime(window.resets_at))
+                        + (". Capped until reset." if window.status == "rate-limited" else ".")
+                    )
+        if summary.error:
+            lines.append(summary.error + ".")
+        return "\n".join(lines)
+
+    def mousePressEvent(self, event):
+        self._expanded = not self._expanded
+        self.setFixedHeight(self._EXPANDED_H if self._expanded else self._COLLAPSED_H)
+        _resize_parent(self)
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        arrow = "▾" if self._expanded else "▸"
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 18, f"GO {arrow}")
+
+        summary = self._summary
+        right = self.summary_text()
+        if summary is None or summary.source != "live":
+            painter.setPen(QColor(160, 160, 180))
+        else:
+            painter.setPen(_bar_color(self._peak_percent()))
+        fm = painter.fontMetrics()
+        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 18, right)
+
+        if self._expanded:
+            painter.setFont(QFont("sans-serif", 7))
+            for index, (name, label) in enumerate(self._WINDOW_LABELS.items()):
+                window = self._window(name, summary)
+                if window is None:
+                    painter.setPen(QColor(100, 100, 120))
+                else:
+                    painter.setPen(_bar_color(window.used_percent))
+                painter.drawText(8, 40 + index * 18, f"{label} PLAN   {self._window_detail(window)}")
         painter.end()
 
 
@@ -7083,6 +7374,7 @@ class ClaudeWidget(QWidget):
         self._codex_worker: CodexUsageWorker | None = None
         self._deepseek_worker: DeepSeekUsageWorker | None = None
         self._minimax_worker: MinimaxUsageWorker | None = None
+        self._go_worker: OpencodeGoUsageWorker | None = None
         self._opencode_worker: OpencodeUsageWorker | None = None
         self._ollama_worker: OllamaFetchWorker | None = None
         self._comfyui_worker: ComfyUIFetchWorker | None = None
@@ -7147,6 +7439,7 @@ class ClaudeWidget(QWidget):
         self._refresh_codex_usage()
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
+        self._refresh_opencode_go_usage()
         self._refresh_opencode_usage()
         self._refresh_terminal_sessions()
 
@@ -7316,6 +7609,10 @@ class ClaudeWidget(QWidget):
         self._minimax_row = MinimaxUsageRow()
         layout.addWidget(self._minimax_row)
 
+        # OpenCode Go subscription usage row (5-hour/weekly/monthly dollar windows)
+        self._go_row = OpencodeGoUsageRow()
+        layout.addWidget(self._go_row)
+
         # OpenCode ledger usage, broken down per model
         self._opencode_row = OpencodeUsageRow()
         layout.addWidget(self._opencode_row)
@@ -7467,6 +7764,10 @@ class ClaudeWidget(QWidget):
         self._minimax_timer.timeout.connect(self._refresh_minimax_usage)
         self._minimax_timer.start(MINIMAX_REFRESH_MS)
 
+        self._go_timer = QTimer(self)
+        self._go_timer.timeout.connect(self._refresh_opencode_go_usage)
+        self._go_timer.start(OPENCODE_GO_REFRESH_MS)
+
         self._opencode_timer = QTimer(self)
         self._opencode_timer.timeout.connect(self._refresh_opencode_usage)
         self._opencode_timer.start(LOCAL_TOKENS_REFRESH_MS)
@@ -7490,6 +7791,7 @@ class ClaudeWidget(QWidget):
         self._refresh_codex_usage()
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
+        self._refresh_opencode_go_usage()
         self._refresh_opencode_usage()
         self._refresh_terminal_sessions()
         self._fetch_ollama()
@@ -7812,6 +8114,19 @@ class ClaudeWidget(QWidget):
 
     def _on_minimax_usage_read(self, summary: MinimaxUsageSummary | None):
         self._minimax_row.set_data(summary)
+        self.adjustSize()
+
+    def _refresh_opencode_go_usage(self):
+        if self._shutdown_started:
+            return
+        if self._go_worker and self._go_worker.isRunning():
+            return
+        self._go_worker = OpencodeGoUsageWorker()
+        self._go_worker.result.connect(self._on_opencode_go_usage_read)
+        self._go_worker.start()
+
+    def _on_opencode_go_usage_read(self, summary: OpencodeGoUsageSummary | None):
+        self._go_row.set_data(summary)
         self.adjustSize()
 
     def _refresh_opencode_usage(self):
@@ -8166,6 +8481,7 @@ class ClaudeWidget(QWidget):
             for worker in (
                 self._deepseek_worker,
                 self._minimax_worker,
+                self._go_worker,
                 self._opencode_worker,
                 self._ollama_worker,
                 self._comfyui_worker,

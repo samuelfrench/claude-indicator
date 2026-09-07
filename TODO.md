@@ -1,5 +1,6 @@
 # Claude Indicator TODO
 
+- [x] Add an OpenCode Go usage row (built 2026-09-07, working tree, not yet committed/deployed): `OpencodeGoUsageRow` shows the dollar-metered `5H/$12 · 7D/$30 · 30D/$60` utilization percents from `GET https://opencode.ai/zen/go/v1/usage` (Bearer `opencode-go` key; env `OPENCODE_GO_API_KEY` first, else owner-only mode-0600 `~/.local/share/opencode/auth.json`), with per-window dollars used, reset times, and a `!` marker for `rate-limited` windows. Sam approved growing the panel past the 800px budget; the tall-sections test budget is now 824 and `clamp_to_available_screen` pins the top when the window is taller than the screen. Live endpoint verified 2026-09-07: rolling 83%, weekly 33%, monthly 16%. Full suite `380 passed, 10 subtests passed`. Still pending: commit + restart `app-claude\x2dwidget@autostart.service` + visual check.
 - [x] Read task-loop status from local configuration only; no longer scan DynamoDB every 60 seconds.
 - [x] Document the controlled `mergepdfnow.com` registrar contact-recovery exception and hash-verified immutable-field rule without storing an address or other PII.
 - [x] Complete and review the immediate Cloudflare cutover for all 16 active Route 53 zones while leaving every source zone intact.

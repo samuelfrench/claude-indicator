@@ -15,6 +15,7 @@ panel.
 - **Real-time usage tracking** — monitors 5-hour and 7-day rate limit windows
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
 - **Codex limit percentage** — reads current limits through local `codex app-server`, renders whichever one or two windows are present, and combines them with latest-thread and lifetime totals from local Codex state
+- **OpenCode Go subscription usage** — shows the dollar-metered 5-hour ($12), weekly ($30), and monthly ($60) window utilization from OpenCode's official Go usage endpoint, including per-window dollars used and reset times
 - **DeepSeek spend and credit** — shows OpenCode-recorded DeepSeek cost from the rolling past 24 hours plus current account credit from DeepSeek's official balance endpoint
 - **Embedded Ollama section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
 - **Compact system activity** — shows CPU, RAM, GPU, and download/upload byte rates for the active lowest-metric UP IPv4 default-route interface(s); route or counter changes reset the 3-second sample baseline instead of producing a spike
@@ -34,6 +35,7 @@ The widget displays a dark translucent overlay with:
 - "CLAUDE MAX" header in warm gold
 - Up to 3 progress bars (5-Hour Window, 7-Day Window, Model-specific 7-Day)
 - A compact `CODEX` row with current Codex limit percentage and local usage totals
+- A compact `GO` row with OpenCode Go 5-hour/weekly/monthly dollar-window utilization; expand it for per-window dollars used and reset times
 - A compact `DEEPSEEK` row with `24H` spend and `CREDIT` always visible
 - A collapsed `OLLAMA` row with GPU summary and expandable details
 - A compact `SYSTEM` row with CPU/RAM/GPU and IPv4 default-route download/upload rates; expand it for temperature and an explicit `NET` row
@@ -172,6 +174,7 @@ frame remains inside the primary screen's available work area.
 - **Claude Code Max subscription** — the widget reads usage data from Anthropic's API
 - **Claude Code CLI** — must be installed and logged in (the widget reads OAuth credentials from `~/.claude/.credentials.json`)
 - **Codex CLI** — `codex` must be installed, on `PATH`, and logged in so local `codex app-server` can read the account rate limits
+- **OpenCode Go subscription** — the widget reads the `opencode-go` API key that the OpenCode CLI stores in `~/.local/share/opencode/auth.json` (or set `OPENCODE_GO_API_KEY`); the row shows `—` until a key is available
 - **DeepSeek API key** — set `DEEPSEEK_API_KEY`, or use OpenCode's existing
   `~/.local/share/opencode/auth.json`; the fallback must be an owner-controlled,
   non-symlink regular file with mode `0600`
@@ -233,10 +236,11 @@ LD_LIBRARY_PATH=/path/to/miniconda3/lib python claude_widget.py
 2. **Refreshes the access token** if it's within 5 minutes of expiry, using the OAuth refresh flow
 3. **Fetches usage data** from `GET https://api.anthropic.com/api/oauth/usage` with the `anthropic-beta: oauth-2025-04-20` header
 4. **Reads Codex usage** from local `codex app-server` (`account/rateLimits/read`) plus `~/.codex/state_*.sqlite`; cached session `token_count` events under `~/.codex/sessions/` are visibly marked fallbacks and are accepted only when no more than five minutes old and not past their reset
-5. **Builds cron health** from `crontab -l` plus `journalctl` execution logs, using command equality and local-time schedule prediction
-6. **Scans local TODO files** on a background Qt worker and writes only the marked Indicator Inbox section in `~/TODO.md`
-7. **Samples system activity** from `/proc`, selecting the active lowest-metric UP IPv4 default-route interface(s) for network byte rates without summing unrelated virtual interfaces
-8. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, collapsible custom rows, and a modeless Smart TODO dialog
+5. **Reads OpenCode Go usage** from `GET https://opencode.ai/zen/go/v1/usage` using the `opencode-go` credential, rendering the 5-hour/weekly/monthly dollar-metered windows
+6. **Builds cron health** from `crontab -l` plus `journalctl` execution logs, using command equality and local-time schedule prediction
+7. **Scans local TODO files** on a background Qt worker and writes only the marked Indicator Inbox section in `~/TODO.md`
+8. **Samples system activity** from `/proc`, selecting the active lowest-metric UP IPv4 default-route interface(s) for network byte rates without summing unrelated virtual interfaces
+9. **Renders the widget** using PySide6 with custom-painted progress bars, translucent panels, collapsible custom rows, and a modeless Smart TODO dialog
 
 ### Architecture
 
@@ -249,6 +253,7 @@ for the local TODO domain and dialog, with these components:
 | `FetchWorker` | QThread that fetches usage data off the main thread |
 | `UsageBar` | Custom-painted widget for a single progress bar with label, percentage, and countdown |
 | `CodexUsageRow` | Custom-painted summary row backed by live local app-server limits plus local Codex SQLite totals |
+| `OpencodeGoUsageRow` | Compact OpenCode Go 5-hour/weekly/monthly dollar-window utilization with per-window dollars used and reset times |
 | `DeepSeekUsageRow` | Rolling local OpenCode cost plus official current DeepSeek credit, with source disclosure |
 | `LocalAISection` | Compact expandable Ollama models, GPU/VRAM, ComfyUI, and local task-loop status |
 | `SystemMetricsReader`, `SystemMetricsRow` | Three-second CPU/RAM/GPU summary plus monotonic receive/transmit rates for the active lowest-metric UP IPv4 default route(s), read directly from procfs |
