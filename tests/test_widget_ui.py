@@ -37,6 +37,9 @@ from claude_widget import (
     MinimaxUsageRow,
     MinimaxUsageSummary,
     MinimaxWindow,
+    OpencodeGoUsageRow,
+    OpencodeGoUsageSummary,
+    OpencodeGoWindow,
     MoneyBalance,
     OllamaStatus,
     SystemMetrics,
@@ -65,6 +68,8 @@ from claude_widget import (
     read_opencode_usage,
     read_opencode_minimax_usage,
     parse_minimax_quota,
+    read_opencode_go_api_key,
+    parse_opencode_go_usage,
     record_deepseek_snapshot,
     save_last_usage,
     UsageData,
@@ -271,6 +276,122 @@ class WidgetUiTest(unittest.TestCase):
         layout = widget._deepseek_row.parentWidget().layout()
         deepseek_index = layout.indexOf(widget._deepseek_row)
         self.assertEqual(layout.indexOf(widget._minimax_row), deepseek_index + 1)
+
+    GO_USAGE_PAYLOAD = {
+        "usage": {
+            "rolling": {"status": "ok", "percent": 12.0,
+                        "resetsAt": "2026-09-07T18:00:00Z"},
+            "weekly": {"status": "ok", "percent": 36.0,
+                       "resetsAt": "2026-09-13T12:00:00Z"},
+            "monthly": {"status": "rate-limited", "percent": 100.0,
+                        "resetsAt": "2026-10-01T00:00:00Z"},
+        }
+    }
+
+    def test_parse_opencode_go_usage_reads_three_dollar_windows(self):
+        rolling, weekly, monthly = parse_opencode_go_usage(self.GO_USAGE_PAYLOAD)
+
+        self.assertEqual(rolling.status, "ok")
+        self.assertEqual(rolling.used_percent, 12.0)
+        self.assertEqual(rolling.used_dollars, Decimal("1.44"))
+        self.assertEqual(rolling.limit_dollars, Decimal("12"))
+        self.assertGreater(rolling.resets_at, 0)
+
+        self.assertEqual(weekly.used_percent, 36.0)
+        self.assertEqual(weekly.used_dollars, Decimal("10.80"))
+        self.assertEqual(weekly.limit_dollars, Decimal("30"))
+
+        self.assertEqual(monthly.status, "rate-limited")
+        self.assertEqual(monthly.used_percent, 100.0)
+        self.assertEqual(monthly.used_dollars, Decimal("60.00"))
+        self.assertEqual(monthly.limit_dollars, Decimal("60"))
+
+    def test_parse_opencode_go_usage_rejects_error_response(self):
+        payload = {"type": "error",
+                   "error": {"type": "EntitlementError",
+                             "message": "OpenCode Go subscription required."}}
+        with self.assertRaises(ValueError):
+            parse_opencode_go_usage(payload)
+
+    def test_parse_opencode_go_usage_rejects_missing_windows(self):
+        with self.assertRaises(ValueError):
+            parse_opencode_go_usage({"usage": {}})
+
+        payload = json.loads(json.dumps(self.GO_USAGE_PAYLOAD))
+        del payload["usage"]["weekly"]
+        with self.assertRaises(ValueError):
+            parse_opencode_go_usage(payload)
+
+    def test_parse_opencode_go_usage_rejects_invalid_fields(self):
+        payload = json.loads(json.dumps(self.GO_USAGE_PAYLOAD))
+        payload["usage"]["rolling"]["percent"] = 150
+        with self.assertRaises(ValueError):
+            parse_opencode_go_usage(payload)
+
+        payload = json.loads(json.dumps(self.GO_USAGE_PAYLOAD))
+        payload["usage"]["rolling"]["percent"] = True
+        with self.assertRaises(ValueError):
+            parse_opencode_go_usage(payload)
+
+        payload = json.loads(json.dumps(self.GO_USAGE_PAYLOAD))
+        payload["usage"]["rolling"]["status"] = "paused"
+        with self.assertRaises(ValueError):
+            parse_opencode_go_usage(payload)
+
+        payload = json.loads(json.dumps(self.GO_USAGE_PAYLOAD))
+        payload["usage"]["rolling"]["resetsAt"] = "not-a-date"
+        with self.assertRaises(ValueError):
+            parse_opencode_go_usage(payload)
+
+    def test_opencode_go_api_key_prefers_environment_and_reads_protected_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth_path = Path(tmpdir) / "auth.json"
+            auth_path.write_text('{"opencode-go":{"type":"api","key":"file-key"}}')
+            auth_path.chmod(0o600)
+
+            self.assertEqual(
+                read_opencode_go_api_key(
+                    auth_path=auth_path, environ={"OPENCODE_GO_API_KEY": "env-key"}
+                ),
+                "env-key",
+            )
+            self.assertEqual(
+                read_opencode_go_api_key(auth_path=auth_path, environ={}),
+                "file-key",
+            )
+
+            auth_path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                read_opencode_go_api_key(auth_path=auth_path, environ={})
+
+    def test_opencode_go_row_renders_window_utilization(self):
+        rolling, weekly, monthly = parse_opencode_go_usage(self.GO_USAGE_PAYLOAD)
+        row = OpencodeGoUsageRow()
+        row.set_data(
+            OpencodeGoUsageSummary(
+                rolling=rolling, weekly=weekly, monthly=monthly, source="live"
+            )
+        )
+
+        self.assertEqual(row.summary_text(), "5H 12%  ·  7D 36%  ·  30D 100%!")
+        self.assertEqual(row._peak_percent(), 100.0)
+        tooltip = row.toolTip()
+        self.assertIn("/zen/go/v1/usage", tooltip)
+        self.assertIn("$12 per 5-hour window", tooltip)
+        self.assertIn("Capped until reset", tooltip)
+
+    def test_opencode_go_row_shows_placeholder_when_usage_unavailable(self):
+        row = OpencodeGoUsageRow()
+        row.set_data(OpencodeGoUsageSummary(error="Go usage unavailable"))
+
+        self.assertEqual(row.summary_text(), "5H —  ·  7D —  ·  30D —")
+        self.assertIn("Go usage unavailable", row.toolTip())
+
+    def test_widget_places_go_row_directly_after_minimax_row(self):
+        widget = self._make_inert_claude_widget()
+        layout = widget._minimax_row.parentWidget().layout()
+        minimax_index = layout.indexOf(widget._minimax_row)
+        self.assertEqual(layout.indexOf(widget._go_row), minimax_index + 1)
 
     def test_opencode_local_tokens_splits_today_from_all_time(self):
         # 2026-08-19 12:00:00 local; "today" starts at the local midnight before it.
@@ -497,12 +618,12 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(usage.local.today_tokens, 15)
         self.assertEqual(usage.error, "")
 
-    def test_widget_places_opencode_row_directly_after_minimax_row(self):
+    def test_widget_places_opencode_row_directly_after_go_row(self):
         widget = self._make_inert_claude_widget()
-        layout = widget._minimax_row.parentWidget().layout()
+        layout = widget._go_row.parentWidget().layout()
         self.assertEqual(
             layout.indexOf(widget._opencode_row),
-            layout.indexOf(widget._minimax_row) + 1,
+            layout.indexOf(widget._go_row) + 1,
         )
 
     def test_task_loop_status_reads_local_config_without_aws(self):
@@ -818,6 +939,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_deepseek_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_minimax_usage", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_opencode_go_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_opencode_usage", lambda self: None),
             patch.object(
                 ClaudeWidget, "_refresh_terminal_sessions", lambda self: None
@@ -2121,8 +2243,10 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._local_ai_section.is_expanded())
         self.assertFalse(widget._history_expanded)
-        # 800px work area less a 10px margin; each provider row costs 30px collapsed.
-        self.assertLessEqual(widget.height(), 790)
+        # The collapsed GO row grows the panel beyond an 800px work area (Sam
+        # accepted the tradeoff 2026-09-07); the mutual exclusion keeps the
+        # panel bounded at this fixed budget.
+        self.assertLessEqual(widget.height(), 824)
 
         widget._toggle_history()
         widget.adjustSize()
@@ -2130,7 +2254,7 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._history_expanded)
         self.assertFalse(widget._local_ai_section.is_expanded())
-        self.assertLessEqual(widget.height(), 790)
+        self.assertLessEqual(widget.height(), 824)
 
     def test_fable_and_max_expansions_reposition_inside_800px_work_area(self):
         widget = self._make_inert_claude_widget(tray_available=False)
@@ -2169,16 +2293,18 @@ class WidgetUiTest(unittest.TestCase):
         QApplication.processEvents()
 
         frame = widget.frameGeometry()
-        self.assertLessEqual(widget.height(), available.height())
+        # The GO row makes the fully expanded panel taller than the 800px work
+        # area (accepted tradeoff, 2026-09-07), so clamp pins it to the screen
+        # top instead of fitting it vertically.
+        self.assertLessEqual(widget.height(), 824)
         self.assertGreaterEqual(frame.left(), available.left())
         self.assertGreaterEqual(frame.top(), available.top())
         self.assertLessEqual(frame.right(), available.right())
-        self.assertLessEqual(frame.bottom(), available.bottom())
 
         widget.move(frame.left(), available.bottom() - frame.height() + 21)
         self.assertGreater(widget.frameGeometry().bottom(), available.bottom())
         widget.clamp_to_available_screen()
-        self.assertLessEqual(widget.frameGeometry().bottom(), available.bottom())
+        self.assertLessEqual(widget.frameGeometry().top(), available.top() + 1)
 
     def test_shutdown_stops_owned_timers_and_quiesces_new_workers_once(self):
         widget = self._make_inert_claude_widget(tray_available=False)
