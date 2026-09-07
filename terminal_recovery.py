@@ -6,6 +6,7 @@ Arguments, environment, shell history and terminal contents are never read.
 
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import time
@@ -69,6 +70,10 @@ def scan_terminals(proc_root=Path("/proc"), now=None):
             process = _stat(directory / "stat")
             try:
                 process["program"] = Path(os.readlink(directory / "exe")).name
+                # Versioned application installs (e.g. Claude's 2.1.263 binary)
+                # need the process name to make the inventory recognizable.
+                if re.fullmatch(r"v?\d+(?:\.\d+)+(?:[-+].*)?", process["program"]):
+                    process["program"] = process["comm"]
             except OSError:
                 process["program"] = process["comm"]
             try:
@@ -82,8 +87,10 @@ def scan_terminals(proc_root=Path("/proc"), now=None):
             ):
                 continue
             processes[process["pid"]] = process
-        except (OSError, ValueError, IndexError):
+        except (FileNotFoundError, ProcessLookupError):
             continue
+        except (OSError, ValueError, IndexError) as exc:
+            raise OSError(f"Could not read terminal process metadata for PID {directory.name}") from exc
 
     groups = {}
     for process in processes.values():

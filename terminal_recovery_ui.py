@@ -1,6 +1,7 @@
 """Browsable live terminal inventory and retained boot snapshots."""
 
 from datetime import datetime
+import re
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -40,7 +41,10 @@ class TerminalRecoveryDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Terminal recovery")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-        self.resize(960, 620)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else None
+        self.resize(min(960, available.width() - 40) if available else 960,
+                    min(620, available.height() - 60) if available else 620)
         self._entries = []
         self._boots = []
         self._boot_id = ""
@@ -101,6 +105,8 @@ class TerminalRecoveryDialog(QDialog):
         self._table.setColumnWidth(0, 85)
         self._table.setColumnWidth(1, 130)
         self._table.setColumnWidth(3, 155)
+        self._table.setColumnWidth(4, 110)
+        self._table.header().setStretchLastSection(False)
         self._table.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self._table.itemSelectionChanged.connect(self._selection_changed)
         splitter.addWidget(self._table)
@@ -148,6 +154,7 @@ class TerminalRecoveryDialog(QDialog):
         previous = self._previous_boot()
         if mode == 0:
             rows = [r for r in self._entries if r["live"]]
+            rows.sort(key=lambda r: [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", r["tty"])])
             explanation = "Terminals present at the latest successful scan."
         elif mode == 1:
             rows = [r for r in self._entries if previous and r["boot_id"] == previous["boot_id"] and r["at_boot_end"]]

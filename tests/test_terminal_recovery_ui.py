@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from claude_widget import ClaudeWidget
 from terminal_recovery import TerminalRecoveryStore
@@ -118,3 +118,18 @@ def test_unwritable_store_does_not_crash_widget_and_retries(app):
     assert factory.call_count == 2
     assert "recording error" in fake._tabs_panel._recovery_button.text()
     assert "permission denied" in fake._tabs_panel._recovery_button.toolTip()
+
+
+def test_tray_hide_hides_modeless_recovery_dialog(app):
+    parent = QWidget()
+    dialog = TerminalRecoveryDialog(parent)
+    parent.show()
+    dialog.show()
+    fake = SimpleNamespace(_tray=object(), _recovery_dialog=dialog,
+                           _hide_tabs_panel=Mock(), _restore_sliver=QWidget(),
+                           hide=parent.hide)
+    assert dialog.isVisible()
+    ClaudeWidget.hide_to_tray(fake)
+    assert not dialog.isVisible()
+    assert not parent.isVisible()
+    parent.close()

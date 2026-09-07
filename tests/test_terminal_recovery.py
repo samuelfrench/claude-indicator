@@ -81,11 +81,29 @@ def test_scan_excludes_other_users(proc_root, monkeypatch):
     assert scan_terminals(proc_root) == []
 
 
+def test_versioned_executable_keeps_recognizable_program_name(proc_root):
+    process = proc(proc_root, 100, "claude", tty=os.makedev(136, 2))
+    (process / "exe").symlink_to("/home/user/.local/share/claude/versions/2.1.263")
+    assert scan_terminals(proc_root)[0]["programs"] == ["claude"]
+
+
 def test_unreadable_proc_or_boot_is_an_error(tmp_path, proc_root):
     with pytest.raises(OSError):
         scan_terminals(tmp_path / "missing")
     (proc_root / "sys/kernel/random/boot_id").write_text("")
     with pytest.raises(OSError, match="boot identity"):
+        scan_terminals(proc_root)
+
+
+def test_required_metadata_permission_error_is_not_an_empty_scan(proc_root, monkeypatch):
+    proc(proc_root, 100, "bash", tty=os.makedev(136, 2))
+    read_text = Path.read_text
+    def denied(path, *args, **kwargs):
+        if path == proc_root / "100/stat":
+            raise PermissionError("cannot read stat")
+        return read_text(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(OSError, match="PID 100"):
         scan_terminals(proc_root)
 
 

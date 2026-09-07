@@ -8152,6 +8152,8 @@ class ClaudeWidget(QWidget):
     def hide_to_tray(self):
         if self._tray is None:
             return
+        if self._recovery_dialog is not None:
+            self._recovery_dialog.hide()
         self._hide_tabs_panel()
         self._restore_sliver.hide()
         self.hide()
