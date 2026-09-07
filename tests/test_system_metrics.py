@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_widget import (
+    DiskMetrics,
     SystemMetricsReader,
     _lowest_metric_default_interfaces,
     _parse_net_dev_bytes,
@@ -246,6 +247,257 @@ class SystemMetricsNetworkReaderTest(unittest.TestCase):
         self._write(routes, {"eth0": (400, 500)})
         recovered = reader.read()
         self.assertEqual((recovered.net_rx_bps, recovered.net_tx_bps), (100.0, 100.0))
+
+
+def diskstats_line(name: str, *, sectors_read=0, sectors_written=0, io_ticks=0) -> str:
+    return (
+        f"   8       0 {name} 10 0 {sectors_read} 5 20 0 {sectors_written} 7 0 "
+        f"{io_ticks} 12 0 0 0 0 0 0\n"
+    )
+
+
+class FakeStatvfs:
+    def __init__(self, frsize, blocks, bfree, bavail):
+        self.f_frsize = frsize
+        self.f_blocks = blocks
+        self.f_bfree = bfree
+        self.f_bavail = bavail
+
+
+class SystemMetricsDiskReaderTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.proc = root / "proc"
+        self.sys = root / "sys"
+        (self.proc / "net").mkdir(parents=True)
+        (self.sys / "block").mkdir(parents=True)
+        (self.proc / "stat").write_text("cpu  1 0 1 8 0 0 0 0\n")
+        (self.proc / "meminfo").write_text(
+            "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n"
+        )
+        (self.proc / "net" / "route").write_text(ROUTE_HEADER)
+        (self.proc / "net" / "dev").write_text(dev_text({}))
+        (self.proc / "mounts").write_text("")
+        self.clock = ManualClock()
+        self.statvfs_results: dict[str, FakeStatvfs] = {}
+        self.statvfs_calls: list[str] = []
+
+    def _add_block(
+        self,
+        name: str,
+        *,
+        physical=True,
+        rotational=False,
+        size_sectors=1000,
+        model="",
+        partitions=(),
+        hidden=False,
+    ):
+        block = self.sys / "block" / name
+        block.mkdir()
+        (block / "size").write_text(f"{size_sectors}\n")
+        (block / "queue").mkdir()
+        (block / "queue" / "rotational").write_text("1\n" if rotational else "0\n")
+        (block / "hidden").write_text("1\n" if hidden else "0\n")
+        if physical:
+            (block / "device").mkdir()
+            (block / "device" / "model").write_text(f"{model}\n")
+        for partition in partitions:
+            (block / partition).mkdir()
+
+    def _write_diskstats(self, *lines: str):
+        (self.proc / "diskstats").write_text("".join(lines))
+
+    def _statvfs(self, path):
+        self.statvfs_calls.append(path)
+        result = self.statvfs_results.get(path)
+        if result is None:
+            raise OSError("no such filesystem")
+        return result
+
+    def _reader(self):
+        with patch("claude_widget.subprocess.run", side_effect=FileNotFoundError):
+            return SystemMetricsReader(
+                proc_root=self.proc,
+                sys_root=self.sys,
+                monotonic=self.clock,
+                statvfs=self._statvfs,
+            )
+
+    def test_discovers_only_physical_unhidden_disks_sorted_by_name(self):
+        self._add_block("sda", rotational=True, size_sectors=1953525168, model="WDC WD10EZEX")
+        self._add_block("nvme0n1", size_sectors=3907029168, model="WD_BLACK SN7100")
+        self._add_block("loop0", physical=False)
+        self._add_block("zram0", physical=False)
+        self._add_block("sdz", hidden=True)
+        self._write_diskstats(
+            diskstats_line("sda", sectors_read=100),
+            diskstats_line("nvme0n1", sectors_read=200),
+            diskstats_line("loop0", sectors_read=300),
+        )
+        reader = self._reader()
+
+        metrics = reader.read()
+
+        self.assertEqual([disk.name for disk in metrics.disks], ["nvme0n1", "sda"])
+        nvme, sda = metrics.disks
+        self.assertIsInstance(nvme, DiskMetrics)
+        self.assertEqual(nvme.model, "WD_BLACK SN7100")
+        self.assertFalse(nvme.rotational)
+        self.assertEqual(nvme.size_bytes, 3907029168 * 512)
+        self.assertTrue(sda.rotational)
+        self.assertEqual(sda.model, "WDC WD10EZEX")
+        self.assertEqual(sda.size_bytes, 1953525168 * 512)
+        self.assertEqual(metrics.disk_error, "")
+
+    def test_first_sample_is_zero_then_rates_and_busy_use_elapsed_time(self):
+        self._add_block("sda")
+        self._write_diskstats(
+            diskstats_line("sda", sectors_read=1000, sectors_written=2000, io_ticks=500)
+        )
+        reader = self._reader()
+
+        first = reader.read()
+        self.assertEqual(
+            (first.disks[0].read_bps, first.disks[0].write_bps, first.disks[0].busy_pct),
+            (0.0, 0.0, 0.0),
+        )
+
+        self.clock.value = 12.0
+        self._write_diskstats(
+            diskstats_line("sda", sectors_read=1400, sectors_written=2100, io_ticks=1500)
+        )
+        second = reader.read()
+
+        disk = second.disks[0]
+        self.assertEqual(disk.read_bps, 400 * 512 / 2)
+        self.assertEqual(disk.write_bps, 100 * 512 / 2)
+        self.assertEqual(disk.busy_pct, 50.0)
+
+    def test_busy_percent_is_clamped_and_counter_reset_rebaselines_only_that_disk(self):
+        self._add_block("sda")
+        self._add_block("sdb")
+        self._write_diskstats(
+            diskstats_line("sda", sectors_read=1000, io_ticks=1000),
+            diskstats_line("sdb", sectors_read=1000, io_ticks=1000),
+        )
+        reader = self._reader()
+        reader.read()
+
+        self.clock.value = 11.0
+        self._write_diskstats(
+            diskstats_line("sda", sectors_read=10, io_ticks=5),
+            diskstats_line("sdb", sectors_read=2024, io_ticks=2100),
+        )
+        metrics = reader.read()
+
+        by_name = {disk.name: disk for disk in metrics.disks}
+        self.assertEqual((by_name["sda"].read_bps, by_name["sda"].busy_pct), (0.0, 0.0))
+        self.assertEqual(by_name["sdb"].read_bps, 1024 * 512)
+        self.assertEqual(by_name["sdb"].busy_pct, 100.0)
+
+        self.clock.value = 13.0
+        self._write_diskstats(
+            diskstats_line("sda", sectors_read=210, io_ticks=205),
+            diskstats_line("sdb", sectors_read=2024, io_ticks=2100),
+        )
+        after = {disk.name: disk for disk in reader.read().disks}
+        self.assertEqual(after["sda"].read_bps, 100 * 512)
+        self.assertEqual(after["sda"].busy_pct, 10.0)
+        self.assertEqual((after["sdb"].read_bps, after["sdb"].busy_pct), (0.0, 0.0))
+
+    def test_filesystem_usage_sums_each_disk_partition_once(self):
+        self._add_block("sda", partitions=("sda1",))
+        self._add_block("nvme0n1", partitions=("nvme0n1p1", "nvme0n1p2"))
+        self._add_block("nvme1n1")
+        self._write_diskstats(
+            diskstats_line("sda"), diskstats_line("nvme0n1"), diskstats_line("nvme1n1")
+        )
+        (self.proc / "mounts").write_text(
+            "/dev/nvme0n1p2 / ext4 rw 0 0\n"
+            "/dev/loop0 /snap/core 0 squashfs ro 0 0\n"
+            "/dev/nvme0n1p1 /boot/efi vfat rw 0 0\n"
+            "/dev/nvme0n1p2 /mnt/bind ext4 rw 0 0\n"
+            "/dev/sda1 /media/sam/HDD\\040two ext4 rw 0 0\n"
+            "/dev/mapper/vg-lv /crypt ext4 rw 0 0\n"
+        )
+        self.statvfs_results = {
+            "/": FakeStatvfs(4096, 1000, 400, 300),
+            "/boot/efi": FakeStatvfs(512, 100, 50, 50),
+            "/media/sam/HDD two": FakeStatvfs(4096, 2000, 1000, 1000),
+        }
+        reader = self._reader()
+
+        by_name = {disk.name: disk for disk in reader.read().disks}
+
+        self.assertEqual(by_name["nvme0n1"].mount_points, ("/", "/boot/efi"))
+        self.assertEqual(
+            by_name["nvme0n1"].fs_used_bytes, 600 * 4096 + 50 * 512
+        )
+        self.assertEqual(
+            by_name["nvme0n1"].fs_total_bytes, 900 * 4096 + 100 * 512
+        )
+        self.assertEqual(by_name["sda"].mount_points, ("/media/sam/HDD two",))
+        self.assertEqual(by_name["sda"].fs_used_bytes, 1000 * 4096)
+        self.assertEqual(by_name["sda"].fs_total_bytes, 2000 * 4096)
+        self.assertAlmostEqual(by_name["sda"].fs_used_pct, 50.0)
+        self.assertEqual(by_name["nvme1n1"].mount_points, ())
+        self.assertIsNone(by_name["nvme1n1"].fs_used_pct)
+        self.assertEqual(self.statvfs_calls.count("/"), 1)
+
+    def test_failed_statvfs_leaves_disk_without_usage_not_crashing(self):
+        self._add_block("sda", partitions=("sda1",))
+        self._write_diskstats(diskstats_line("sda"))
+        (self.proc / "mounts").write_text("/dev/sda1 /gone ext4 rw 0 0\n")
+        reader = self._reader()
+
+        disk = reader.read().disks[0]
+
+        self.assertEqual(disk.mount_points, ("/gone",))
+        self.assertIsNone(disk.fs_used_pct)
+
+    def test_missing_diskstats_reports_error_and_clears_baseline(self):
+        self._add_block("sda")
+        self._write_diskstats(diskstats_line("sda", sectors_read=1000, io_ticks=100))
+        reader = self._reader()
+        reader.read()
+
+        self.clock.value = 12.0
+        (self.proc / "diskstats").unlink()
+        broken = reader.read()
+        self.assertEqual(broken.disks, ())
+        self.assertEqual(broken.disk_error, "diskstats-read")
+
+        self.clock.value = 14.0
+        self._write_diskstats(diskstats_line("sda", sectors_read=9000, io_ticks=1900))
+        recovered = reader.read()
+        self.assertEqual(recovered.disk_error, "")
+        self.assertEqual(
+            (recovered.disks[0].read_bps, recovered.disks[0].busy_pct), (0.0, 0.0)
+        )
+
+    def test_disk_missing_from_diskstats_or_block_dir_is_skipped(self):
+        self._add_block("sda")
+        self._add_block("sdb")
+        self._write_diskstats(diskstats_line("sda"))
+        reader = self._reader()
+
+        metrics = reader.read()
+
+        self.assertEqual([disk.name for disk in metrics.disks], ["sda"])
+        self.assertEqual(metrics.disk_error, "")
+
+    def test_no_block_dir_is_honest_and_empty(self):
+        (self.sys / "block").rmdir()
+        self._write_diskstats(diskstats_line("sda"))
+        reader = self._reader()
+
+        metrics = reader.read()
+
+        self.assertEqual(metrics.disks, ())
+        self.assertEqual(metrics.disk_error, "block-read")
 
 
 class NetworkRateFormatterTest(unittest.TestCase):

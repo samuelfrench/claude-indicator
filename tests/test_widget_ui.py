@@ -42,6 +42,7 @@ from claude_widget import (
     OpencodeGoWindow,
     MoneyBalance,
     OllamaStatus,
+    DiskMetrics,
     SystemMetrics,
     SystemMetricsRow,
     TaskLoopInfo,
@@ -2099,6 +2100,61 @@ class WidgetUiTest(unittest.TestCase):
         row.mousePressEvent(Event())
         self.assertEqual(row.height(), 110)
         row.grab()  # exercise the explicit GPU-temperature and NET paint rows
+
+    def test_system_metrics_row_adds_one_bar_row_per_physical_disk(self):
+        row = SystemMetricsRow()
+        row.setFixedWidth(340)
+        disks = (
+            DiskMetrics(
+                name="nvme0n1",
+                model="WD_BLACK SN7100 2TB",
+                size_bytes=2 * 1000**4,
+                busy_pct=12.5,
+                read_bps=85 * 1024,
+                write_bps=1.2 * 1024**2,
+                fs_used_bytes=450 * 1024**3,
+                fs_total_bytes=1000 * 1024**3,
+                mount_points=("/", "/boot/efi"),
+            ),
+            DiskMetrics(
+                name="sda",
+                model="WDC WD10EZEX",
+                rotational=True,
+                size_bytes=1000**4,
+                busy_pct=100,
+            ),
+        )
+        metrics = SystemMetrics(
+            gpu_available=True, net_available=True, disks=disks
+        )
+        row.set_data(metrics)
+
+        self.assertEqual(row.height(), 22)
+        self.assertEqual(
+            SystemMetricsRow._disk_detail(disks[0]), "R85K/s W1.2M/s · 45%"
+        )
+        self.assertEqual(SystemMetricsRow._disk_detail(disks[1]), "R0B/s W0B/s · —")
+        tooltip = row.toolTip()
+        self.assertIn("nvme0n1: SSD WD_BLACK SN7100 2TB 2.0 TB", tooltip)
+        self.assertIn("busy 12%", tooltip)
+        self.assertIn("used 450/1000 GiB (45%)", tooltip)
+        self.assertIn("mounted at /, /boot/efi", tooltip)
+        self.assertIn("sda: HDD WDC WD10EZEX 1.0 TB", tooltip)
+        self.assertIn("not mounted", tooltip)
+        self.assertIn("/proc/diskstats", tooltip)
+
+        class Event:
+            def accept(self):
+                pass
+
+        row.mousePressEvent(Event())
+        # CPU + RAM + GPU + two disks + NET, 22px each under the 22px header.
+        self.assertEqual(row.height(), 22 + 22 * 6)
+        row.grab()
+
+        row.set_data(SystemMetrics(gpu_available=False, disk_error="diskstats-read"))
+        self.assertEqual(row.height(), 22 + 22 * 3)
+        self.assertIn("Disks unavailable: /proc/diskstats could not be read", row.toolTip())
 
     def test_system_metrics_collapsed_layout_fits_panel_with_all_signals(self):
         row = SystemMetricsRow()

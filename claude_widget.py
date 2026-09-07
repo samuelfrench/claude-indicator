@@ -438,6 +438,32 @@ class CronJobInfo:
         return f"next {int(remaining // 86400)}d"
 
 
+@dataclass(frozen=True)
+class DiskMetrics:
+    """One physical block device: activity, throughput and filesystem fill."""
+
+    name: str
+    model: str = ""
+    rotational: bool = False
+    size_bytes: int = 0
+    busy_pct: float = 0.0
+    read_bps: float = 0.0
+    write_bps: float = 0.0
+    fs_used_bytes: int = 0
+    fs_total_bytes: int = 0
+    mount_points: tuple[str, ...] = ()
+
+    @property
+    def fs_used_pct(self) -> float | None:
+        if self.fs_total_bytes <= 0:
+            return None
+        return min(100.0, self.fs_used_bytes / self.fs_total_bytes * 100)
+
+    @property
+    def kind(self) -> str:
+        return "HDD" if self.rotational else "SSD"
+
+
 @dataclass
 class SystemMetrics:
     cpu_pct: float = 0.0
@@ -453,6 +479,8 @@ class SystemMetrics:
     net_interfaces: tuple[str, ...] = ()
     net_available: bool = False
     net_error: str = ""
+    disks: tuple[DiskMetrics, ...] = ()
+    disk_error: str = ""
 
 
 @dataclass
@@ -710,6 +738,48 @@ def _parse_net_dev_bytes(dev_text: str) -> dict[str, tuple[int, int]]:
     return counters
 
 
+def _parse_diskstats(text: str) -> dict[str, tuple[int, int, int]]:
+    """Parse device -> (sectors read, sectors written, io_ticks ms)."""
+    counters: dict[str, tuple[int, int, int]] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 14:
+            continue
+        try:
+            sectors_read = int(fields[5])
+            sectors_written = int(fields[9])
+            io_ticks = int(fields[12])
+        except ValueError:
+            continue
+        if min(sectors_read, sectors_written, io_ticks) >= 0:
+            counters[fields[2]] = (sectors_read, sectors_written, io_ticks)
+    return counters
+
+
+def _parse_mount_sources(text: str) -> list[tuple[str, str]]:
+    """Parse /proc/mounts into (device basename, mount point) pairs.
+
+    Only plain ``/dev/<name>`` sources are kept (mapper/LVM/LUKS volumes are
+    not attributed to a physical disk); octal escapes in mount points are
+    decoded so ``\\040`` becomes a space.
+    """
+    def unescape(value: str) -> str:
+        return re.sub(
+            r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value
+        )
+
+    pairs: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or not fields[0].startswith("/dev/"):
+            continue
+        source = fields[0][len("/dev/"):]
+        if not source or "/" in source:
+            continue
+        pairs.append((source, unescape(fields[1])))
+    return pairs
+
+
 def format_network_rate(bytes_per_second: float | None, *, compact=False) -> str:
     """Format a byte rate with stable binary-unit thresholds."""
     if bytes_per_second is None:
@@ -749,11 +819,18 @@ class SystemMetricsReader:
         self,
         *,
         proc_root: Path = Path("/proc"),
+        sys_root: Path = Path("/sys"),
         monotonic=time.monotonic,
+        statvfs=os.statvfs,
     ):
         self._proc_root = Path(proc_root)
+        self._sys_root = Path(sys_root)
         self._monotonic = monotonic
+        self._statvfs = statvfs
         self._prev_cpu: list[int] | None = None
+        self._prev_disks: (
+            tuple[dict[str, tuple[int, int, int]], float] | None
+        ) = None
         self._prev_network: (
             tuple[tuple[str, ...], dict[str, tuple[int, int]], float] | None
         ) = None
@@ -849,6 +926,141 @@ class SystemMetricsReader:
         metrics.net_rx_bps = received_delta / elapsed
         metrics.net_tx_bps = transmitted_delta / elapsed
 
+    def _physical_disks(self) -> list[tuple[str, Path]]:
+        """Physical, unhidden block devices from sysfs, sorted by name."""
+        block_root = self._sys_root / "block"
+        disks: list[tuple[str, Path]] = []
+        for entry in sorted(block_root.iterdir(), key=lambda path: path.name):
+            if not (entry / "device").exists():
+                continue  # loop, ram, zram, dm-*, md* have no backing device
+            try:
+                hidden = (entry / "hidden").read_text().strip() == "1"
+            except (OSError, UnicodeError):
+                hidden = False
+            if hidden:
+                continue
+            disks.append((entry.name, entry))
+        return disks
+
+    @staticmethod
+    def _read_sysfs_text(path: Path) -> str:
+        try:
+            return path.read_text().strip()
+        except (OSError, UnicodeError):
+            return ""
+
+    def _filesystem_usage(
+        self, name: str, block_path: Path, mounts: list[tuple[str, str]]
+    ) -> tuple[int, int, tuple[str, ...]]:
+        """Sum df-style used/total bytes over the disk's mounted volumes."""
+        partitions = {name}
+        try:
+            # sysfs lists partitions as child directories named after the disk
+            # (sda1, nvme0n1p2); the whole-disk device can also carry a filesystem.
+            partitions.update(
+                child.name
+                for child in block_path.iterdir()
+                if child.name != name and child.name.startswith(name) and child.is_dir()
+            )
+        except OSError:
+            pass
+        used = total = 0
+        mount_points: list[str] = []
+        seen_sources: set[str] = set()
+        for source, mount_point in mounts:
+            if source not in partitions or source in seen_sources:
+                continue
+            seen_sources.add(source)
+            mount_points.append(mount_point)
+            try:
+                stats = self._statvfs(mount_point)
+                frsize = int(stats.f_frsize)
+                blocks = int(stats.f_blocks)
+                bfree = int(stats.f_bfree)
+                bavail = int(stats.f_bavail)
+            except (OSError, AttributeError, TypeError, ValueError):
+                continue
+            if min(frsize, blocks, bfree, bavail) < 0 or blocks < bfree:
+                continue
+            fs_used = (blocks - bfree) * frsize
+            used += fs_used
+            total += fs_used + bavail * frsize
+        return used, total, tuple(mount_points)
+
+    def _read_disks(self, metrics: SystemMetrics) -> None:
+        try:
+            disks = self._physical_disks()
+        except OSError:
+            metrics.disk_error = "block-read"
+            self._prev_disks = None
+            return
+        try:
+            counters = _parse_diskstats(
+                (self._proc_root / "diskstats").read_text()
+            )
+        except (OSError, UnicodeError):
+            metrics.disk_error = "diskstats-read"
+            self._prev_disks = None
+            return
+        try:
+            mounts = _parse_mount_sources((self._proc_root / "mounts").read_text())
+        except (OSError, UnicodeError):
+            mounts = []
+        try:
+            observed_at = float(self._monotonic())
+            if not math.isfinite(observed_at):
+                raise ValueError
+        except (OSError, TypeError, ValueError):
+            metrics.disk_error = "clock-read"
+            self._prev_disks = None
+            return
+
+        previous = self._prev_disks
+        elapsed = observed_at - previous[1] if previous else 0.0
+        current: dict[str, tuple[int, int, int]] = {}
+        results: list[DiskMetrics] = []
+        for name, block_path in disks:
+            stats = counters.get(name)
+            if stats is None:
+                continue
+            current[name] = stats
+            read_bps = write_bps = busy_pct = 0.0
+            baseline = previous[0].get(name) if previous else None
+            if baseline is not None and elapsed > 0 and all(
+                now >= before for now, before in zip(stats, baseline)
+            ):
+                read_bps = (stats[0] - baseline[0]) * 512 / elapsed
+                write_bps = (stats[1] - baseline[1]) * 512 / elapsed
+                busy_pct = min(
+                    100.0, (stats[2] - baseline[2]) / (elapsed * 1000) * 100
+                )
+            try:
+                size_bytes = int(self._read_sysfs_text(block_path / "size")) * 512
+            except ValueError:
+                size_bytes = 0
+            used, total, mount_points = self._filesystem_usage(
+                name, block_path, mounts
+            )
+            results.append(
+                DiskMetrics(
+                    name=name,
+                    model=self._read_sysfs_text(block_path / "device" / "model"),
+                    rotational=(
+                        self._read_sysfs_text(block_path / "queue" / "rotational")
+                        == "1"
+                    ),
+                    size_bytes=size_bytes,
+                    busy_pct=busy_pct,
+                    read_bps=read_bps,
+                    write_bps=write_bps,
+                    fs_used_bytes=used,
+                    fs_total_bytes=total,
+                    mount_points=mount_points,
+                )
+            )
+        self._prev_disks = (current, observed_at)
+        metrics.disks = tuple(results)
+
     def read(self) -> SystemMetrics:
         m = SystemMetrics()
 
@@ -886,6 +1098,9 @@ class SystemMetricsReader:
         # Network. The first sample and every route/counter reset intentionally
         # report zero so a stale baseline can never become a visible spike.
         self._read_network(m)
+
+        # Disks share the network rules: first sample and counter resets are zero.
+        self._read_disks(m)
 
         # GPU
         m.gpu_available = self._gpu_available
@@ -7031,8 +7246,8 @@ class SystemMetricsRow(QWidget):
 
     def set_data(self, metrics: SystemMetrics):
         self._metrics = metrics
-        eh = self._COLLAPSED_H + 22 * (4 if metrics.gpu_available else 3)
-        self._EXPANDED_H = eh
+        detail_rows = (3 if metrics.gpu_available else 2) + len(metrics.disks) + 1
+        self._EXPANDED_H = self._COLLAPSED_H + 22 * detail_rows
         if self._expanded:
             self.setFixedHeight(self._EXPANDED_H)
         self._update_network_tooltip(metrics)
@@ -7052,6 +7267,49 @@ class SystemMetricsRow(QWidget):
             f"↓ {format_network_rate(metrics.net_rx_bps)}  "
             f"↑ {format_network_rate(metrics.net_tx_bps)}"
         )
+
+    @staticmethod
+    def _disk_detail(disk: DiskMetrics) -> str:
+        used = disk.fs_used_pct
+        used_text = "—" if used is None else f"{used:.0f}%"
+        return (
+            f"R{format_network_rate(disk.read_bps, compact=True)} "
+            f"W{format_network_rate(disk.write_bps, compact=True)} · {used_text}"
+        )
+
+    @staticmethod
+    def _disk_tooltip(metrics: SystemMetrics) -> str:
+        if metrics.disk_error == "diskstats-read":
+            return "Disks unavailable: /proc/diskstats could not be read"
+        if metrics.disk_error == "block-read":
+            return "Disks unavailable: /sys/block could not be listed"
+        if metrics.disk_error == "clock-read":
+            return "Disks unavailable: monotonic sample clock could not be read"
+        if not metrics.disks:
+            return "Disks: no physical block devices found under /sys/block"
+        lines = ["Disks (busy = time with I/O in flight; used = df-style fill):"]
+        for disk in metrics.disks:
+            size = f" {disk.size_bytes / 1000**4:.1f} TB" if disk.size_bytes else ""
+            model = f" {disk.model}" if disk.model else ""
+            used = disk.fs_used_pct
+            if used is None:
+                fill = "not mounted" if not disk.mount_points else "usage unavailable"
+            else:
+                fill = (
+                    f"used {disk.fs_used_bytes / 1024**3:.0f}/"
+                    f"{disk.fs_total_bytes / 1024**3:.0f} GiB ({used:.0f}%)"
+                )
+            mounted = (
+                f"; mounted at {', '.join(disk.mount_points)}"
+                if disk.mount_points
+                else ""
+            )
+            lines.append(
+                f"  {disk.name}: {disk.kind}{model}{size} — busy {disk.busy_pct:.0f}%, "
+                f"read {format_network_rate(disk.read_bps)}, "
+                f"write {format_network_rate(disk.write_bps)}, {fill}{mounted}"
+            )
+        return "\n".join(lines)
 
     def _update_network_tooltip(self, metrics: SystemMetrics) -> None:
         interfaces = ", ".join(metrics.net_interfaces)
@@ -7083,7 +7341,9 @@ class SystemMetricsRow(QWidget):
             status = "Network unavailable: no UP IPv4 default route"
         detail = (
             f"{status}\nUnits: bytes per second (binary KiB/MiB/GiB)\n"
-            "Source: /proc/net/route + /proc/net/dev, sampled every 3 seconds"
+            "Source: /proc/net/route + /proc/net/dev, sampled every 3 seconds\n"
+            f"{self._disk_tooltip(metrics)}\n"
+            "Source: /sys/block + /proc/diskstats + statvfs, sampled every 3 seconds"
         )
         self.setToolTip(detail)
         self.setAccessibleDescription(detail.replace("\n", "; "))
@@ -7223,11 +7483,6 @@ class SystemMetricsRow(QWidget):
             mem_pct = self._memory_percent(m)
             bar_h = 8
             bar_radius = 4
-            label_w = 32
-            detail_w = 132 if m.gpu_available else 90
-            bar_left = label_w + 4
-            bar_right = w - detail_w - 4
-            bar_w = bar_right - bar_left
 
             rows = [
                 ("CPU", m.cpu_pct, f"{m.cpu_pct:.0f}%"),
@@ -7239,6 +7494,20 @@ class SystemMetricsRow(QWidget):
                     f"{m.gpu_mem_total_gb:.0f}G · {m.gpu_temp}°C"
                 )
                 rows.append(("GPU", m.gpu_pct, gpu_detail))
+            # One bar per physical disk: fill = busy time, detail = R/W · fill.
+            for disk in m.disks:
+                rows.append((disk.name, disk.busy_pct, self._disk_detail(disk)))
+
+            # Long kernel names (nvme0n1) widen the label column; the detail
+            # column takes the widest text so bars never overlap the values.
+            label_w = max(32, max(fm.horizontalAdvance(label) for label, _, _ in rows) + 4)
+            detail_w = max(
+                132 if m.gpu_available else 90,
+                max(fm.horizontalAdvance(detail) for _, _, detail in rows) + 2,
+            )
+            bar_left = label_w + 4
+            bar_right = w - detail_w - 4
+            bar_w = max(bar_h, bar_right - bar_left)
 
             for i, (label, pct, detail) in enumerate(rows):
                 row_y = self._COLLAPSED_H + 22 * i
