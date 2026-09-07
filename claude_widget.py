@@ -56,6 +56,8 @@ from PySide6.QtWidgets import (
 )
 
 from smart_todos import SmartTodoDialog
+from terminal_recovery import TerminalRecoveryStore, scan_terminals
+from terminal_recovery_ui import TerminalRecoveryDialog, local_time
 
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
@@ -5599,6 +5601,7 @@ class TerminalTabsPanel(QWidget):
     navigate_requested = Signal(str)
     close_requested = Signal()
     drag_requested = Signal(QPoint)
+    recovery_requested = Signal()
 
     PANEL_WIDTH = 320
     _CARD_H = 62
@@ -5673,6 +5676,15 @@ class TerminalTabsPanel(QWidget):
         self._cards_layout.setSpacing(4)
         self._scroll.setWidget(self._cards_host)
         outer.addWidget(self._scroll)
+        self._recovery_button = QPushButton("All terminals & recovery")
+        self._recovery_button.setAccessibleName("Open all terminals and recovery history")
+        self._recovery_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._recovery_button.setStyleSheet(
+            "QPushButton { background: #35354d; color: #e0c2a0; border: none;"
+            " border-radius: 4px; padding: 5px; font-size: 11px; }"
+        )
+        self._recovery_button.clicked.connect(self.recovery_requested.emit)
+        outer.addWidget(self._recovery_button)
 
     # -- data ---------------------------------------------------------------
 
@@ -5822,7 +5834,7 @@ class TerminalTabsPanel(QWidget):
 
     def _sync_height(self, session_count: int, group_count: int = 0):
         content = (
-            38 + max(1, session_count) * (self._CARD_H + 4) + group_count * 16
+            68 + max(1, session_count) * (self._CARD_H + 4) + group_count * 16
         )
         available_h = None
         screen = QApplication.primaryScreen()
@@ -7107,7 +7119,13 @@ class ClaudeWidget(QWidget):
         self._terminal_state: dict = {}
         self._parked_sessions, self._session_notes = load_terminal_state()
         self._last_terminal_snapshot: TerminalSessionsSnapshot | None = None
+        self._recovery_store = None
+        self._recovery_dialog = None
+        self._recovery_entries = []
+        self._recovery_boots = []
+        self._recovery_error = ""
         self._tabs_panel = TerminalTabsPanel()
+        self._tabs_panel.recovery_requested.connect(self._show_terminal_recovery)
         self._tabs_panel.parked_toggled.connect(self._on_session_park_toggled)
         self._tabs_panel.note_changed.connect(self._on_session_note_changed)
         self._tabs_panel.navigate_requested.connect(self._on_session_navigate)
@@ -7828,12 +7846,55 @@ class ClaudeWidget(QWidget):
         self.adjustSize()
 
     def _refresh_terminal_sessions(self):
+        self._refresh_terminal_recovery()
         # Synchronous on purpose: one /proc pass with no network, same as the
         # system-metrics reader, so parked toggles never race a worker thread.
         snapshot, self._terminal_state = read_terminal_sessions(
             self._terminal_state, self._parked_sessions
         )
         self._on_terminal_sessions_read(snapshot)
+
+    def _refresh_terminal_recovery(self):
+        error = ""
+        try:
+            if self._recovery_store is None:
+                self._recovery_store = TerminalRecoveryStore()
+            self._recovery_store.capture(scan_terminals())
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            error = str(exc)
+        # Even after a scan/write failure, show whatever was durably saved.
+        if self._recovery_store is not None:
+            try:
+                self._recovery_entries = self._recovery_store.entries()
+                self._recovery_boots = self._recovery_store.boot_snapshots()
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                error = str(exc)
+        if error != self._recovery_error:
+            log_line(f"terminal recovery: {error or 'recording resumed'}")
+        self._recovery_error = error
+        count = sum(row["live"] for row in self._recovery_entries)
+        self._tabs_panel._recovery_button.setText(
+            "Recovery · recording error" if error else f"All terminals & recovery · {count}"
+        )
+        boot_id = self._recovery_store.boot_id if self._recovery_store else ""
+        current = next((b for b in self._recovery_boots if b["boot_id"] == boot_id), None)
+        self._tabs_panel._recovery_button.setToolTip(
+            f"{error}\nLast saved: {local_time(current['captured']) if current else 'not yet'}"
+            if error else "Browse all terminals and saved snapshots from previous boots"
+        )
+        if self._recovery_dialog is not None:
+            self._recovery_dialog.set_data(
+                self._recovery_entries, self._recovery_boots, boot_id, error
+            )
+
+    def _show_terminal_recovery(self):
+        if self._recovery_dialog is None:
+            self._recovery_dialog = TerminalRecoveryDialog(self)
+            self._recovery_dialog.refresh_requested.connect(self._refresh_terminal_recovery)
+        self._refresh_terminal_recovery()
+        self._recovery_dialog.show()
+        self._recovery_dialog.raise_()
+        self._recovery_dialog.activateWindow()
 
     def _on_terminal_sessions_read(self, snapshot: TerminalSessionsSnapshot):
         if not snapshot.error:
@@ -8043,6 +8104,9 @@ class ClaudeWidget(QWidget):
         self._smart_todo_action = QAction("Smart TODOs…", self)
         self._smart_todo_action.triggered.connect(self._show_smart_todos)
         menu.addAction(self._smart_todo_action)
+        recovery_action = QAction("Terminal recovery…", self)
+        recovery_action.triggered.connect(self._show_terminal_recovery)
+        menu.addAction(recovery_action)
         self._show_hide_action = QAction("Show/Hide", self)
         self._show_hide_action.triggered.connect(self._toggle_from_tray)
         menu.addAction(self._show_hide_action)
@@ -8154,6 +8218,8 @@ class ClaudeWidget(QWidget):
         if self._shutdown_started:
             return
         self._shutdown_started = True
+        if self._recovery_dialog is not None:
+            self._recovery_dialog.close()
         self._tabs_panel.hide()
         self._tabs_panel.close()
         self._restore_sliver.hide()

@@ -42,6 +42,31 @@ The widget displays a dark translucent overlay with:
 - Percentage and reset countdown on each bar
 - Last-updated timestamp and manual refresh button
 
+## Terminal recovery
+
+Open **TABS → All terminals & recovery**, or **Terminal recovery…** in the tray
+menu, to browse ordinary shells and running programs as well as agent sessions.
+The **Live** view shows the latest inventory. After a reboot, **Last boot
+snapshot** shows the terminals present at the final successful scan of the
+previous recorded boot. **All saved** also includes terminals that closed earlier.
+Search by directory, program, terminal, or date; select a row to see and copy its
+full recovery details.
+
+The Indicator records the current user's controlling terminals every five seconds
+while running. Each record contains its working directory, program names, terminal
+identity, and first/last observation times. SQLite commits use full synchronous
+durability, and the database is private to your user at
+`~/.local/state/claude-indicator/terminals.sqlite3`. Records survive widget restarts,
+reboots, and later empty scans, with no automatic history expiry. Recording errors
+appear in the panel and recovery window; the last successful save time remains
+visible.
+
+This is a record of running work, not terminal scrollback or process restoration.
+It does not collect command arguments, environment variables, or terminal output,
+and does not restart commands. Recording begins when this version first runs;
+work started or changed after the last five-second scan may be absent after power
+loss. Keep the existing desktop autostart enabled to resume recording on login.
+
 ## Cron Manager behavior
 
 - **What appears**: one collapsed row labeled `CRON JOBS` with a late-job count summary

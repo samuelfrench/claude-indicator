@@ -1045,9 +1045,9 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertEqual(
             [action.text() for action in actions],
-            ["Smart TODOs…", "Show/Hide", "", "Quit"],
+            ["Smart TODOs…", "Terminal recovery…", "Show/Hide", "", "Quit"],
         )
-        self.assertTrue(actions[2].isSeparator())
+        self.assertTrue(actions[3].isSeparator())
 
     def test_smart_todo_tray_has_exact_initial_tooltip(self):
         widget = self._make_inert_claude_widget(tray_available=True)
@@ -1108,13 +1108,13 @@ class WidgetUiTest(unittest.TestCase):
         self.assertFalse(retry_timer.isActive())
         self.assertEqual(
             [action.text() for action in tray.contextMenu().actions()],
-            ["Smart TODOs…", "Show/Hide", "", "Quit"],
+            ["Smart TODOs…", "Terminal recovery…", "Show/Hide", "", "Quit"],
         )
 
         retry_timer.timeout.emit()
 
         self.assertIs(widget._tray, tray)
-        self.assertEqual(len(tray.contextMenu().actions()), 4)
+        self.assertEqual(len(tray.contextMenu().actions()), 5)
 
     def test_repeated_unavailable_tray_retries_log_only_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
