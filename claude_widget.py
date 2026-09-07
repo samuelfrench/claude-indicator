@@ -34,6 +34,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QCursor,
     QDesktopServices,
     QFont,
     QIcon,
@@ -54,6 +55,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSystemTrayIcon,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -8739,7 +8741,11 @@ class ClaudeWidget(QWidget):
 
     def _open_traffic_report(self):
         if not QDesktopServices.openUrl(QUrl(TRAFFIC_REPORT_URL)):
-            self._set_status_text("Could not open browser")
+            QToolTip.showText(
+                QCursor.pos(),
+                f"Could not open Traffic Report.\nOpen {TRAFFIC_REPORT_URL} in your browser.",
+                msecShowTime=5000,
+            )
 
     def _show_smart_todos(self):
         if self._smart_todo_dialog is None:
