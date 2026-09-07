@@ -462,6 +462,10 @@ class DiskMetrics:
         return min(100.0, self.fs_used_bytes / self.fs_total_bytes * 100)
 
     @property
+    def fs_free_bytes(self) -> int:
+        return max(0, self.fs_total_bytes - self.fs_used_bytes)
+
+    @property
     def kind(self) -> str:
         return "HDD" if self.rotational else "SSD"
 
@@ -780,6 +784,24 @@ def _parse_mount_sources(text: str) -> list[tuple[str, str]]:
             continue
         pairs.append((source, unescape(fields[1])))
     return pairs
+
+
+def format_bytes_compact(byte_count: float) -> str:
+    """Format a byte count as a short binary-unit string (550G, 1.5T)."""
+    try:
+        value = float(byte_count)
+    except (TypeError, ValueError):
+        return "—"
+    if value < 0 or not math.isfinite(value):
+        return "—"
+    units = ("B", "K", "M", "G", "T", "P")
+    unit_index = 0
+    while value >= 1023.5 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    if unit_index and value < 9.95:
+        return f"{value:.1f}{units[unit_index]}"
+    return f"{value:.0f}{units[unit_index]}"
 
 
 def format_network_rate(bytes_per_second: float | None, *, compact=False) -> str:
@@ -7272,12 +7294,20 @@ class SystemMetricsRow(QWidget):
 
     @staticmethod
     def _disk_detail(disk: DiskMetrics) -> str:
-        used = disk.fs_used_pct
-        used_text = "—" if used is None else f"{used:.0f}%"
+        if disk.fs_used_pct is None:
+            space = "unmounted"
+        else:
+            space = f"{format_bytes_compact(disk.fs_free_bytes)} free"
         return (
-            f"R{format_network_rate(disk.read_bps, compact=True)} "
-            f"W{format_network_rate(disk.write_bps, compact=True)} · {used_text}"
+            f"{space} · R{format_network_rate(disk.read_bps, compact=True)} "
+            f"W{format_network_rate(disk.write_bps, compact=True)}"
         )
+
+    @staticmethod
+    def _disk_bar_pct(disk: DiskMetrics) -> float:
+        """Bar fill is filesystem usage, so a nearly full disk turns red."""
+        used = disk.fs_used_pct
+        return 0.0 if used is None else used
 
     @staticmethod
     def _disk_tooltip(metrics: SystemMetrics) -> str:
@@ -7289,7 +7319,7 @@ class SystemMetricsRow(QWidget):
             return "Disks unavailable: monotonic sample clock could not be read"
         if not metrics.disks:
             return "Disks: no physical block devices found under /sys/block"
-        lines = ["Disks (busy = time with I/O in flight; used = df-style fill):"]
+        lines = ["Disks (free = df-style available space; busy = time with I/O in flight):"]
         for disk in metrics.disks:
             size = f" {disk.size_bytes / 1000**4:.1f} TB" if disk.size_bytes else ""
             model = f" {disk.model}" if disk.model else ""
@@ -7298,8 +7328,8 @@ class SystemMetricsRow(QWidget):
                 fill = "not mounted" if not disk.mount_points else "usage unavailable"
             else:
                 fill = (
-                    f"used {disk.fs_used_bytes / 1024**3:.0f}/"
-                    f"{disk.fs_total_bytes / 1024**3:.0f} GiB ({used:.0f}%)"
+                    f"{disk.fs_free_bytes / 1024**3:.0f} GiB free of "
+                    f"{disk.fs_total_bytes / 1024**3:.0f} GiB ({used:.0f}% used)"
                 )
             mounted = (
                 f"; mounted at {', '.join(disk.mount_points)}"
@@ -7496,9 +7526,11 @@ class SystemMetricsRow(QWidget):
                     f"{m.gpu_mem_total_gb:.0f}G · {m.gpu_temp}°C"
                 )
                 rows.append(("GPU", m.gpu_pct, gpu_detail))
-            # One bar per physical disk: fill = busy time, detail = R/W · fill.
+            # One bar per physical disk: fill = space used, detail = free · R/W.
             for disk in m.disks:
-                rows.append((disk.name, disk.busy_pct, self._disk_detail(disk)))
+                rows.append(
+                    (disk.name, self._disk_bar_pct(disk), self._disk_detail(disk))
+                )
 
             # Long kernel names (nvme0n1) widen the label column; the detail
             # column takes the widest text so bars never overlap the values.

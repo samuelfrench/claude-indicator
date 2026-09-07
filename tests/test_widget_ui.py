@@ -43,6 +43,7 @@ from claude_widget import (
     MoneyBalance,
     OllamaStatus,
     DiskMetrics,
+    format_bytes_compact,
     SystemMetrics,
     SystemMetricsRow,
     TaskLoopInfo,
@@ -2131,13 +2132,22 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertEqual(row.height(), 22)
         self.assertEqual(
-            SystemMetricsRow._disk_detail(disks[0]), "R85K/s W1.2M/s · 45%"
+            SystemMetricsRow._disk_detail(disks[0]), "550G free · R85K/s W1.2M/s"
         )
-        self.assertEqual(SystemMetricsRow._disk_detail(disks[1]), "R0B/s W0B/s · —")
+        self.assertEqual(
+            SystemMetricsRow._disk_detail(disks[1]), "unmounted · R0B/s W0B/s"
+        )
+        self.assertEqual(SystemMetricsRow._disk_bar_pct(disks[0]), 45.0)
+        self.assertEqual(SystemMetricsRow._disk_bar_pct(disks[1]), 0.0)
+        self.assertEqual(format_bytes_compact(550 * 1024**3), "550G")
+        self.assertEqual(format_bytes_compact(1.5 * 1024**4), "1.5T")
+        self.assertEqual(format_bytes_compact(9.96 * 1024**3), "10G")
+        self.assertEqual(format_bytes_compact(512 * 1024**2), "512M")
+        self.assertEqual(format_bytes_compact(0), "0B")
         tooltip = row.toolTip()
         self.assertIn("nvme0n1: SSD WD_BLACK SN7100 2TB 2.0 TB", tooltip)
         self.assertIn("busy 12%", tooltip)
-        self.assertIn("used 450/1000 GiB (45%)", tooltip)
+        self.assertIn("550 GiB free of 1000 GiB (45% used)", tooltip)
         self.assertIn("mounted at /, /boot/efi", tooltip)
         self.assertIn("sda: HDD WDC WD10EZEX 1.0 TB", tooltip)
         self.assertIn("not mounted", tooltip)
