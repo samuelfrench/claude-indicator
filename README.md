@@ -21,6 +21,7 @@ panel.
 - **Compact system activity** — shows CPU, RAM, GPU, and download/upload byte rates for the active lowest-metric UP IPv4 default-route interface(s); route or counter changes reset the 3-second sample baseline instead of producing a spike
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
+- **Traffic Report shortcut** — opens the local portfolio dashboard in your default browser from the footer or tray menu
 - **Compact terminal selector** — a 320px docked panel groups live Claude/Codex/OpenCode tabs by status, keeps notes and park state, and selects duplicate-project GNOME Terminal tabs by their exact TTY instead of cycling by title; other emulators use best-effort verified title/key navigation
 - **Docked drag and recoverable minimize** — drag either the main widget or the selector header/background to move them together; minimizing hides the main usage panel but leaves the terminal selector and right-edge restore sliver usable, while tray hide hides every surface
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
@@ -42,7 +43,12 @@ The widget displays a dark translucent overlay with:
 - `CRON JOBS` row that collapses to one line and expands to show per-job status and timing
 - A compact `TABS` row that opens the docked terminal-session selector
 - Percentage and reset countdown on each bar
-- Last-updated timestamp and manual refresh button
+- Last-updated timestamp, Traffic Report link, and manual refresh button
+
+Select **Traffic Report** in the footer or tray menu to open
+`http://127.0.0.1:5173/` in your default browser. The footer link supports Tab
+focus and Space activation. The existing local Traffic Report server must be
+running; the shortcut does not start or refresh the report.
 
 ## Terminal recovery
 

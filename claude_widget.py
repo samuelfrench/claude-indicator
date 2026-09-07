@@ -27,12 +27,14 @@ from PySide6.QtCore import (
     QRectF,
     QThread,
     QTimer,
+    QUrl,
     Qt,
     Signal,
 )
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QDesktopServices,
     QFont,
     QIcon,
     QLinearGradient,
@@ -50,6 +52,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -107,6 +110,7 @@ RATE_LIMIT_MIN_BACKOFF_S = 60        # 1 minute after first 429
 RATE_LIMIT_MAX_BACKOFF_S = 32 * 60   # 32 minute cap
 OLLAMA_URL = "http://127.0.0.1:11434"
 COMFYUI_URL = "http://127.0.0.1:8188"
+TRAFFIC_REPORT_URL = "http://127.0.0.1:5173/"
 DEEPSEEK_HISTORY_VERSION = 1
 DEEPSEEK_HISTORY_RETENTION_S = 8 * 24 * 3600
 DEEPSEEK_SNAPSHOT_MAX_AGE_S = 15 * 60
@@ -7683,10 +7687,32 @@ class ClaudeWidget(QWidget):
 
         # Status row
         status_layout = QHBoxLayout()
+        status_layout.setSpacing(2)
         self._status_label = QLabel("Fetching...")
         self._status_label.setStyleSheet("color: #666680; font-size: 10px;")
-        status_layout.addWidget(self._status_label)
-        status_layout.addStretch()
+        self._status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self._status_label.setAccessibleName("Indicator status")
+        status_layout.addWidget(self._status_label, 1)
+
+        self._traffic_report_button = QPushButton("Traffic Report")
+        self._traffic_report_button.setFlat(True)
+        self._traffic_report_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._traffic_report_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._traffic_report_button.setAccessibleName("Open Traffic Report")
+        self._traffic_report_button.setToolTip(
+            f"Open the local traffic dashboard in your browser ({TRAFFIC_REPORT_URL})"
+        )
+        self._traffic_report_button.setStyleSheet(
+            "QPushButton { color: #a9bde8; font-size: 10px;"
+            " text-decoration: underline; background: transparent;"
+            " border: 1px solid transparent; border-radius: 3px; padding: 0 1px; }"
+            "QPushButton:hover { color: #e0eaff; }"
+            "QPushButton:focus { border-color: #a9bde8; }"
+        )
+        self._traffic_report_button.clicked.connect(self._open_traffic_report)
+        status_layout.addWidget(self._traffic_report_button)
 
         refresh_btn = QLabel("⟳")
         refresh_btn.setStyleSheet(
@@ -7930,10 +7956,10 @@ class ClaudeWidget(QWidget):
                     delay_str = f"{delay // 60}m {delay % 60:02d}s"
                 else:
                     delay_str = f"{delay}s"
-                self._status_label.setText(f"Rate limited · retry in {delay_str}")
+                self._set_status_text(f"Rate limited · retry in {delay_str}")
                 self._status_label.setStyleSheet("color: #f59e0b; font-size: 10px;")
             else:
-                self._status_label.setText(data.error)
+                self._set_status_text(data.error)
                 self._status_label.setStyleSheet("color: #ef4444; font-size: 10px;")
             return
 
@@ -7962,13 +7988,20 @@ class ClaudeWidget(QWidget):
             else:
                 delay_str = f"{delay}s"
             age = self._format_age(now - data.fetched_at) if data.fetched_at else "?"
-            self._status_label.setText(
+            self._set_status_text(
                 f"Rate limited · {age} old · retry in {delay_str}"
             )
         else:
             remaining = max(0, int(self._next_fetch_at - now))
             age = self._format_age(now - data.fetched_at) if data.fetched_at else "just now"
-            self._status_label.setText(f"Updated: {age}  ·  Next: {remaining}s")
+            self._set_status_text(f"Updated: {age}  ·  Next: {remaining}s")
+
+    def _set_status_text(self, text: str) -> None:
+        self._status_label.setToolTip(text)
+        self._status_label.setAccessibleDescription(text)
+        self._status_label.setText(self._status_label.fontMetrics().elidedText(
+            text, Qt.TextElideMode.ElideMiddle, self._status_label.width()
+        ))
 
     @staticmethod
     def _format_age(seconds: float) -> str:
@@ -8419,6 +8452,9 @@ class ClaudeWidget(QWidget):
         self._smart_todo_action = QAction("Smart TODOs…", self)
         self._smart_todo_action.triggered.connect(self._show_smart_todos)
         menu.addAction(self._smart_todo_action)
+        traffic_report_action = QAction("Traffic Report", self)
+        traffic_report_action.triggered.connect(self._open_traffic_report)
+        menu.addAction(traffic_report_action)
         recovery_action = QAction("Terminal recovery…", self)
         recovery_action.triggered.connect(self._show_terminal_recovery)
         menu.addAction(recovery_action)
@@ -8431,6 +8467,10 @@ class ClaudeWidget(QWidget):
         menu.addAction(quit_action)
         self._tray.setContextMenu(menu)
         self._tray.show()
+
+    def _open_traffic_report(self):
+        if not QDesktopServices.openUrl(QUrl(TRAFFIC_REPORT_URL)):
+            self._set_status_text("Could not open browser")
 
     def _show_smart_todos(self):
         if self._smart_todo_dialog is None:
