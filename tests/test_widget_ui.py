@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -40,6 +41,8 @@ from claude_widget import (
     OpencodeGoUsageRow,
     OpencodeGoUsageSummary,
     OpencodeGoWindow,
+    GrokUsageRow,
+    GrokUsageSummary,
     MoneyBalance,
     OllamaStatus,
     DiskMetrics,
@@ -72,6 +75,9 @@ from claude_widget import (
     parse_minimax_quota,
     read_opencode_go_api_key,
     parse_opencode_go_usage,
+    parse_grok_credits,
+    fetch_grok_credits,
+    read_grok_bearer,
     record_deepseek_snapshot,
     save_last_usage,
     UsageData,
@@ -395,6 +401,255 @@ class WidgetUiTest(unittest.TestCase):
         minimax_index = layout.indexOf(widget._minimax_row)
         self.assertEqual(layout.indexOf(widget._go_row), minimax_index + 1)
 
+    GROK_CREDITS_PAYLOAD = {
+        "config": {
+            "creditUsagePercent": 34.0,
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "start": "2026-09-08T00:00:00Z",
+                "end": "2026-09-15T00:00:00Z",
+            },
+            "onDemandCap": {"val": 5000},
+            "onDemandUsed": {"val": 300},
+            "prepaidBalance": {"val": 1250},
+            "productUsage": [
+                {"product": "GrokBuild", "usagePercent": 29.0},
+                {"product": "Api", "usagePercent": 34.0},
+                {"product": "GrokChat"},
+            ],
+        }
+    }
+
+    def test_parse_grok_credits_reads_weekly_percent_reset_and_caps(self):
+        credits = parse_grok_credits(self.GROK_CREDITS_PAYLOAD)
+
+        self.assertEqual(credits.used_percent, 34.0)
+        self.assertEqual(credits.meter, "weekly")
+        self.assertGreater(credits.resets_at, 0)
+        self.assertEqual(
+            credits.resets_at,
+            int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()),
+        )
+        self.assertEqual(
+            [(item.product, item.used_percent) for item in credits.products],
+            [("GrokBuild", 29.0), ("Api", 34.0)],
+        )
+        self.assertEqual(credits.prepaid_balance, Decimal("1250"))
+        self.assertEqual(credits.on_demand_cap, Decimal("5000"))
+        self.assertEqual(credits.on_demand_used, Decimal("300"))
+
+    def test_parse_grok_credits_uses_on_demand_meter_when_weekly_percent_absent(self):
+        payload = {
+            "config": {
+                "onDemandCap": {"val": 1000},
+                "onDemandUsed": {"val": 250},
+                "billingPeriodEnd": "2026-10-01T00:00:00Z",
+            }
+        }
+        credits = parse_grok_credits(payload)
+        self.assertEqual(credits.used_percent, 25.0)
+        self.assertEqual(credits.meter, "on_demand")
+        self.assertGreater(credits.resets_at, 0)
+
+    def test_parse_grok_credits_rejects_missing_config_invalid_percent_and_legacy_monthly(self):
+        with self.assertRaises(ValueError):
+            parse_grok_credits({})
+        with self.assertRaises(ValueError):
+            parse_grok_credits({"config": None})
+        with self.assertRaises(ValueError):
+            parse_grok_credits({"error": "unauthorized"})
+
+        payload = json.loads(json.dumps(self.GROK_CREDITS_PAYLOAD))
+        payload["config"]["creditUsagePercent"] = 150
+        with self.assertRaises(ValueError):
+            parse_grok_credits(payload)
+
+        payload = json.loads(json.dumps(self.GROK_CREDITS_PAYLOAD))
+        payload["config"]["creditUsagePercent"] = True
+        with self.assertRaises(ValueError):
+            parse_grok_credits(payload)
+
+        payload = json.loads(json.dumps(self.GROK_CREDITS_PAYLOAD))
+        payload["config"]["creditUsagePercent"] = "34"
+        with self.assertRaises(ValueError):
+            parse_grok_credits(payload)
+
+        legacy = {
+            "config": {
+                "used": {"val": 4277},
+                "monthlyLimit": {"val": 60000},
+                "onDemandCap": {"val": 0},
+                "billingPeriodEnd": "2026-06-01T00:00:00+00:00",
+            }
+        }
+        with self.assertRaises(ValueError):
+            parse_grok_credits(legacy)
+
+    def test_fetch_grok_credits_sends_cli_gate_header_and_rejects_non_json(self):
+        with patch.object(claude_widget.requests, "get") as get:
+            response = Mock()
+            response.raise_for_status = Mock()
+            response.json.return_value = self.GROK_CREDITS_PAYLOAD
+            get.return_value = response
+
+            credits = fetch_grok_credits("oauth-token")
+
+        self.assertEqual(credits.used_percent, 34.0)
+        get.assert_called_once()
+        args, kwargs = get.call_args
+        self.assertEqual(args[0], claude_widget.GROK_BILLING_URL)
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer oauth-token")
+        self.assertEqual(
+            kwargs["headers"]["X-XAI-Token-Auth"], claude_widget.GROK_CLI_TOKEN_AUTH
+        )
+
+        with patch.object(claude_widget.requests, "get") as get:
+            response = Mock()
+            response.raise_for_status = Mock()
+            response.json.side_effect = json.JSONDecodeError("Expecting value", "x", 0)
+            get.return_value = response
+            with self.assertRaises(ValueError):
+                fetch_grok_credits("oauth-token")
+
+        with patch.object(claude_widget.requests, "get") as get:
+            response = Mock()
+            response.raise_for_status.side_effect = (
+                claude_widget.requests.HTTPError("401 Client Error")
+            )
+            get.return_value = response
+            with self.assertRaises(claude_widget.requests.HTTPError):
+                fetch_grok_credits("oauth-token")
+
+    def _write_grok_auth(self, path: Path, payload: dict, mode: int = 0o600):
+        path.write_text(json.dumps(payload))
+        path.chmod(mode)
+
+    def test_grok_bearer_prefers_env_and_current_auth_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth_path = Path(tmpdir) / "auth.json"
+            self._write_grok_auth(
+                auth_path,
+                {
+                    "https://accounts.x.ai/sign-in": {
+                        "key": "legacy-key",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    },
+                    "https://auth.x.ai::abc": {
+                        "key": "current-key",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    },
+                },
+            )
+
+            self.assertEqual(
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    environ={"GROK_OAUTH_TOKEN": "env-token"},
+                ),
+                "env-token",
+            )
+            self.assertEqual(
+                read_grok_bearer(auth_path=auth_path, environ={}),
+                "current-key",
+            )
+
+            auth_path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                read_grok_bearer(auth_path=auth_path, environ={})
+
+    def test_grok_bearer_rejects_xai_api_keys_and_expired_tokens(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth_path = Path(tmpdir) / "auth.json"
+            self._write_grok_auth(
+                auth_path,
+                {
+                    "https://auth.x.ai::abc": {
+                        "key": "file-key",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    }
+                },
+            )
+            with self.assertRaises(ValueError):
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    environ={"GROK_OAUTH_TOKEN": "xai-management-key"},
+                )
+            self.assertEqual(
+                read_grok_bearer(auth_path=auth_path, environ={}),
+                "file-key",
+            )
+
+            self._write_grok_auth(
+                auth_path,
+                {
+                    "https://auth.x.ai::abc": {
+                        "key": "xai-file-key",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    }
+                },
+            )
+            with self.assertRaises(ValueError):
+                read_grok_bearer(auth_path=auth_path, environ={})
+
+            self._write_grok_auth(
+                auth_path,
+                {
+                    "https://auth.x.ai::abc": {
+                        "key": "stale-key",
+                        "expires_at": "2020-01-01T00:00:00Z",
+                    }
+                },
+            )
+            with self.assertRaises(ValueError):
+                read_grok_bearer(auth_path=auth_path, environ={}, now=1_800_000_000.0)
+
+    def test_grok_row_renders_weekly_percent_products_and_caps(self):
+        credits = parse_grok_credits(self.GROK_CREDITS_PAYLOAD)
+        row = GrokUsageRow()
+        row.set_data(
+            GrokUsageSummary(
+                used_percent=credits.used_percent,
+                resets_at=credits.resets_at,
+                meter=credits.meter,
+                products=credits.products,
+                prepaid_balance=credits.prepaid_balance,
+                on_demand_cap=credits.on_demand_cap,
+                on_demand_used=credits.on_demand_used,
+                source="live",
+            )
+        )
+
+        self.assertEqual(row.summary_text(), "7D 34%")
+        self.assertEqual(row._peak_percent(), 34.0)
+        tooltip = row.toolTip()
+        self.assertIn("/v1/billing?format=credits", tooltip)
+        self.assertIn("GrokBuild", tooltip)
+        self.assertIn("Api", tooltip)
+        self.assertIn("29%", tooltip)
+        self.assertIn("1250", tooltip)
+        self.assertIn("5000", tooltip)
+        self.assertNotIn("GrokChat", tooltip)
+        self.assertNotIn("oauth-token", tooltip)
+        self.assertNotIn("Bearer", tooltip)
+
+    def test_grok_row_shows_placeholder_when_usage_unavailable(self):
+        row = GrokUsageRow()
+        row.set_data(GrokUsageSummary(error="Grok billing response is not JSON"))
+
+        self.assertEqual(row.summary_text(), "—")
+        self.assertIn("Grok billing response is not JSON", row.toolTip())
+
+        row.set_data(GrokUsageSummary(error="Grok credential is not a SuperGrok bearer"))
+        self.assertEqual(row.summary_text(), "—")
+        self.assertIn("not a SuperGrok bearer", row.toolTip())
+
+    def test_widget_places_grok_row_directly_after_go_row(self):
+        widget = self._make_inert_claude_widget()
+        layout = widget._go_row.parentWidget().layout()
+        go_index = layout.indexOf(widget._go_row)
+        self.assertEqual(layout.indexOf(widget._grok_row), go_index + 1)
+        self.assertIsInstance(widget._grok_row, GrokUsageRow)
+
     def test_opencode_local_tokens_splits_today_from_all_time(self):
         # 2026-08-19 12:00:00 local; "today" starts at the local midnight before it.
         now = time.mktime((2026, 8, 19, 12, 0, 0, 0, 0, -1))
@@ -620,12 +875,12 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(usage.local.today_tokens, 15)
         self.assertEqual(usage.error, "")
 
-    def test_widget_places_opencode_row_directly_after_go_row(self):
+    def test_widget_places_opencode_row_directly_after_grok_row(self):
         widget = self._make_inert_claude_widget()
-        layout = widget._go_row.parentWidget().layout()
+        layout = widget._grok_row.parentWidget().layout()
         self.assertEqual(
             layout.indexOf(widget._opencode_row),
-            layout.indexOf(widget._go_row) + 1,
+            layout.indexOf(widget._grok_row) + 1,
         )
 
     def test_task_loop_status_reads_local_config_without_aws(self):
@@ -942,6 +1197,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_refresh_deepseek_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_minimax_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_opencode_go_usage", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_grok_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_opencode_usage", lambda self: None),
             patch.object(
                 ClaudeWidget, "_refresh_terminal_sessions", lambda self: None
@@ -2309,10 +2565,10 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._local_ai_section.is_expanded())
         self.assertFalse(widget._history_expanded)
-        # The collapsed GO row grows the panel beyond an 800px work area (Sam
-        # accepted the tradeoff 2026-09-07); the mutual exclusion keeps the
-        # panel bounded at this fixed budget.
-        self.assertLessEqual(widget.height(), 824)
+        # The collapsed GO + GROK rows grow the panel beyond an 800px work area
+        # (Sam accepted the GO tradeoff 2026-09-07; GROK adds one 30px row);
+        # the mutual exclusion keeps the panel bounded at this fixed budget.
+        self.assertLessEqual(widget.height(), 860)
 
         widget._toggle_history()
         widget.adjustSize()
@@ -2320,7 +2576,7 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._history_expanded)
         self.assertFalse(widget._local_ai_section.is_expanded())
-        self.assertLessEqual(widget.height(), 824)
+        self.assertLessEqual(widget.height(), 860)
 
     def test_fable_and_max_expansions_reposition_inside_800px_work_area(self):
         widget = self._make_inert_claude_widget(tray_available=False)
@@ -2359,10 +2615,10 @@ class WidgetUiTest(unittest.TestCase):
         QApplication.processEvents()
 
         frame = widget.frameGeometry()
-        # The GO row makes the fully expanded panel taller than the 800px work
-        # area (accepted tradeoff, 2026-09-07), so clamp pins it to the screen
-        # top instead of fitting it vertically.
-        self.assertLessEqual(widget.height(), 824)
+        # The GO + GROK rows make the fully expanded panel taller than the
+        # 800px work area (accepted tradeoff, 2026-09-07), so clamp pins it to
+        # the screen top instead of fitting it vertically.
+        self.assertLessEqual(widget.height(), 860)
         self.assertGreaterEqual(frame.left(), available.left())
         self.assertGreaterEqual(frame.top(), available.top())
         self.assertLessEqual(frame.right(), available.right())

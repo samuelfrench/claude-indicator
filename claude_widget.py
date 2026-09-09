@@ -136,6 +136,14 @@ OPENCODE_GO_WINDOW_LIMITS = {
     "monthly": Decimal("60"),
 }
 OPENCODE_GO_REFRESH_MS = 5 * 60 * 1000  # usage endpoint; limits move slowly
+# SuperGrok / Grok Build CLI billing: weekly credit percent from the CLI-proxy
+# credits endpoint. The bearer is the local Grok CLI login, never an xai- key.
+GROK_AUTH_PATH = Path.home() / ".grok" / "auth.json"
+GROK_AUTH_CURRENT_PREFIX = "https://auth.x.ai::"
+GROK_AUTH_LEGACY_KEY = "https://accounts.x.ai/sign-in"
+GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+GROK_CLI_TOKEN_AUTH = "xai-grok-cli"
+GROK_REFRESH_MS = 5 * 60 * 1000
 # Local-model token tracking is scoped to the OpenCode ledger on purpose: it is
 # the one place local usage is recorded per message. Other local clients (the
 # clawd-bot runner drives ollama through aider) are outside it and are excluded.
@@ -597,6 +605,37 @@ class OpencodeGoUsageSummary:
     rolling: OpencodeGoWindow | None = None
     weekly: OpencodeGoWindow | None = None
     monthly: OpencodeGoWindow | None = None
+    fetched_at: float = 0.0
+    source: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class GrokProductUsage:
+    product: str
+    used_percent: float
+
+
+@dataclass(frozen=True)
+class GrokCredits:
+    used_percent: float
+    resets_at: int
+    meter: str
+    products: tuple[GrokProductUsage, ...] = ()
+    prepaid_balance: Decimal | None = None
+    on_demand_cap: Decimal | None = None
+    on_demand_used: Decimal | None = None
+
+
+@dataclass
+class GrokUsageSummary:
+    used_percent: float | None = None
+    resets_at: int = 0
+    meter: str = ""
+    products: tuple[GrokProductUsage, ...] = ()
+    prepaid_balance: Decimal | None = None
+    on_demand_cap: Decimal | None = None
+    on_demand_used: Decimal | None = None
     fetched_at: float = 0.0
     source: str = ""
     error: str = ""
@@ -1658,6 +1697,223 @@ def read_opencode_go_usage(
         summary.rolling = rolling
         summary.weekly = weekly
         summary.monthly = monthly
+        summary.fetched_at = now
+        summary.source = "live"
+    return summary
+
+
+def grok_auth_path(*, environ: dict | None = None) -> Path:
+    environment = os.environ if environ is None else environ
+    home = environment.get("GROK_HOME", "")
+    if isinstance(home, str) and home.strip():
+        return Path(home.strip()).expanduser() / "auth.json"
+    return GROK_AUTH_PATH
+
+
+def _grok_iso_epoch(value) -> int:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Grok billing reset time is invalid")
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("Grok billing reset time is invalid") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    epoch = int(parsed.timestamp())
+    if epoch <= 0:
+        raise ValueError("Grok billing reset time is invalid")
+    return epoch
+
+
+def _select_grok_auth_entry(data: dict) -> dict:
+    current = [
+        value
+        for key, value in data.items()
+        if isinstance(key, str)
+        and key.startswith(GROK_AUTH_CURRENT_PREFIX)
+        and isinstance(value, dict)
+    ]
+    if current:
+        return current[0]
+    legacy = data.get(GROK_AUTH_LEGACY_KEY)
+    if isinstance(legacy, dict):
+        return legacy
+    raise ValueError("Grok credential unavailable")
+
+
+def _reject_xai_api_key(token: str) -> str:
+    if token.startswith("xai-"):
+        raise ValueError("Grok credential is not a SuperGrok bearer")
+    return token
+
+
+def read_grok_bearer(
+    *,
+    auth_path: Path | None = None,
+    environ: dict | None = None,
+    now: float | None = None,
+) -> str:
+    environment = os.environ if environ is None else environ
+    now = time.time() if now is None else now
+    env_token = environment.get("GROK_OAUTH_TOKEN", "")
+    if isinstance(env_token, str) and env_token.strip():
+        return _reject_xai_api_key(env_token.strip())
+    path = grok_auth_path(environ=environment) if auth_path is None else auth_path
+    data = _read_owned_private_json(path)
+    entry = _select_grok_auth_entry(data)
+    key = entry.get("key")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("Grok credential unavailable")
+    token = _reject_xai_api_key(key.strip())
+    expires_at = entry.get("expires_at")
+    if isinstance(expires_at, str) and expires_at.strip():
+        try:
+            expiry = _grok_iso_epoch(expires_at)
+        except ValueError as exc:
+            raise ValueError("Grok credential expired") from exc
+        if expiry <= now:
+            raise ValueError("Grok credential expired")
+    return token
+
+
+def _grok_percent(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Grok usage percent is invalid")
+    percent = float(value)
+    if not math.isfinite(percent) or not 0 <= percent <= 100:
+        raise ValueError("Grok usage percent is out of range")
+    return percent
+
+
+def _grok_val(value) -> Decimal | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Grok billing amount is invalid")
+    if "val" not in value:
+        return None
+    return _decimal_money(value.get("val"))
+
+
+def _grok_product_name(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if name.startswith("PRODUCT_"):
+        parts = [part for part in name[len("PRODUCT_") :].split("_") if part]
+        name = "".join(part.capitalize() for part in parts)
+    return name or None
+
+
+def _parse_grok_products(raw) -> tuple[GrokProductUsage, ...]:
+    if not isinstance(raw, list):
+        return ()
+    products: list[GrokProductUsage] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = _grok_product_name(item.get("product"))
+        if not name or name in seen or "usagePercent" not in item:
+            continue
+        try:
+            percent = _grok_percent(item.get("usagePercent"))
+        except ValueError:
+            continue
+        seen.add(name)
+        products.append(GrokProductUsage(product=name, used_percent=percent))
+    return tuple(products)
+
+
+def parse_grok_credits(payload: dict) -> GrokCredits:
+    if not isinstance(payload, dict):
+        raise ValueError("Grok billing response schema is invalid")
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("Grok billing response has no config")
+    reset_raw = None
+    period = config.get("currentPeriod")
+    if isinstance(period, dict):
+        reset_raw = period.get("end")
+    if not reset_raw:
+        reset_raw = config.get("billingPeriodEnd")
+    resets_at = _grok_iso_epoch(reset_raw) if reset_raw else 0
+
+    prepaid = _grok_val(config.get("prepaidBalance"))
+    on_demand_cap = _grok_val(config.get("onDemandCap"))
+    on_demand_used = _grok_val(config.get("onDemandUsed"))
+    products = _parse_grok_products(config.get("productUsage"))
+
+    if "creditUsagePercent" in config and config.get("creditUsagePercent") is not None:
+        used_percent = _grok_percent(config.get("creditUsagePercent"))
+        meter = "weekly"
+    elif (
+        on_demand_cap is not None
+        and on_demand_cap > 0
+        and on_demand_used is not None
+    ):
+        cap = float(on_demand_cap)
+        used = float(on_demand_used)
+        used_percent = min(100.0, max(0.0, used / cap * 100.0))
+        meter = "on_demand"
+    else:
+        raise ValueError("Grok billing has no weekly or on-demand meter")
+
+    return GrokCredits(
+        used_percent=used_percent,
+        resets_at=resets_at,
+        meter=meter,
+        products=products,
+        prepaid_balance=prepaid,
+        on_demand_cap=on_demand_cap,
+        on_demand_used=on_demand_used,
+    )
+
+
+def fetch_grok_credits(bearer: str) -> GrokCredits:
+    response = requests.get(
+        GROK_BILLING_URL,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer}",
+            "X-XAI-Token-Auth": GROK_CLI_TOKEN_AUTH,
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise ValueError("Grok billing response is not JSON") from exc
+    return parse_grok_credits(payload)
+
+
+def read_grok_usage(
+    *,
+    now: float | None = None,
+    auth_path: Path | None = None,
+    environ: dict | None = None,
+) -> GrokUsageSummary:
+    now = time.time() if now is None else now
+    summary = GrokUsageSummary()
+    try:
+        bearer = read_grok_bearer(auth_path=auth_path, environ=environ, now=now)
+        credits = fetch_grok_credits(bearer)
+    except ValueError as exc:
+        summary.error = str(exc) or "Grok usage unavailable"
+    except (OSError, requests.RequestException, json.JSONDecodeError):
+        summary.error = "Grok usage unavailable"
+    else:
+        summary.used_percent = credits.used_percent
+        summary.resets_at = credits.resets_at
+        summary.meter = credits.meter
+        summary.products = credits.products
+        summary.prepaid_balance = credits.prepaid_balance
+        summary.on_demand_cap = credits.on_demand_cap
+        summary.on_demand_used = credits.on_demand_used
         summary.fetched_at = now
         summary.source = "live"
     return summary
@@ -4040,6 +4296,22 @@ class OpencodeGoUsageWorker(QThread):
             self.result.emit(summary)
 
 
+class GrokUsageWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        reader = self._reader or read_grok_usage
+        summary = reader()
+        if not self.isInterruptionRequested():
+            self.result.emit(summary)
+
+
 class OpencodeUsageWorker(QThread):
     result = Signal(object)
 
@@ -5792,6 +6064,162 @@ class OpencodeGoUsageRow(QWidget):
                 else:
                     painter.setPen(_bar_color(window.used_percent))
                 painter.drawText(8, 40 + index * 18, f"{label} PLAN   {self._window_detail(window)}")
+        painter.end()
+
+
+def _grok_amount_text(amount: Decimal) -> str:
+    quantized = amount.quantize(Decimal("0.01")) if amount != amount.to_integral_value() else amount
+    text = format(quantized, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+class GrokUsageRow(QWidget):
+    """Compact SuperGrok/Grok Build weekly-credit row from the CLI-proxy billing API."""
+
+    _COLLAPSED_H = 30
+    _LINE_H = 18
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._summary: GrokUsageSummary | None = None
+        self._expanded = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, summary: GrokUsageSummary | None):
+        self._summary = summary
+        self.setToolTip(self._tooltip(summary))
+        if self._expanded:
+            self.setFixedHeight(self._expanded_height())
+        self.update()
+
+    def summary_text(self) -> str:
+        summary = self._summary
+        if summary is None or summary.used_percent is None:
+            return "—"
+        label = "OD" if summary.meter == "on_demand" else "7D"
+        return f"{label} {summary.used_percent:.0f}%"
+
+    def _peak_percent(self) -> float:
+        summary = self._summary
+        if summary is None or summary.used_percent is None:
+            return 0.0
+        return summary.used_percent
+
+    def _cap_lines(self, summary: GrokUsageSummary) -> list[str]:
+        lines: list[str] = []
+        if summary.prepaid_balance is not None and summary.prepaid_balance > 0:
+            lines.append(f"PREPAID     {_grok_amount_text(summary.prepaid_balance)}")
+        if summary.on_demand_cap is not None and summary.on_demand_cap > 0:
+            used = (
+                _grok_amount_text(summary.on_demand_used)
+                if summary.on_demand_used is not None
+                else "—"
+            )
+            lines.append(
+                f"ON-DEMAND   {used}/{_grok_amount_text(summary.on_demand_cap)}"
+            )
+        return lines
+
+    def _detail_lines(self, summary: GrokUsageSummary | None) -> list[str]:
+        if summary is None or summary.used_percent is None:
+            return ["CREDITS     —"]
+        label = "ON-DEMAND" if summary.meter == "on_demand" else "7D CREDITS"
+        detail = f"{summary.used_percent:.0f}%"
+        if summary.resets_at > 0:
+            detail += "   ·   resets " + time.strftime(
+                "%d %b %H:%M", time.localtime(summary.resets_at)
+            )
+        lines = [f"{label:<11}{detail}"]
+        for product in summary.products:
+            name = product.product.upper()[:11]
+            lines.append(f"{name:<11}{product.used_percent:.0f}%")
+        lines.extend(self._cap_lines(summary))
+        return lines
+
+    def _expanded_height(self) -> int:
+        return self._COLLAPSED_H + max(1, len(self._detail_lines(self._summary))) * self._LINE_H
+
+    def _tooltip(self, summary: GrokUsageSummary | None) -> str:
+        if summary is None:
+            return "Grok data has not been read yet."
+        lines: list[str] = []
+        if summary.source == "live" and summary.used_percent is not None:
+            meter = "On-demand" if summary.meter == "on_demand" else "Weekly credits"
+            lines.append(
+                f"{meter} {summary.used_percent:.0f}% used "
+                "(live Grok CLI /v1/billing?format=credits)."
+            )
+            if summary.resets_at > 0:
+                lines.append(
+                    "Resets "
+                    + time.strftime("%a %d %b %H:%M", time.localtime(summary.resets_at))
+                    + "."
+                )
+            if summary.products:
+                lines.append(
+                    "Products: "
+                    + ", ".join(
+                        f"{item.product} {item.used_percent:.0f}%"
+                        for item in summary.products
+                    )
+                    + "."
+                )
+            extras: list[str] = []
+            if summary.prepaid_balance is not None and summary.prepaid_balance > 0:
+                extras.append(f"prepaid {_grok_amount_text(summary.prepaid_balance)}")
+            if summary.on_demand_cap is not None and summary.on_demand_cap > 0:
+                used = (
+                    _grok_amount_text(summary.on_demand_used)
+                    if summary.on_demand_used is not None
+                    else "—"
+                )
+                extras.append(
+                    f"on-demand {used}/{_grok_amount_text(summary.on_demand_cap)}"
+                )
+            if extras:
+                lines.append("Caps: " + ", ".join(extras) + ".")
+        if summary.error:
+            lines.append(summary.error + ".")
+        return "\n".join(lines)
+
+    def mousePressEvent(self, event):
+        self._expanded = not self._expanded
+        self.setFixedHeight(
+            self._expanded_height() if self._expanded else self._COLLAPSED_H
+        )
+        _resize_parent(self)
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        painter.setFont(font)
+        arrow = "▾" if self._expanded else "▸"
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 18, f"GROK {arrow}")
+
+        summary = self._summary
+        right = self.summary_text()
+        if summary is None or summary.source != "live":
+            painter.setPen(QColor(160, 160, 180))
+        else:
+            painter.setPen(_bar_color(self._peak_percent()))
+        fm = painter.fontMetrics()
+        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 18, right)
+
+        if self._expanded:
+            painter.setFont(QFont("sans-serif", 7))
+            for index, line in enumerate(self._detail_lines(summary)):
+                if summary is None or summary.source != "live":
+                    painter.setPen(QColor(100, 100, 120))
+                else:
+                    painter.setPen(_bar_color(self._peak_percent()))
+                painter.drawText(8, 40 + index * self._LINE_H, line)
         painter.end()
 
 
@@ -7694,6 +8122,7 @@ class ClaudeWidget(QWidget):
         self._deepseek_worker: DeepSeekUsageWorker | None = None
         self._minimax_worker: MinimaxUsageWorker | None = None
         self._go_worker: OpencodeGoUsageWorker | None = None
+        self._grok_worker: GrokUsageWorker | None = None
         self._opencode_worker: OpencodeUsageWorker | None = None
         self._ollama_worker: OllamaFetchWorker | None = None
         self._comfyui_worker: ComfyUIFetchWorker | None = None
@@ -7765,6 +8194,7 @@ class ClaudeWidget(QWidget):
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
         self._refresh_opencode_go_usage()
+        self._refresh_grok_usage()
         self._refresh_opencode_usage()
         self._refresh_terminal_sessions()
 
@@ -7937,6 +8367,10 @@ class ClaudeWidget(QWidget):
         # OpenCode Go subscription usage row (5-hour/weekly/monthly dollar windows)
         self._go_row = OpencodeGoUsageRow()
         layout.addWidget(self._go_row)
+
+        # SuperGrok / Grok Build CLI weekly-credit row
+        self._grok_row = GrokUsageRow()
+        layout.addWidget(self._grok_row)
 
         # OpenCode ledger usage, broken down per model
         self._opencode_row = OpencodeUsageRow()
@@ -8115,6 +8549,10 @@ class ClaudeWidget(QWidget):
         self._go_timer.timeout.connect(self._refresh_opencode_go_usage)
         self._go_timer.start(OPENCODE_GO_REFRESH_MS)
 
+        self._grok_timer = QTimer(self)
+        self._grok_timer.timeout.connect(self._refresh_grok_usage)
+        self._grok_timer.start(GROK_REFRESH_MS)
+
         self._opencode_timer = QTimer(self)
         self._opencode_timer.timeout.connect(self._refresh_opencode_usage)
         self._opencode_timer.start(LOCAL_TOKENS_REFRESH_MS)
@@ -8139,6 +8577,7 @@ class ClaudeWidget(QWidget):
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
         self._refresh_opencode_go_usage()
+        self._refresh_grok_usage()
         self._refresh_opencode_usage()
         self._refresh_terminal_sessions()
         self._fetch_ollama()
@@ -8481,6 +8920,19 @@ class ClaudeWidget(QWidget):
 
     def _on_opencode_go_usage_read(self, summary: OpencodeGoUsageSummary | None):
         self._go_row.set_data(summary)
+        self.adjustSize()
+
+    def _refresh_grok_usage(self):
+        if self._shutdown_started:
+            return
+        if self._grok_worker and self._grok_worker.isRunning():
+            return
+        self._grok_worker = GrokUsageWorker()
+        self._grok_worker.result.connect(self._on_grok_usage_read)
+        self._grok_worker.start()
+
+    def _on_grok_usage_read(self, summary: GrokUsageSummary | None):
+        self._grok_row.set_data(summary)
         self.adjustSize()
 
     def _refresh_opencode_usage(self):
@@ -8897,6 +9349,7 @@ class ClaudeWidget(QWidget):
                 self._deepseek_worker,
                 self._minimax_worker,
                 self._go_worker,
+                self._grok_worker,
                 self._opencode_worker,
                 self._ollama_worker,
                 self._comfyui_worker,

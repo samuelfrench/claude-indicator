@@ -2,8 +2,8 @@
 
 ## Project Description
 Translucent PySide6 desktop widget combining Claude Code Max and Codex usage,
-DeepSeek API spend/credit, compact local system activity, and
-Ollama/GPU/ComfyUI status.
+DeepSeek API spend/credit, MiniMax/OpenCode Go/SuperGrok quotas, compact
+local system activity, and Ollama/GPU/ComfyUI status.
 
 ## Architecture
 - **Single-file app**: `claude_widget.py` contains all logic (client, UI, timers, history)
@@ -17,6 +17,7 @@ Ollama/GPU/ComfyUI status.
 - **DeepSeekUsageRow**: Sums numeric DeepSeek assistant-message costs from the read-only local OpenCode SQLite ledger for rolling 24-hour spend and reads current credit from official `GET /user/balance` in a background thread
 - **MinimaxUsageRow**: Reads MiniMax coding-plan quota from `GET https://api.minimax.io/v1/token_plan/remains` (`general` family) in a background thread, inverting the API's *remaining* percentages into 5-hour/weekly utilization, and pairs it with 24-hour token volume, message count, and latest model from the read-only local OpenCode SQLite ledger. The plan is a subscription, so OpenCode records `cost = 0` for every MiniMax message and no dollar figure is shown.
 - **OpencodeGoUsageRow**: Reads OpenCode Go subscription usage from `GET https://opencode.ai/zen/go/v1/usage` in a background thread with the `opencode-go` API key (env `OPENCODE_GO_API_KEY` first, then the same owner-controlled mode-`0600` OpenCode auth file). The row shows the dollar-metered 5-hour/`$12`, weekly/`$30` and monthly/`$60` utilization percents with reset times and dollar used per window; a `!` suffix and tooltip flag cap-locked (`rate-limited`) windows. This row grows the panel past the old 800px budget (Sam approved 2026-09-07).
+- **GrokUsageRow**: Reads SuperGrok/Grok Build CLI billing from `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` in a background thread. Bearer is `GROK_OAUTH_TOKEN` first, else the owner-only mode-`0600` `~/.grok/auth.json` (`GROK_HOME` if set), preferring the current `https://auth.x.ai::<client-id>` entry's `key` over the legacy `https://accounts.x.ai/sign-in` key. Requests send `X-XAI-Token-Auth: xai-grok-cli`. An `xai-` management/API key is rejected; an expired cached access token fails closed without refresh. Collapsed summary is the weekly `creditUsagePercent` (or `onDemandUsed/onDemandCap` when that is the only meter); expanded/tooltip text includes the reset from `config.currentPeriod.end` (else `billingPeriodEnd`), product percents from `productUsage`, and a positive prepaid/on-demand cap. Failures show `—` / the error string. Tokens, refresh tokens, and emails never appear in logs, history, labels, or tooltips. The collapsed row adds 30px; the tall-sections test budget is 860.
 - **OpencodeUsageRow**: DeepSeek, MiniMax and ollama all write to the same read-only OpenCode SQLite ledger, so this row breaks the last 24 hours down per model — every line tagged with its provider (`minimax` / `deepseek` / `ollama`), with tokens, cost, and message counts — above a `LOCAL` line carrying today (since local midnight) and all-time local-model token volume plus the ledger start date. Collapsed it shows the 24-hour token total and the model count. MiniMax cost always reads `$0.00` because the coding plan is a subscription.
 - **TerminalSessionsRow + TerminalTabsPanel**: The 22px `TABS` row summarises agent CLI sessions holding terminal tabs (`claude`/`codex`/`opencode` processes with a controlling pts, scanned from `/proc` every 5s, nested agents deduped via the ppid chain). A session is WORKING when its CPU delta beats a per-tool threshold, its terminal write rate (`/proc/<pid>/io` wchar) beats a per-tool bytes/s threshold (`TERMINAL_SESSION_TOOLS`), or it has a child forked >90s after session start (quiet tools like `gh run watch`); otherwise it is WAITING, and after 120s idle it flags NEEDS YOU. The write-rate signal is what keeps API-bound sessions marked WORKING: a claude waiting on the API uses ~0 CPU but redraws its spinner at 2-3 KB/s, while an idle prompt writes ~10 B/s (calibrated 2026-08-19). Clicking the row slides a compact 320px `TerminalTabsPanel` with 62px cards from the widget's left edge (right when needed); full cwd/TTY/PID detail remains in tooltips and accessibility metadata. GNOME Terminal navigation revalidates the live PID start time and pts, then selects the exact TTY through its GTK `active-tab` action plus a temporary VTE title marker; nonmatching/error paths restore original tab indices and the title, and failures fail closed without ambiguous title cycling. Other terminal emulators retain title matching and verified keyboard cycling only as a best-effort compatibility path. Dragging the selector header/background moves the main-window anchor and keeps both surfaces docked; minimizing the main widget leaves/opens the selector beside its restore sliver, while tray hide hides all surfaces. Cards remain grouped under NEEDS YOU / WAITING / WORKING / PARKED, with PARK/UNPARK and persistent notes in `~/.claude/terminal_sessions.json` (atomic, keyed `pid:starttime`, pruned when sessions exit). Card rebuilds defer while a note editor has focus. Only one `TerminalFocusWorker` runs at a time — replacing a live QThread is fatal.
 - **TerminalRecoveryStore + TerminalRecoveryDialog**: `terminal_recovery.py` scans every owned controlling terminal (ordinary shells, agent/non-agent commands, multiplexer PTYs, and physical terminals) every 5 seconds through the widget terminal timer. Boot-scoped identities and full-synchronous SQLite transactions preserve the final snapshot of each boot plus previously closed terminals at `~/.local/state/claude-indicator/terminals.sqlite3` (directory 0700, file 0600); no auto-expiry, argv, environment, or scrollback collection. `terminal_recovery_ui.py` is opened through the TABS footer or tray Terminal recovery action, with Live/Last boot snapshot/All saved, directory/program/date search, copy details, timestamps, and explicit errors retaining last-good history. Required proc metadata failures abort the capture; real process exits are skipped. The previous-boot snapshot remains available after empty startup scans. Records describe work; they do not restart processes.
@@ -25,9 +26,11 @@ Ollama/GPU/ComfyUI status.
 - **Per-disk rows in SystemMetricsRow**: `SystemMetricsReader._read_disks` lists physical, unhidden block devices from `/sys/block` (entries with a `device` link, so loop/zram/dm/md are skipped), reads sector and `io_ticks` counters from `/proc/diskstats`, and sums df-style used/total bytes over each disk's mounted `/dev/<partition>` entries from `/proc/mounts` via `statvfs` (mapper/LVM sources are not attributed). Each `DiskMetrics` renders one expanded bar row between GPU and NET labelled with the kernel name: bar = filesystem fill % (red when nearly full), detail = `<free> free · R<rate> W<rate>` (`unmounted` when no filesystem is mounted); busy % (io_ticks delta / elapsed) lives in the tooltip. First sample, per-disk counter decreases, and missing `/proc/diskstats` read zero / `disk_error`; the tooltip lists HDD/SSD, model, decimal TB size, GiB free of total, busy % and mount points.
 - **DeepSeek balance history**: Currency-separated snapshots in `~/.claude/deepseek_balance_history.json` use a strict schema, mode `0600`, fsync, and atomic replacement
 - **Expansion geometry**: Usage History and Ollama are mutually exclusive so
-  the fixed-width panel remains usable on 800px-tall screens; DeepSeek remains
-  independently expandable. `ClaudeWidget.adjustSize()` clamps the full frame
-  into the primary screen's available geometry after every size change.
+  the fixed-width panel remains usable on 800px-tall screens; DeepSeek, MiniMax,
+  OpenCode Go, and Grok remain independently expandable. `ClaudeWidget.adjustSize()`
+  clamps the full frame into the primary screen's available geometry after every
+  size change. The collapsed GO + GROK rows grow the panel past 800px (tall-sections
+  budget 860); clamp pins the top when the window is taller than the screen.
 - **UsageHistory**: Persists data points to `~/.claude/usage_history.json` (max 288 points / 24h), atomic writes via os.replace()
 - **Dynamic plan name**: Title detects CLAUDE MAX (opus present), CLAUDE PRO (sonnet present), or CLAUDE (neither)
 - Token refresh via `https://platform.claude.com/v1/oauth/token` with client_id `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
@@ -72,5 +75,12 @@ Ollama/GPU/ComfyUI status.
 - MiniMax credentials resolve from `MINIMAX_API_KEY` first, then the same
   owner-controlled mode-`0600` OpenCode auth file (`minimax-coding-plan.key`);
   the key reaches only the Authorization header, never history, logs, or tooltips.
+- Grok credentials resolve from `GROK_OAUTH_TOKEN` first, then owner-only
+  mode-`0600` `~/.grok/auth.json` (`GROK_HOME` if set). Prefer
+  `https://auth.x.ai::<client-id>` over `https://accounts.x.ai/sign-in`. The
+  bearer reaches only `cli-chat-proxy.grok.com` with `X-XAI-Token-Auth:
+  xai-grok-cli`. `xai-` API keys are never sent; expired access tokens fail
+  closed without OAuth refresh. Tokens, refresh tokens, and emails never appear
+  in logs, history, labels, or tooltips.
 - Clawd task-loop rows remain local-configuration-only. The unified Ollama
   section reuses those results and adds no boto3/DynamoDB polling.
