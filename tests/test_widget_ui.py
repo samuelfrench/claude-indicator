@@ -485,6 +485,26 @@ class WidgetUiTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_grok_credits(legacy)
 
+        # Live SuperGrok unified-billing 200 (2026-09-09): weekly period present,
+        # creditUsagePercent omitted, onDemandCap 0. That is a visible error,
+        # not 0% — proto3 may omit a zero percent, but the plan forbids guessing.
+        live_unified_zero = {
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-09-09T08:55:17.539153+00:00",
+                    "end": "2026-09-16T08:55:17.539153+00:00",
+                },
+                "onDemandCap": {"val": 0},
+                "onDemandUsed": {"val": 0},
+                "prepaidBalance": {"val": 0},
+                "isUnifiedBillingUser": True,
+                "billingPeriodEnd": "2026-09-16T08:55:17.539153+00:00",
+            }
+        }
+        with self.assertRaises(ValueError):
+            parse_grok_credits(live_unified_zero)
+
     def test_fetch_grok_credits_sends_cli_gate_header_and_rejects_non_json(self):
         with patch.object(claude_widget.requests, "get") as get:
             response = Mock()
