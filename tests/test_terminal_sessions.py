@@ -19,6 +19,7 @@ from claude_widget import (
     TerminalSessionsSnapshot,
     TerminalTabsPanel,
     XdotoolRunner,
+    _TERMINAL_TOOL_COLORS,
     _terminal_ancestor_pid,
     focus_terminal_session,
     load_terminal_state,
@@ -201,9 +202,72 @@ class ReadTerminalSessionsTest(unittest.TestCase):
         snapshot, _ = self._read(prev=state, now=1_020.0)
         self.assertFalse(snapshot.sessions[0].busy)
 
-    def test_config_covers_all_three_agent_clis(self):
-        comms = {comm for comm, _, _, _ in TERMINAL_SESSION_TOOLS}
-        self.assertEqual(comms, {"claude", "codex", "opencode"})
+    def test_config_covers_agent_clis_including_grok(self):
+        by_comm = {
+            comm: (label, busy, io_rate)
+            for comm, label, busy, io_rate in TERMINAL_SESSION_TOOLS
+        }
+        self.assertIn("claude", by_comm)
+        self.assertIn("codex", by_comm)
+        self.assertIn("opencode", by_comm)
+        self.assertIn("grok", by_comm)
+        self.assertEqual(by_comm["grok"][0], "GROK")
+        # API-bound TUI: same busy class as claude/codex, not opencode's higher floor.
+        self.assertEqual(by_comm["grok"][1:], by_comm["claude"][1:])
+        self.assertEqual(by_comm["grok"][1:], by_comm["codex"][1:])
+        self.assertIn("GROK", _TERMINAL_TOOL_COLORS)
+
+    def test_finds_grok_on_pts_and_skips_headless_grok(self):
+        make_proc(self.proc, 410, "grok", tty_nr=PTS3)
+        make_proc(self.proc, 411, "grok", tty_nr=0)
+
+        snapshot, _ = self._read()
+
+        self.assertEqual(snapshot.error, "")
+        self.assertEqual(len(snapshot.sessions), 1)
+        session = snapshot.sessions[0]
+        self.assertEqual(session.pid, 410)
+        self.assertEqual(session.tool, "GROK")
+        self.assertEqual(session.tty, "pts/3")
+
+    def test_finds_claude_codex_opencode_and_grok_pts_sessions(self):
+        make_proc(self.proc, 100, "claude", tty_nr=PTS3)
+        make_proc(self.proc, 200, "codex", tty_nr=(136 << 8) | 4)
+        make_proc(self.proc, 300, "opencode", tty_nr=(136 << 8) | 5)
+        make_proc(self.proc, 400, "grok", tty_nr=(136 << 8) | 6)
+        make_proc(self.proc, 500, "grok-cli", tty_nr=(136 << 8) | 7)
+
+        snapshot, _ = self._read()
+
+        by_pid = {s.pid: s for s in snapshot.sessions}
+        self.assertEqual(set(by_pid), {100, 200, 300, 400})
+        self.assertEqual(by_pid[100].tool, "CLAUDE")
+        self.assertEqual(by_pid[200].tool, "CODEX")
+        self.assertEqual(by_pid[300].tool, "OPENCODE")
+        self.assertEqual(by_pid[400].tool, "GROK")
+        self.assertEqual(by_pid[400].tty, "pts/6")
+
+    def test_nested_grok_under_another_agent_is_not_a_second_tab(self):
+        make_proc(self.proc, 100, "claude", tty_nr=PTS3, children=(200,))
+        make_proc(self.proc, 200, "bash", ppid=100, tty_nr=PTS3, children=(300,))
+        make_proc(self.proc, 300, "grok", ppid=200, tty_nr=PTS3)
+
+        snapshot, _ = self._read()
+
+        self.assertEqual([(s.pid, s.tool) for s in snapshot.sessions], [(100, "CLAUDE")])
+
+    def test_grok_terminal_writes_mark_busy_even_when_cpu_is_flat(self):
+        make_proc(self.proc, 100, "grok", tty_nr=PTS3, wchar=1_000_000)
+        _, state = self._read(now=1_000.0)
+
+        (self.proc / "100" / "io").write_text("rchar: 0\nwchar: 1051200\n")
+        snapshot, state = self._read(prev=state, now=1_010.0)
+        self.assertEqual(snapshot.sessions[0].tool, "GROK")
+        self.assertTrue(snapshot.sessions[0].busy)
+
+        (self.proc / "100" / "io").write_text("rchar: 0\nwchar: 1051300\n")
+        snapshot, _ = self._read(prev=state, now=1_020.0)
+        self.assertFalse(snapshot.sessions[0].busy)
 
 
 class TerminalStatePersistenceTest(unittest.TestCase):
@@ -320,6 +384,31 @@ class TerminalSessionsRowTest(unittest.TestCase):
         row.set_panel_open(True)
         self.assertTrue(row._panel_open)
 
+    def test_row_shows_grok_tool_and_empty_tooltip_names_grok(self):
+        row = TerminalSessionsRow()
+        grok = TerminalSessionsSnapshot(
+            sessions=[
+                _session(
+                    key="410:1",
+                    tool="GROK",
+                    project="claude-indicator",
+                    tty="pts/7",
+                    pid=410,
+                    busy=True,
+                )
+            ],
+            updated_at=1.0,
+        )
+        row.set_data(grok)
+        lines = row.session_lines()
+        self.assertEqual(lines[0][0], "GROK")
+        self.assertEqual(lines[0][1], "claude-indicator")
+        self.assertEqual(lines[0][2], "pts/7")
+
+        empty = TerminalSessionsSnapshot(sessions=[], updated_at=1.0)
+        row.set_data(empty)
+        self.assertIn("grok", row.toolTip().lower())
+
 
 class TerminalTabsPanelTest(unittest.TestCase):
     @classmethod
@@ -348,6 +437,41 @@ class TerminalTabsPanelTest(unittest.TestCase):
     def test_header_carries_the_summary(self):
         panel = self._panel()
         self.assertIn("4 OPEN · 1 NEED YOU", panel.header_text())
+
+    def test_panel_shows_grok_tool_and_empty_copy_names_grok(self):
+        grok = TerminalSessionsSnapshot(
+            sessions=[
+                _session(
+                    key="410:1",
+                    tool="GROK",
+                    project="claude-indicator",
+                    tty="pts/7",
+                    pid=410,
+                    busy=True,
+                )
+            ],
+            updated_at=1.0,
+        )
+        panel = self._panel(snapshot=grok)
+        card = panel._card("410:1")
+        labels = [label.text() for label in card["widget"].findChildren(QLabel)]
+        self.assertIn("GROK", labels)
+        self.assertEqual(
+            card["widget"].accessibleName(),
+            "GROK terminal tab: claude-indicator",
+        )
+        grok_color = _TERMINAL_TOOL_COLORS["GROK"]
+        grok_label = next(label for label in card["widget"].findChildren(QLabel)
+                          if label.text() == "GROK")
+        self.assertIn(grok_color.name().lower(), grok_label.styleSheet().lower())
+
+        empty_panel = self._panel(
+            snapshot=TerminalSessionsSnapshot(sessions=[], updated_at=1.0)
+        )
+        empty_labels = [
+            label.text().lower() for label in empty_panel.findChildren(QLabel)
+        ]
+        self.assertTrue(any("grok" in text for text in empty_labels))
 
     def test_park_buttons_emit_the_inverted_state(self):
         panel = self._panel()

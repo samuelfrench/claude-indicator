@@ -23,7 +23,7 @@ and Ollama/GPU/ComfyUI status in one panel.
 - **Expandable Cron Manager** — reads the current user's crontab and journal entries, lists each job, and shows live status (`ok`, `late`, `unknown`) with last run + next scheduled run
 - **Smart TODO command center** — captures an overall inbox task and ranks TODOs from local workspaces from the tray
 - **Traffic Report shortcut** — opens the local portfolio dashboard in your default browser from the footer or tray menu
-- **Compact terminal selector** — a 320px docked panel groups live Claude/Codex/OpenCode tabs by status, keeps notes and park state, and selects duplicate-project GNOME Terminal tabs by their exact TTY instead of cycling by title; other emulators use best-effort verified title/key navigation
+- **Compact terminal selector** — a 320px docked panel groups live Claude/Codex/OpenCode/Grok tabs by status, keeps notes and park state, and selects duplicate-project GNOME Terminal tabs by their exact TTY instead of cycling by title; other emulators use best-effort verified title/key navigation
 - **Docked drag and recoverable minimize** — drag either the main widget or the selector header/background to move them together; minimizing hides the main usage panel but leaves the terminal selector and right-edge restore sliver usable, while tray hide hides every surface
 - **Color-coded progress bars** — green/yellow/orange/red based on usage percentage
 - **Live countdown timers** — shows time remaining until each window resets

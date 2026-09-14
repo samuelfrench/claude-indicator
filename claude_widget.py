@@ -160,15 +160,23 @@ OPENCODE_PROVIDER_LABELS = (
 OPENCODE_MODEL_LINES = 5
 # Agent CLI sessions on terminal tabs: a process from this table with a
 # controlling pts is one tab, judged working by either CPU share or terminal
-# write volume (wchar bytes/s). The write signal matters most for claude and
-# codex: while waiting on the API they barely use CPU but keep redrawing their
-# spinner/elapsed timer at KB/s, whereas an idle input prompt is near-silent.
-# opencode's TUI redraws even while settled, so both its thresholds sit higher.
+# write volume (wchar bytes/s). The write signal matters most for claude,
+# codex, and grok: while waiting on the API they barely use CPU but keep
+# redrawing their spinner/elapsed timer at KB/s, whereas an idle input prompt
+# is near-silent. opencode's TUI redraws even while settled, so both its
+# thresholds sit higher. Match /proc comm exactly (`grok`, not grok-cli).
 TERMINAL_SESSION_TOOLS = (
     ("claude", "CLAUDE", 0.03, 1024),
     ("codex", "CODEX", 0.03, 1024),
     ("opencode", "OPENCODE", 0.08, 65536),
+    ("grok", "GROK", 0.03, 1024),
 )
+
+
+def _terminal_cli_names(sep: str = "/") -> str:
+    return sep.join(comm for comm, *_ in TERMINAL_SESSION_TOOLS)
+
+
 TERMINAL_SESSIONS_STATE_PATH = Path.home() / ".claude" / "terminal_sessions.json"
 TERMINAL_SESSIONS_REFRESH_MS = 5 * 1000
 TERMINAL_SESSION_ATTENTION_IDLE_S = 120
@@ -6392,6 +6400,7 @@ _TERMINAL_TOOL_COLORS = {
     "CLAUDE": QColor(212, 165, 116),
     "CODEX": QColor(100, 181, 246),
     "OPENCODE": QColor(129, 199, 132),
+    "GROK": QColor(139, 92, 246),
 }
 
 
@@ -6512,7 +6521,9 @@ class TerminalSessionsRow(QWidget):
         if snapshot.error:
             return f"Terminal session scan failed: {snapshot.error}."
         if not snapshot.sessions:
-            return "No claude/codex/opencode sessions hold a terminal right now."
+            return (
+                f"No {_terminal_cli_names()} sessions hold a terminal right now."
+            )
         lines = []
         for s in _ordered_terminal_sessions(snapshot):
             lines.append(
@@ -6681,7 +6692,9 @@ class TerminalTabsPanel(QWidget):
         self._group_labels = []
         sessions = _ordered_terminal_sessions(snapshot)
         if not sessions:
-            empty = QLabel("no claude / codex / opencode session holds a terminal")
+            empty = QLabel(
+                f"no {_terminal_cli_names(' / ')} session holds a terminal"
+            )
             self._register_drag_handle(empty)
             empty.setStyleSheet("color: #8888a0; font-size: 9px; padding: 8px;")
             self._cards_layout.addWidget(empty)
