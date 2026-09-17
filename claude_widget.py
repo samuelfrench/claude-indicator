@@ -137,13 +137,16 @@ OPENCODE_GO_WINDOW_LIMITS = {
 }
 OPENCODE_GO_REFRESH_MS = 5 * 60 * 1000  # usage endpoint; limits move slowly
 # SuperGrok / Grok Build CLI billing: weekly credit percent from the CLI-proxy
-# credits endpoint. The bearer is the local Grok CLI login, never an xai- key.
+# credits endpoint. Bearer is GROK_OAUTH_TOKEN, then Grok CLI ~/.grok/auth.json,
+# then OpenCode xai oauth access. Never an xai- key; never refresh OAuth.
 GROK_AUTH_PATH = Path.home() / ".grok" / "auth.json"
 GROK_AUTH_CURRENT_PREFIX = "https://auth.x.ai::"
 GROK_AUTH_LEGACY_KEY = "https://accounts.x.ai/sign-in"
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_CLI_TOKEN_AUTH = "xai-grok-cli"
 GROK_REFRESH_MS = 5 * 60 * 1000
+OPENCODE_XAI_AUTH_PATH = DEEPSEEK_AUTH_PATH
+OPENCODE_XAI_PROVIDER_ID = "xai"
 # Local-model token tracking is scoped to the OpenCode ledger on purpose: it is
 # the one place local usage is recorded per message. Other local clients (the
 # clawd-bot runner drives ollama through aider) are outside it and are excluded.
@@ -1758,18 +1761,20 @@ def _reject_xai_api_key(token: str) -> str:
     return token
 
 
-def read_grok_bearer(
-    *,
-    auth_path: Path | None = None,
-    environ: dict | None = None,
-    now: float | None = None,
-) -> str:
-    environment = os.environ if environ is None else environ
-    now = time.time() if now is None else now
-    env_token = environment.get("GROK_OAUTH_TOKEN", "")
-    if isinstance(env_token, str) and env_token.strip():
-        return _reject_xai_api_key(env_token.strip())
-    path = grok_auth_path(environ=environment) if auth_path is None else auth_path
+def _grok_expiry_epoch(value) -> float:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("Grok credential expired")
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            raise ValueError("Grok credential expired")
+        if timestamp > 1e12:
+            timestamp /= 1000.0
+        return timestamp
+    return float(_grok_iso_epoch(value))
+
+
+def _read_grok_cli_bearer(path: Path, now: float) -> str:
     data = _read_owned_private_json(path)
     entry = _select_grok_auth_entry(data)
     key = entry.get("key")
@@ -1779,12 +1784,70 @@ def read_grok_bearer(
     expires_at = entry.get("expires_at")
     if isinstance(expires_at, str) and expires_at.strip():
         try:
-            expiry = _grok_iso_epoch(expires_at)
+            expiry = _grok_expiry_epoch(expires_at)
         except ValueError as exc:
             raise ValueError("Grok credential expired") from exc
         if expiry <= now:
             raise ValueError("Grok credential expired")
     return token
+
+
+def _read_opencode_xai_bearer(path: Path, now: float) -> str:
+    data = _read_owned_private_json(path)
+    provider = data.get(OPENCODE_XAI_PROVIDER_ID)
+    if not isinstance(provider, dict) or provider.get("type") != "oauth":
+        raise ValueError("Grok credential unavailable")
+    access = provider.get("access")
+    if not isinstance(access, str) or not access.strip():
+        raise ValueError("Grok credential unavailable")
+    token = _reject_xai_api_key(access.strip())
+    expires = provider.get("expires")
+    if expires is None:
+        raise ValueError("Grok credential unavailable")
+    try:
+        expiry = _grok_expiry_epoch(expires)
+    except ValueError as exc:
+        raise ValueError("Grok credential expired") from exc
+    if expiry <= now:
+        raise ValueError("Grok credential expired")
+    return token
+
+
+def read_grok_bearer(
+    *,
+    auth_path: Path | None = None,
+    opencode_auth_path: Path | None = None,
+    environ: dict | None = None,
+    now: float | None = None,
+) -> str:
+    environment = os.environ if environ is None else environ
+    now = time.time() if now is None else now
+    env_token = environment.get("GROK_OAUTH_TOKEN", "")
+    if isinstance(env_token, str) and env_token.strip():
+        return _reject_xai_api_key(env_token.strip())
+    cli_path = grok_auth_path(environ=environment) if auth_path is None else auth_path
+    cli_error: ValueError | None = None
+    try:
+        return _read_grok_cli_bearer(cli_path, now)
+    except ValueError as exc:
+        cli_error = exc
+    oc_path = OPENCODE_XAI_AUTH_PATH if opencode_auth_path is None else opencode_auth_path
+    try:
+        return _read_opencode_xai_bearer(oc_path, now)
+    except ValueError as oc_error:
+        if cli_error is None:
+            raise
+        oc_msg = str(oc_error)
+        cli_msg = str(cli_error)
+        specific = {
+            "Grok credential expired",
+            "Grok credential is not a SuperGrok bearer",
+        }
+        if oc_msg in specific:
+            raise oc_error
+        if cli_msg in specific:
+            raise cli_error
+        raise oc_error
 
 
 def _grok_percent(value) -> float:
@@ -1903,12 +1966,18 @@ def read_grok_usage(
     *,
     now: float | None = None,
     auth_path: Path | None = None,
+    opencode_auth_path: Path | None = None,
     environ: dict | None = None,
 ) -> GrokUsageSummary:
     now = time.time() if now is None else now
     summary = GrokUsageSummary()
     try:
-        bearer = read_grok_bearer(auth_path=auth_path, environ=environ, now=now)
+        bearer = read_grok_bearer(
+            auth_path=auth_path,
+            opencode_auth_path=opencode_auth_path,
+            environ=environ,
+            now=now,
+        )
         credits = fetch_grok_credits(bearer)
     except ValueError as exc:
         summary.error = str(exc) or "Grok usage unavailable"
@@ -6158,7 +6227,7 @@ class GrokUsageRow(QWidget):
             meter = "On-demand" if summary.meter == "on_demand" else "Weekly credits"
             lines.append(
                 f"{meter} {summary.used_percent:.0f}% used "
-                "(live Grok CLI /v1/billing?format=credits)."
+                "(live SuperGrok /v1/billing?format=credits)."
             )
             if summary.resets_at > 0:
                 lines.append(

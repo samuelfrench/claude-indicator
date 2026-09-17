@@ -544,9 +544,32 @@ class WidgetUiTest(unittest.TestCase):
         path.write_text(json.dumps(payload))
         path.chmod(mode)
 
+    def _write_opencode_xai_auth(
+        self,
+        path: Path,
+        *,
+        access: str = "opencode-access",
+        expires=None,
+        mode: int = 0o600,
+        provider_type: str = "oauth",
+    ):
+        if expires is None:
+            expires = int((1_800_000_000.0 + 3600) * 1000)
+        payload = {
+            "xai": {
+                "type": provider_type,
+                "access": access,
+                "refresh": "opencode-refresh-must-never-be-returned",
+                "expires": expires,
+            }
+        }
+        path.write_text(json.dumps(payload))
+        path.chmod(mode)
+
     def test_grok_bearer_prefers_env_and_current_auth_entry(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             auth_path = Path(tmpdir) / "auth.json"
+            opencode_auth_path = Path(tmpdir) / "opencode-auth.json"
             self._write_grok_auth(
                 auth_path,
                 {
@@ -564,22 +587,32 @@ class WidgetUiTest(unittest.TestCase):
             self.assertEqual(
                 read_grok_bearer(
                     auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
                     environ={"GROK_OAUTH_TOKEN": "env-token"},
                 ),
                 "env-token",
             )
             self.assertEqual(
-                read_grok_bearer(auth_path=auth_path, environ={}),
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                ),
                 "current-key",
             )
 
             auth_path.chmod(0o644)
             with self.assertRaises(ValueError):
-                read_grok_bearer(auth_path=auth_path, environ={})
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                )
 
     def test_grok_bearer_rejects_xai_api_keys_and_expired_tokens(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             auth_path = Path(tmpdir) / "auth.json"
+            opencode_auth_path = Path(tmpdir) / "opencode-auth.json"
             self._write_grok_auth(
                 auth_path,
                 {
@@ -592,10 +625,15 @@ class WidgetUiTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_grok_bearer(
                     auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
                     environ={"GROK_OAUTH_TOKEN": "xai-management-key"},
                 )
             self.assertEqual(
-                read_grok_bearer(auth_path=auth_path, environ={}),
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                ),
                 "file-key",
             )
 
@@ -608,8 +646,13 @@ class WidgetUiTest(unittest.TestCase):
                     }
                 },
             )
-            with self.assertRaises(ValueError):
-                read_grok_bearer(auth_path=auth_path, environ={})
+            with self.assertRaises(ValueError) as raised:
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                )
+            self.assertEqual(str(raised.exception), "Grok credential is not a SuperGrok bearer")
 
             self._write_grok_auth(
                 auth_path,
@@ -620,8 +663,123 @@ class WidgetUiTest(unittest.TestCase):
                     }
                 },
             )
-            with self.assertRaises(ValueError):
-                read_grok_bearer(auth_path=auth_path, environ={}, now=1_800_000_000.0)
+            with self.assertRaises(ValueError) as raised:
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                    now=1_800_000_000.0,
+                )
+            self.assertEqual(str(raised.exception), "Grok credential expired")
+
+    def test_grok_bearer_falls_back_to_opencode_xai_oauth(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth_path = Path(tmpdir) / "auth.json"
+            opencode_auth_path = Path(tmpdir) / "opencode-auth.json"
+            self._write_opencode_xai_auth(opencode_auth_path)
+
+            self.assertEqual(
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                    now=now,
+                ),
+                "opencode-access",
+            )
+
+            self._write_grok_auth(
+                auth_path,
+                {
+                    "https://auth.x.ai::abc": {
+                        "key": "stale-key",
+                        "expires_at": "2020-01-01T00:00:00Z",
+                    }
+                },
+            )
+            self.assertEqual(
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                    now=now,
+                ),
+                "opencode-access",
+            )
+
+            self._write_grok_auth(
+                auth_path,
+                {
+                    "https://auth.x.ai::abc": {
+                        "key": "cli-key",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                    }
+                },
+            )
+            self.assertEqual(
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                    now=now,
+                ),
+                "cli-key",
+            )
+            self.assertEqual(
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={"GROK_OAUTH_TOKEN": "env-token"},
+                    now=now,
+                ),
+                "env-token",
+            )
+
+            self._write_opencode_xai_auth(
+                opencode_auth_path, access="xai-opencode-key"
+            )
+            self._write_grok_auth(
+                auth_path,
+                {
+                    "https://auth.x.ai::abc": {
+                        "key": "stale-key",
+                        "expires_at": "2020-01-01T00:00:00Z",
+                    }
+                },
+            )
+            with self.assertRaises(ValueError) as raised:
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                    now=now,
+                )
+            self.assertEqual(str(raised.exception), "Grok credential is not a SuperGrok bearer")
+
+            self._write_opencode_xai_auth(
+                opencode_auth_path, expires=int((now - 60) * 1000)
+            )
+            with self.assertRaises(ValueError) as raised:
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                    now=now,
+                )
+            self.assertEqual(str(raised.exception), "Grok credential expired")
+
+            self._write_opencode_xai_auth(
+                opencode_auth_path, provider_type="api"
+            )
+            with self.assertRaises(ValueError) as raised:
+                read_grok_bearer(
+                    auth_path=auth_path,
+                    opencode_auth_path=opencode_auth_path,
+                    environ={},
+                    now=now,
+                )
+            self.assertEqual(str(raised.exception), "Grok credential expired")
 
     def test_grok_row_renders_weekly_percent_products_and_caps(self):
         credits = parse_grok_credits(self.GROK_CREDITS_PAYLOAD)

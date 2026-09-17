@@ -16,7 +16,7 @@ and Ollama/GPU/ComfyUI status in one panel.
 - **Model-specific limits** — shows Opus or Sonnet 7-day utilization when available
 - **Codex limit percentage** — reads current limits through local `codex app-server`, renders whichever one or two windows are present, and combines them with latest-thread and lifetime totals from local Codex state
 - **OpenCode Go subscription usage** — shows the dollar-metered 5-hour ($12), weekly ($30), and monthly ($60) window utilization from OpenCode's official Go usage endpoint, including per-window dollars used and reset times
-- **SuperGrok / Grok Build usage** — shows the weekly credit used percent from the Grok CLI billing endpoint (`/v1/billing?format=credits`), with reset time, product percents, and a positive prepaid/on-demand cap in the expanded row
+- **SuperGrok / Grok Build usage** — shows the weekly credit used percent from the SuperGrok billing endpoint (`/v1/billing?format=credits`) using Grok CLI login or OpenCode `xai` oauth, with reset time, product percents, and a positive prepaid/on-demand cap in the expanded row
 - **DeepSeek spend and credit** — shows OpenCode-recorded DeepSeek cost from the rolling past 24 hours plus current account credit from DeepSeek's official balance endpoint
 - **Embedded Ollama section** — compact Ollama summary that expands to show loaded models, NVIDIA GPU/VRAM, ComfyUI queue state, and locally configured Ollama task loops
 - **Compact system activity** — shows CPU, RAM, GPU, and download/upload byte rates for the active lowest-metric UP IPv4 default-route interface(s); route or counter changes reset the 3-second sample baseline instead of producing a spike
@@ -270,7 +270,7 @@ LD_LIBRARY_PATH=/path/to/miniconda3/lib python claude_widget.py
 3. **Fetches usage data** from `GET https://api.anthropic.com/api/oauth/usage` with the `anthropic-beta: oauth-2025-04-20` header
 4. **Reads Codex usage** from local `codex app-server` (`account/rateLimits/read`) plus `~/.codex/state_*.sqlite`; cached session `token_count` events under `~/.codex/sessions/` are visibly marked fallbacks and are accepted only when no more than five minutes old and not past their reset
 5. **Reads OpenCode Go usage** from `GET https://opencode.ai/zen/go/v1/usage` using the `opencode-go` credential, rendering the 5-hour/weekly/monthly dollar-metered windows
-6. **Reads SuperGrok usage** from `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` using the local Grok CLI login (`GROK_OAUTH_TOKEN` or owner-only `~/.grok/auth.json`) plus `X-XAI-Token-Auth: xai-grok-cli`; `xai-` API keys are never sent
+6. **Reads SuperGrok usage** from `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` using `GROK_OAUTH_TOKEN`, owner-only `~/.grok/auth.json`, or owner-only OpenCode `xai` oauth, plus `X-XAI-Token-Auth: xai-grok-cli`; `xai-` API keys are never sent
 7. **Builds cron health** from `crontab -l` plus `journalctl` execution logs, using command equality and local-time schedule prediction
 8. **Scans local TODO files** on a background Qt worker and writes only the marked Indicator Inbox section in `~/TODO.md`
 9. **Samples system activity** from `/proc`, selecting the active lowest-metric UP IPv4 default-route interface(s) for network byte rates without summing unrelated virtual interfaces
