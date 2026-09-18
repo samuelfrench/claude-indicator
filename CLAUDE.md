@@ -10,6 +10,7 @@ local system activity, and Ollama/GPU/ComfyUI status.
 - **ClaudeUsageClient**: Reads OAuth token from `~/.claude/.credentials.json`, fetches `GET https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` header
 - **ClaudeWidget**: Frameless, translucent, always-on-top PySide6 widget with drag support and fixed 340px width
 - **Traffic Report shortcut**: A keyboard-accessible footer link and tray action open the fixed local dashboard at `http://127.0.0.1:5173/` through `QDesktopServices.openUrl`; the existing report server remains independently managed.
+- **Configure menu**: Header ☰ and tray Configure submenu hide individual sections (Claude usage, history, TABS, deploys, runners, task loops, task groups, cron, system, Local AI) and providers (Codex, DeepSeek, MiniMax, OpenCode Go, Grok, OpenCode ledger, Ollama ledger lines). State is `~/.claude/widget_visibility.json`. Hidden providers skip their fetch; MiniMax/DeepSeek/Go/Ollama hides also filter the OpenCode ledger breakdown.
 - **UsageBar**: Custom-painted progress bars with color coding (green/yellow/orange/red)
 - **UsageGraph**: QPainter line chart showing 5-hour utilization over last 24 hours with gradient fill, grid lines, and 80% threshold
 - **StatsRow**: Compact custom-painted row with AVG, PEAK, TREND, and EXTRA usage stats

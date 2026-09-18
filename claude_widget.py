@@ -83,6 +83,8 @@ LAST_USAGE_PATH = Path.home() / ".claude" / "last_usage.json"
 RATE_LIMIT_STATE_PATH = Path.home() / ".claude" / "widget_rate_limit.json"
 LOG_PATH = Path.home() / ".claude" / "widget.log"
 STATS_CACHE_PATH = Path.home() / ".claude" / "stats-cache.json"
+WIDGET_VISIBILITY_PATH = Path.home() / ".claude" / "widget_visibility.json"
+WIDGET_VISIBILITY_VERSION = 1
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
 SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
@@ -161,6 +163,29 @@ OPENCODE_PROVIDER_LABELS = (
     ("opencode-go", "go"),
 )
 OPENCODE_MODEL_LINES = 5
+WIDGET_SECTIONS = (
+    ("claude", "Claude usage"),
+    ("history", "Usage history"),
+    ("tabs", "Terminal tabs"),
+    ("deploy", "Deploys"),
+    ("runners", "Runners"),
+    ("tasks", "Task loops"),
+    ("groups", "Task groups"),
+    ("cron", "Cron jobs"),
+    ("system", "System"),
+    ("local_ai", "Local AI"),
+)
+WIDGET_PROVIDERS = (
+    ("codex", "Codex"),
+    ("deepseek", "DeepSeek"),
+    ("minimax", "MiniMax"),
+    ("go", "OpenCode Go"),
+    ("grok", "Grok"),
+    ("opencode", "OpenCode ledger"),
+    ("ollama", "Ollama ledger"),
+)
+WIDGET_SECTION_IDS = frozenset(item_id for item_id, _ in WIDGET_SECTIONS)
+WIDGET_PROVIDER_IDS = frozenset(item_id for item_id, _ in WIDGET_PROVIDERS)
 # Agent CLI sessions on terminal tabs: a process from this table with a
 # controlling pts is one tab, judged working by either CPU share or terminal
 # write volume (wchar bytes/s). The write signal matters most for claude,
@@ -2225,6 +2250,64 @@ def _opencode_provider_label(provider: str) -> str:
         if provider == prefix:
             return label
     return provider
+
+
+def opencode_provider_id(provider: str) -> str:
+    for prefix, label in OPENCODE_PROVIDER_LABELS:
+        if provider == prefix or provider == label:
+            return label
+    return provider
+
+
+def load_widget_visibility(
+    path: Path | None = None,
+) -> tuple[set[str], set[str]]:
+    if path is None:
+        path = WIDGET_VISIBILITY_PATH
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set(), set()
+    if not isinstance(payload, dict):
+        return set(), set()
+    sections = payload.get("hidden_sections")
+    providers = payload.get("hidden_providers")
+    hidden_sections = (
+        {str(item) for item in sections if str(item) in WIDGET_SECTION_IDS}
+        if isinstance(sections, list)
+        else set()
+    )
+    hidden_providers = (
+        {str(item) for item in providers if str(item) in WIDGET_PROVIDER_IDS}
+        if isinstance(providers, list)
+        else set()
+    )
+    return hidden_sections, hidden_providers
+
+
+def save_widget_visibility(
+    hidden_sections: set[str],
+    hidden_providers: set[str],
+    path: Path | None = None,
+) -> None:
+    if path is None:
+        path = WIDGET_VISIBILITY_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": WIDGET_VISIBILITY_VERSION,
+        "hidden_sections": sorted(
+            item for item in hidden_sections if item in WIDGET_SECTION_IDS
+        ),
+        "hidden_providers": sorted(
+            item for item in hidden_providers if item in WIDGET_PROVIDER_IDS
+        ),
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
 
 
 def read_opencode_model_breakdown(
@@ -6314,6 +6397,7 @@ class OpencodeUsageRow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._usage: OpencodeUsage | None = None
+        self._hidden_providers: set[str] = set()
         self._expanded = False
         self.setFixedHeight(self._COLLAPSED_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -6325,6 +6409,29 @@ class OpencodeUsageRow(QWidget):
             self.setFixedHeight(self._expanded_height())
             _resize_parent(self)
         self.update()
+
+    def set_hidden_providers(self, hidden: set[str] | None):
+        self._hidden_providers = set(hidden or ())
+        self.setToolTip(self._tooltip(self._usage))
+        if self._expanded:
+            self.setFixedHeight(self._expanded_height())
+        self.update()
+
+    def _provider_hidden(self, provider: str) -> bool:
+        return opencode_provider_id(provider) in self._hidden_providers
+
+    def _visible_models(self) -> list[OpencodeModelUsage]:
+        usage = self._usable()
+        if usage is None:
+            return []
+        return [
+            model
+            for model in usage.models
+            if not self._provider_hidden(model.provider)
+        ]
+
+    def _show_local(self) -> bool:
+        return "ollama" not in self._hidden_providers
 
     def label_text(self) -> str:
         return "OPENCODE"
@@ -6339,13 +6446,12 @@ class OpencodeUsageRow(QWidget):
         usage = self._usable()
         if usage is None:
             return "24H —  ·  — MODELS"
-        return f"24H {_fmt_tokens(usage.window_tokens)}  ·  {len(usage.models)} MODELS"
+        models = self._visible_models()
+        tokens = sum(model.tokens for model in models)
+        return f"24H {_fmt_tokens(tokens)}  ·  {len(models)} MODELS"
 
     def model_lines(self) -> list[tuple[str, str, str, str]]:
         """(model, tokens, provider, cost) for the heaviest models in the window."""
-        usage = self._usable()
-        if usage is None:
-            return []
         return [
             (
                 model.model,
@@ -6353,10 +6459,12 @@ class OpencodeUsageRow(QWidget):
                 _opencode_provider_label(model.provider),
                 _money_text(model.cost, "USD"),
             )
-            for model in usage.models[:OPENCODE_MODEL_LINES]
+            for model in self._visible_models()[:OPENCODE_MODEL_LINES]
         ]
 
     def local_text(self) -> str:
+        if not self._show_local():
+            return ""
         usage = self._usable()
         if usage is None:
             return "DAY —  ·  ALL —"
@@ -6376,23 +6484,30 @@ class OpencodeUsageRow(QWidget):
             return "OpenCode usage has not been read yet."
         if usage.error:
             return f"OpenCode usage unavailable: {usage.error}."
-        lines = [
-            f"Last 24 hours: {_fmt_tokens(usage.window_tokens)} tokens across "
-            f"{len(usage.models)} models in the local OpenCode ledger."
+        models = [
+            model
+            for model in usage.models
+            if not self._provider_hidden(model.provider)
         ]
-        for model in usage.models:
+        tokens = sum(model.tokens for model in models)
+        lines = [
+            f"Last 24 hours: {_fmt_tokens(tokens)} tokens across "
+            f"{len(models)} models in the local OpenCode ledger."
+        ]
+        for model in models:
             lines.append(
                 f"  {_opencode_provider_label(model.provider)} / {model.model}: "
                 f"{_fmt_tokens(model.tokens)} tokens, {model.messages:,} messages, "
                 f"{_money_text(model.cost, 'USD')}"
             )
-        local = usage.local
-        lines.append(
-            f"Local models today: {_fmt_tokens(local.today_tokens)} tokens across "
-            f"{local.today_messages:,} messages; all time "
-            f"{_fmt_tokens(local.all_time_tokens)} across "
-            f"{local.all_time_messages:,} messages."
-        )
+        if self._show_local():
+            local = usage.local
+            lines.append(
+                f"Local models today: {_fmt_tokens(local.today_tokens)} tokens across "
+                f"{local.today_messages:,} messages; all time "
+                f"{_fmt_tokens(local.all_time_tokens)} across "
+                f"{local.all_time_messages:,} messages."
+            )
         lines.append(
             "MiniMax bills by subscription, so its cost reads $0.00 by design. "
             "Local traffic from other clients (the clawd-bot runner drives ollama "
@@ -6401,7 +6516,9 @@ class OpencodeUsageRow(QWidget):
         return "\n".join(lines)
 
     def _expanded_height(self) -> int:
-        rows = 1 + len(self.model_lines()) + 1  # header + models + local summary
+        rows = 1 + len(self.model_lines())
+        if self._show_local():
+            rows += 1
         return self._COLLAPSED_H + rows * self._LINE_H + 6
 
     def mousePressEvent(self, event):
@@ -6448,12 +6565,15 @@ class OpencodeUsageRow(QWidget):
             detail = f"{tokens}  ·  {cost}"
             painter.setPen(QColor(129, 199, 132))
             painter.drawText(self.width() - small.horizontalAdvance(detail) - 4, y, detail)
-        y += self._LINE_H
-        painter.setPen(QColor(100, 100, 120))
-        painter.drawText(8, y, "LOCAL")
-        local = self.local_text()
-        painter.setPen(QColor(150, 150, 170))
-        painter.drawText(self.width() - small.horizontalAdvance(local) - 4, y, local)
+        if self._show_local():
+            y += self._LINE_H
+            painter.setPen(QColor(100, 100, 120))
+            painter.drawText(8, y, "LOCAL")
+            local = self.local_text()
+            painter.setPen(QColor(150, 150, 170))
+            painter.drawText(
+                self.width() - small.horizontalAdvance(local) - 4, y, local
+            )
         painter.end()
 
 
@@ -8248,6 +8368,8 @@ class ClaudeWidget(QWidget):
         self._tabs_panel_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._tabs_panel_anim.finished.connect(self._on_tabs_panel_anim_finished)
         self.destroyed.connect(self._tabs_panel.deleteLater)
+        self._hidden_sections, self._hidden_providers = load_widget_visibility()
+        self._applying_visibility = False
 
         self._build_ui()
         self.adjustSize()
@@ -8339,6 +8461,16 @@ class ClaudeWidget(QWidget):
         header.addWidget(self._title_label)
         header.addStretch()
 
+        self._config_btn = QLabel("☰")
+        self._config_btn.setStyleSheet(
+            "color: #666680; font-size: 13px; padding: 2px 6px;"
+        )
+        self._config_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._config_btn.setAccessibleName("Configure visible sections")
+        self._config_btn.setToolTip("Show or hide sections and providers")
+        self._config_btn.mousePressEvent = lambda _: self._show_config_menu()
+        header.addWidget(self._config_btn)
+
         self._minimize_btn = QLabel("–")
         self._minimize_btn.setStyleSheet(
             "color: #666680; font-size: 14px; padding: 2px 6px;"
@@ -8379,16 +8511,17 @@ class ClaudeWidget(QWidget):
         layout.addWidget(self._model_limits)
         layout.addSpacing(2)
 
-        # Graph separator
-        sep_g = QWidget()
-        sep_g.setFixedHeight(1)
-        sep_g.setStyleSheet("background-color: rgba(100, 100, 120, 80);")
-        layout.addWidget(sep_g)
+        self._graph_sep = QWidget()
+        self._graph_sep.setFixedHeight(1)
+        self._graph_sep.setStyleSheet("background-color: rgba(100, 100, 120, 80);")
+        layout.addWidget(self._graph_sep)
         layout.addSpacing(2)
 
-        # Graph header with window tabs (collapsible)
         self._history_expanded = True
-        graph_header = QHBoxLayout()
+        self._history_header = QWidget()
+        graph_header = QHBoxLayout(self._history_header)
+        graph_header.setContentsMargins(0, 0, 0, 0)
+        graph_header.setSpacing(4)
         self._graph_title = QLabel("Usage History ▾")
         self._graph_title.setStyleSheet("color: #666680; font-size: 9px;")
         self._graph_title.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -8410,7 +8543,7 @@ class ClaudeWidget(QWidget):
                 graph_header.addWidget(spacer)
                 self._window_spacers.append(spacer)
 
-        layout.addLayout(graph_header)
+        layout.addWidget(self._history_header)
 
         # Usage graph
         self._graph = UsageGraph()
@@ -8547,6 +8680,183 @@ class ClaudeWidget(QWidget):
 
         layout.addLayout(status_layout)
 
+    def _section_visible(self, section_id: str) -> bool:
+        return section_id not in self._hidden_sections
+
+    def _provider_visible(self, provider_id: str) -> bool:
+        return provider_id not in self._hidden_providers
+
+    def _ledger_hidden_providers(self) -> set[str]:
+        return self._hidden_providers & {"minimax", "deepseek", "go", "ollama"}
+
+    def _persist_visibility(self) -> None:
+        save_widget_visibility(self._hidden_sections, self._hidden_providers)
+
+    def _set_section_visible(self, section_id: str, visible: bool) -> None:
+        if section_id not in WIDGET_SECTION_IDS:
+            return
+        if visible:
+            self._hidden_sections.discard(section_id)
+        else:
+            self._hidden_sections.add(section_id)
+        self._persist_visibility()
+        self.adjustSize()
+        if visible:
+            self._refresh_after_unhide("section", section_id)
+
+    def _set_provider_visible(self, provider_id: str, visible: bool) -> None:
+        if provider_id not in WIDGET_PROVIDER_IDS:
+            return
+        if visible:
+            self._hidden_providers.discard(provider_id)
+        else:
+            self._hidden_providers.add(provider_id)
+        self._persist_visibility()
+        self.adjustSize()
+        if visible:
+            self._refresh_after_unhide("provider", provider_id)
+
+    def _refresh_after_unhide(self, kind: str, item_id: str) -> None:
+        if kind == "provider":
+            if item_id == "codex":
+                self._refresh_codex_usage()
+            elif item_id == "deepseek":
+                self._refresh_deepseek_usage()
+            elif item_id == "minimax":
+                self._refresh_minimax_usage()
+            elif item_id == "go":
+                self._refresh_opencode_go_usage()
+            elif item_id == "grok":
+                self._refresh_grok_usage()
+            elif item_id in ("opencode", "ollama"):
+                self._refresh_opencode_usage()
+            return
+        if item_id in ("claude", "history"):
+            self._fetch_usage()
+        elif item_id == "tabs":
+            self._refresh_terminal_sessions()
+        elif item_id == "deploy":
+            self._fetch_deploys()
+        elif item_id == "runners":
+            self._fetch_runners()
+        elif item_id == "tasks":
+            self._fetch_task_loops()
+        elif item_id == "groups":
+            self._fetch_task_groups()
+        elif item_id == "cron":
+            self._fetch_cron_jobs()
+        elif item_id == "system":
+            self._update_system_metrics()
+        elif item_id == "local_ai":
+            self._fetch_ollama()
+            self._fetch_comfyui()
+            self._fetch_task_loops()
+            self._update_system_metrics()
+
+    def _set_hideable_row_visible(
+        self, row: QWidget, visible: bool, content
+    ) -> None:
+        row.setVisible(bool(visible and content))
+
+    def _apply_visibility(self) -> None:
+        if self._applying_visibility or not hasattr(self, "_usage_limits"):
+            return
+        self._applying_visibility = True
+        try:
+            claude_on = self._section_visible("claude")
+            self._usage_limits.setVisible(claude_on)
+            if not claude_on:
+                self._model_limits.setVisible(False)
+            elif (
+                self._has_fetched_usage
+                and self._usage is not None
+                and not self._usage.error
+                and self._usage.display_model_limits
+            ):
+                self._model_limits.setVisible(True)
+
+            history_on = self._section_visible("history")
+            self._graph_sep.setVisible(history_on)
+            self._history_header.setVisible(history_on)
+            expanded = history_on and self._history_expanded
+            for widget in self._window_labels + self._window_spacers:
+                widget.setVisible(expanded)
+            self._graph.setVisible(expanded)
+            self._stats_sep.setVisible(expanded)
+            self._stats_row.setVisible(expanded)
+            self._token_row.setVisible(expanded)
+
+            self._codex_row.setVisible(self._provider_visible("codex"))
+            self._deepseek_row.setVisible(self._provider_visible("deepseek"))
+            self._minimax_row.setVisible(self._provider_visible("minimax"))
+            self._go_row.setVisible(self._provider_visible("go"))
+            self._grok_row.setVisible(self._provider_visible("grok"))
+            self._opencode_row.set_hidden_providers(self._ledger_hidden_providers())
+            self._opencode_row.setVisible(self._provider_visible("opencode"))
+
+            tabs_on = self._section_visible("tabs")
+            self._terminal_sessions_row.setVisible(tabs_on)
+            if not tabs_on:
+                self._hide_tabs_panel()
+
+            self._set_hideable_row_visible(
+                self._deploy_row, self._section_visible("deploy"), self._deploy_row._deploys
+            )
+            self._set_hideable_row_visible(
+                self._runners_row,
+                self._section_visible("runners"),
+                self._runners_row._runners,
+            )
+            self._set_hideable_row_visible(
+                self._task_loop_row,
+                self._section_visible("tasks"),
+                self._task_loop_row._loops,
+            )
+            self._set_hideable_row_visible(
+                self._task_group_row,
+                self._section_visible("groups"),
+                self._task_group_row._groups,
+            )
+            self._set_hideable_row_visible(
+                self._cron_row, self._section_visible("cron"), self._cron_row._jobs
+            )
+            self._sys_row.setVisible(self._section_visible("system"))
+            self._local_ai_section.setVisible(self._section_visible("local_ai"))
+        finally:
+            self._applying_visibility = False
+
+    def _populate_config_menu(self, menu: QMenu) -> None:
+        menu.clear()
+        sections = QMenu("Sections", menu)
+        providers = QMenu("Providers", menu)
+        menu.addMenu(sections)
+        menu.addMenu(providers)
+        menu._visibility_sections = sections
+        menu._visibility_providers = providers
+        for section_id, label in WIDGET_SECTIONS:
+            action = sections.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self._section_visible(section_id))
+            action.triggered.connect(
+                lambda checked, item_id=section_id: self._set_section_visible(
+                    item_id, checked
+                )
+            )
+        for provider_id, label in WIDGET_PROVIDERS:
+            action = providers.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self._provider_visible(provider_id))
+            action.triggered.connect(
+                lambda checked, item_id=provider_id: self._set_provider_visible(
+                    item_id, checked
+                )
+            )
+
+    def _show_config_menu(self) -> None:
+        menu = QMenu(self)
+        self._populate_config_menu(menu)
+        menu.exec(self._config_btn.mapToGlobal(QPoint(0, self._config_btn.height())))
+
     def clamp_to_available_screen(self) -> None:
         """Reposition the full panel inside the primary screen's work area."""
         screen = QApplication.primaryScreen()
@@ -8569,6 +8879,7 @@ class ClaudeWidget(QWidget):
             )
 
     def adjustSize(self):
+        self._apply_visibility()
         super().adjustSize()
         self.clamp_to_available_screen()
 
@@ -8669,6 +8980,10 @@ class ClaudeWidget(QWidget):
 
     def _fetch_usage(self, force: bool = False):
         if self._shutdown_started:
+            return
+        if not (
+            self._section_visible("claude") or self._section_visible("history")
+        ):
             return
         if self._worker and self._worker.isRunning():
             return
@@ -8796,8 +9111,8 @@ class ClaudeWidget(QWidget):
         estimate = self._history.estimated_time_left(data.five_hour.utilization)
         self._usage_limits.set_data(data, estimate=estimate)
         if self._has_fetched_usage and data.display_model_limits:
-            self._model_limits.setVisible(True)
             self._model_limits.set_data(data.display_model_limits)
+            self._model_limits.setVisible(self._section_visible("claude"))
         else:
             self._model_limits.setVisible(False)
         self.adjustSize()
@@ -8864,13 +9179,6 @@ class ClaudeWidget(QWidget):
 
     def _set_history_expanded(self, visible: bool):
         self._history_expanded = bool(visible)
-        for w in self._window_labels + self._window_spacers:
-            w.setVisible(self._history_expanded)
-        self._graph.setVisible(self._history_expanded)
-        self._stats_sep.setVisible(self._history_expanded)
-        self._stats_row.setVisible(self._history_expanded)
-        self._token_row.setVisible(self._history_expanded)
-
         arrow = "▾" if self._history_expanded else "▸"
         if self._history_expanded:
             self._graph_title.setText(f"Usage History {arrow}")
@@ -8894,6 +9202,8 @@ class ClaudeWidget(QWidget):
             self._update_display()
 
     def _fetch_deploys(self):
+        if not self._section_visible("deploy"):
+            return
         if self._deploy_worker and self._deploy_worker.isRunning():
             return
         self._deploy_worker = DeployFetchWorker()
@@ -8905,6 +9215,8 @@ class ClaudeWidget(QWidget):
         self.adjustSize()
 
     def _fetch_runners(self):
+        if not self._section_visible("runners"):
+            return
         if self._runner_worker and self._runner_worker.isRunning():
             return
         self._runner_worker = RunnerFetchWorker()
@@ -8916,6 +9228,10 @@ class ClaudeWidget(QWidget):
         self.adjustSize()
 
     def _fetch_task_loops(self):
+        if not (
+            self._section_visible("tasks") or self._section_visible("local_ai")
+        ):
+            return
         if self._task_loop_worker and self._task_loop_worker.isRunning():
             return
         self._task_loop_worker = TaskLoopFetchWorker()
@@ -8928,6 +9244,8 @@ class ClaudeWidget(QWidget):
         self.adjustSize()
 
     def _fetch_task_groups(self):
+        if not self._section_visible("groups"):
+            return
         if self._task_group_worker and self._task_group_worker.isRunning():
             return
         self._task_group_worker = TaskGroupFetchWorker()
@@ -8935,6 +9253,8 @@ class ClaudeWidget(QWidget):
         self._task_group_worker.start()
 
     def _fetch_cron_jobs(self):
+        if not self._section_visible("cron"):
+            return
         if self._cron_worker and self._cron_worker.isRunning():
             return
         self._cron_worker = CronJobsFetchWorker()
@@ -8950,11 +9270,17 @@ class ClaudeWidget(QWidget):
         self.adjustSize()
 
     def _update_system_metrics(self):
+        if not (
+            self._section_visible("system") or self._section_visible("local_ai")
+        ):
+            return
         metrics = self._sys_reader.read()
         self._sys_row.set_data(metrics)
         self._local_ai_section.set_gpu(metrics)
 
     def _refresh_codex_usage(self):
+        if not self._provider_visible("codex"):
+            return
         if self._codex_worker and self._codex_worker.isRunning():
             return
         self._codex_worker = CodexUsageWorker()
@@ -8967,6 +9293,8 @@ class ClaudeWidget(QWidget):
 
     def _refresh_deepseek_usage(self):
         if self._shutdown_started:
+            return
+        if not self._provider_visible("deepseek"):
             return
         if self._deepseek_worker and self._deepseek_worker.isRunning():
             return
@@ -8981,6 +9309,8 @@ class ClaudeWidget(QWidget):
     def _refresh_minimax_usage(self):
         if self._shutdown_started:
             return
+        if not self._provider_visible("minimax"):
+            return
         if self._minimax_worker and self._minimax_worker.isRunning():
             return
         self._minimax_worker = MinimaxUsageWorker()
@@ -8993,6 +9323,8 @@ class ClaudeWidget(QWidget):
 
     def _refresh_opencode_go_usage(self):
         if self._shutdown_started:
+            return
+        if not self._provider_visible("go"):
             return
         if self._go_worker and self._go_worker.isRunning():
             return
@@ -9007,6 +9339,8 @@ class ClaudeWidget(QWidget):
     def _refresh_grok_usage(self):
         if self._shutdown_started:
             return
+        if not self._provider_visible("grok"):
+            return
         if self._grok_worker and self._grok_worker.isRunning():
             return
         self._grok_worker = GrokUsageWorker()
@@ -9020,6 +9354,8 @@ class ClaudeWidget(QWidget):
     def _refresh_opencode_usage(self):
         if self._shutdown_started:
             return
+        if not self._provider_visible("opencode"):
+            return
         if self._opencode_worker and self._opencode_worker.isRunning():
             return
         self._opencode_worker = OpencodeUsageWorker()
@@ -9032,6 +9368,8 @@ class ClaudeWidget(QWidget):
 
     def _refresh_terminal_sessions(self):
         self._refresh_terminal_recovery()
+        if not self._section_visible("tabs"):
+            return
         # Synchronous on purpose: one /proc pass with no network, same as the
         # system-metrics reader, so parked toggles never race a worker thread.
         snapshot, self._terminal_state = read_terminal_sessions(
@@ -9230,6 +9568,8 @@ class ClaudeWidget(QWidget):
     def _fetch_ollama(self):
         if self._shutdown_started:
             return
+        if not self._section_visible("local_ai"):
+            return
         if self._ollama_worker and self._ollama_worker.isRunning():
             return
         self._ollama_worker = OllamaFetchWorker()
@@ -9242,6 +9582,8 @@ class ClaudeWidget(QWidget):
 
     def _fetch_comfyui(self):
         if self._shutdown_started:
+            return
+        if not self._section_visible("local_ai"):
             return
         if self._comfyui_worker and self._comfyui_worker.isRunning():
             return
@@ -9295,6 +9637,12 @@ class ClaudeWidget(QWidget):
         recovery_action = QAction("Terminal recovery…", self)
         recovery_action.triggered.connect(self._show_terminal_recovery)
         menu.addAction(recovery_action)
+        configure_menu = QMenu("Configure", menu)
+        self._populate_config_menu(configure_menu)
+        configure_menu.aboutToShow.connect(
+            lambda m=configure_menu: self._populate_config_menu(m)
+        )
+        menu.addMenu(configure_menu)
         self._show_hide_action = QAction("Show/Hide", self)
         self._show_hide_action.triggered.connect(self._toggle_from_tray)
         menu.addAction(self._show_hide_action)
@@ -9380,9 +9728,10 @@ class ClaudeWidget(QWidget):
         left = available.right() - self._restore_sliver.width() + 1
         self._tabs_panel_anim.stop()
         self._tabs_panel_closing = False
-        self._terminal_sessions_row.set_panel_open(True)
-        self._tabs_panel.move(self._panel_positions()[0])
-        self._tabs_panel.show()
+        if self._section_visible("tabs"):
+            self._terminal_sessions_row.set_panel_open(True)
+            self._tabs_panel.move(self._panel_positions()[0])
+            self._tabs_panel.show()
         self.hide()
         self._restore_sliver.move(left, top)
         self._restore_sliver.show()

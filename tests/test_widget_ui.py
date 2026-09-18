@@ -16,7 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QFont, QFontMetrics
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 import claude_widget
 from claude_widget import (
@@ -58,6 +58,10 @@ from claude_widget import (
     _parse_model_limits,
     _normalize_model_name,
     load_last_usage,
+    load_widget_visibility,
+    save_widget_visibility,
+    WIDGET_PROVIDERS,
+    WIDGET_SECTIONS,
     ModelLimitsWidget,
     read_codex_rate_limit,
     read_latest_codex_rate_limit,
@@ -1350,11 +1354,18 @@ class WidgetUiTest(unittest.TestCase):
         *,
         tray_available: bool = False,
         smart_todo_dialog_factory=None,
+        visibility=None,
     ):
         dialog_factory = smart_todo_dialog_factory or Mock(
             side_effect=self._FakeSmartTodoDialog
         )
+        vis_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(vis_dir.cleanup)
+        vis_path = Path(vis_dir.name) / "widget_visibility.json"
+        if visibility is not None:
+            vis_path.write_text(json.dumps(visibility), encoding="utf-8")
         patches = [
+            patch.object(claude_widget, "WIDGET_VISIBILITY_PATH", vis_path),
             patch.object(
                 QSystemTrayIcon,
                 "isSystemTrayAvailable",
@@ -1603,9 +1614,9 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertEqual(
             [action.text() for action in actions],
-            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Show/Hide", "", "Quit"],
+            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
         )
-        self.assertTrue(actions[4].isSeparator())
+        self.assertTrue(actions[5].isSeparator())
 
     def test_smart_todo_tray_has_exact_initial_tooltip(self):
         widget = self._make_inert_claude_widget(tray_available=True)
@@ -1666,13 +1677,13 @@ class WidgetUiTest(unittest.TestCase):
         self.assertFalse(retry_timer.isActive())
         self.assertEqual(
             [action.text() for action in tray.contextMenu().actions()],
-            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Show/Hide", "", "Quit"],
+            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
         )
 
         retry_timer.timeout.emit()
 
         self.assertIs(widget._tray, tray)
-        self.assertEqual(len(tray.contextMenu().actions()), 6)
+        self.assertEqual(len(tray.contextMenu().actions()), 7)
 
     def test_repeated_unavailable_tray_retries_log_only_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2830,6 +2841,149 @@ class WidgetUiTest(unittest.TestCase):
             timeout_ms = worker.wait.call_args.args[0]
             self.assertGreaterEqual(timeout_ms, 0)
             self.assertLessEqual(timeout_ms, 16_000)
+
+    def test_load_widget_visibility_defaults_and_ignores_unknown_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "missing.json"
+            self.assertEqual(load_widget_visibility(missing), (set(), set()))
+            path = Path(tmpdir) / "widget_visibility.json"
+            path.write_text(
+                json.dumps({
+                    "version": 1,
+                    "hidden_sections": ["system", "not-a-section"],
+                    "hidden_providers": ["grok", "nope"],
+                }),
+                encoding="utf-8",
+            )
+            sections, providers = load_widget_visibility(path)
+        self.assertEqual(sections, {"system"})
+        self.assertEqual(providers, {"grok"})
+
+    def test_save_widget_visibility_round_trips_known_ids(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "widget_visibility.json"
+            save_widget_visibility({"cron", "bogus"}, {"minimax", "x"}, path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            sections, providers = load_widget_visibility(path)
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["hidden_sections"], ["cron"])
+        self.assertEqual(payload["hidden_providers"], ["minimax"])
+        self.assertEqual(sections, {"cron"})
+        self.assertEqual(providers, {"minimax"})
+
+    def test_hiding_minimax_filters_opencode_model_lines(self):
+        row = OpencodeUsageRow()
+        row.set_data(self._sample_opencode_usage())
+        row.set_hidden_providers({"minimax"})
+
+        self.assertEqual(
+            [line[0] for line in row.model_lines()],
+            ["qwen3.6:27b-mtp-ctx32k", "deepseek-chat"],
+        )
+        self.assertEqual(row.summary_text(), "24H 5.3M  ·  2 MODELS")
+        self.assertNotIn("MiniMax-M3", row.toolTip())
+
+    def test_hiding_ollama_hides_opencode_local_line(self):
+        row = OpencodeUsageRow()
+        row.set_data(self._sample_opencode_usage())
+        row.set_hidden_providers({"ollama"})
+
+        self.assertEqual(row.local_text(), "")
+        self.assertEqual(
+            [line[0] for line in row.model_lines()],
+            ["MiniMax-M3", "deepseek-chat"],
+        )
+        self.assertNotIn("Local models today", row.toolTip())
+
+    def test_widget_hides_configured_sections_and_providers(self):
+        widget = self._make_inert_claude_widget(
+            visibility={
+                "version": 1,
+                "hidden_sections": ["system"],
+                "hidden_providers": ["grok"],
+            }
+        )
+        widget.show()
+
+        self.assertTrue(widget._sys_row.isHidden())
+        self.assertTrue(widget._grok_row.isHidden())
+        self.assertFalse(widget._codex_row.isHidden())
+        self.assertFalse(widget._usage_limits.isHidden())
+
+    def test_configure_menu_toggles_persist_and_hide_provider_row(self):
+        widget = self._make_inert_claude_widget()
+        widget.show()
+        self.assertFalse(widget._minimax_row.isHidden())
+
+        widget._set_provider_visible("minimax", False)
+
+        self.assertTrue(widget._minimax_row.isHidden())
+        payload = json.loads(
+            claude_widget.WIDGET_VISIBILITY_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["hidden_providers"], ["minimax"])
+
+        widget._set_provider_visible("minimax", True)
+        self.assertFalse(widget._minimax_row.isHidden())
+        payload = json.loads(
+            claude_widget.WIDGET_VISIBILITY_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["hidden_providers"], [])
+
+    def test_configure_menu_hides_history_section(self):
+        widget = self._make_inert_claude_widget()
+        widget.show()
+        widget._set_section_visible("history", False)
+
+        self.assertTrue(widget._history_header.isHidden())
+        self.assertTrue(widget._graph.isHidden())
+        self.assertTrue(widget._stats_row.isHidden())
+        payload = json.loads(
+            claude_widget.WIDGET_VISIBILITY_PATH.read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["hidden_sections"], ["history"])
+
+    def test_tray_configure_menu_lists_sections_and_providers(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        widget.show()
+        actions = widget._tray.contextMenu().actions()
+        self.assertEqual(
+            [action.text() for action in actions],
+            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
+        )
+        menu = QMenu()
+        widget._populate_config_menu(menu)
+        self.assertEqual(
+            [action.text() for action in menu.actions()],
+            ["Sections", "Providers"],
+        )
+        sections = menu._visibility_sections
+        providers = menu._visibility_providers
+        self.assertEqual(
+            [action.text() for action in sections.actions()],
+            [label for _, label in WIDGET_SECTIONS],
+        )
+        self.assertEqual(
+            [action.text() for action in providers.actions()],
+            [label for _, label in WIDGET_PROVIDERS],
+        )
+        self.assertTrue(
+            all(action.isCheckable() and action.isChecked() for action in sections.actions())
+        )
+        self.assertTrue(
+            all(action.isCheckable() and action.isChecked() for action in providers.actions())
+        )
+        grok = next(action for action in providers.actions() if action.text() == "Grok")
+        grok.trigger()
+        self.assertTrue(widget._grok_row.isHidden())
+        self.assertFalse(grok.isChecked())
+
+    def test_header_config_button_is_present(self):
+        widget = self._make_inert_claude_widget()
+        self.assertEqual(widget._config_btn.accessibleName(), "Configure visible sections")
+        self.assertEqual(
+            widget._config_btn.toolTip(), "Show or hide sections and providers"
+        )
 
 
 class WindowDragTest(unittest.TestCase):

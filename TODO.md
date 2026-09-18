@@ -1,5 +1,9 @@
 # Claude Indicator TODO
 
+## In progress
+
+- [ ] **2026-09-17: Configure menu to hide sections and providers.** Header ☰ + tray Configure submenu hide sections (Claude usage, history, TABS, deploys, runners, task loops, task groups, cron, system, Local AI) and providers (Codex, DeepSeek, MiniMax, OpenCode Go, Grok, OpenCode ledger, Ollama ledger). State `~/.claude/widget_visibility.json`. Hidden providers skip fetches; MiniMax/DeepSeek/Go/Ollama also filter the OpenCode ledger. Tests: `PYTHONPATH=. QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q` **431 passed, 10 subtests passed**. Next: commit, push, restart `app-claude\x2dwidget@autostart.service`, visually confirm the ☰ menu.
+
 ## Known non-blocking failures — check here BEFORE diagnosing a red suite
 
 - Live SuperGrok billing 200 omits `creditUsagePercent` and has `onDemandCap.val=0` while still sending a weekly `currentPeriod` (probed 2026-09-09, HTTP 200, 413-byte JSON, `isUnifiedBillingUser: true`). `parse_grok_credits` raises `Grok billing has no weekly or on-demand meter`; that payload is still a visible error, not 0%; `tests/test_widget_ui.py` covers it. Real fix not done: treat proto3-omitted `creditUsagePercent` as 0% for unified weekly users — the plan forbids guessing 0%. **2026-09-17:** this is not why the GROK row was empty during OpenCode Grok use. Grok CLI `expires_at` is `2026-09-17T03:41:19Z` (expired). OpenCode `xai` oauth against the same endpoint returns `creditUsagePercent: 27` / `GrokBuild` 27% (HTTP 200, 500 bytes). Parser unchanged.
