@@ -2103,6 +2103,35 @@ def test_fifo_todo_is_skipped_promptly_and_shutdown_remains_responsive(
     assert writer.is_alive() is False
 
 
+def test_shutdown_timeout_retains_live_scan_worker(qapp, tmp_path, dialog_cleanup, monkeypatch):
+    dialog = make_dialog(tmp_path, dialog_cleanup, home_text="# TODO\n")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_scan(_worker):
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(smart_todos.TodoScanWorker, "run", blocked_scan)
+    dialog.refresh()
+    worker = dialog.worker
+    try:
+        assert started.wait(1)
+        before = time.monotonic()
+        assert dialog.shutdown(timeout_ms=10) is False
+        assert time.monotonic() - before < .5
+        assert dialog.worker is worker
+        assert worker.isRunning()
+        assert worker.isInterruptionRequested()
+        qapp.processEvents()
+        assert dialog.worker is worker
+    finally:
+        release.set()
+        assert worker.wait(1000)
+    assert dialog.shutdown(timeout_ms=10) is True
+    assert dialog.worker is None
+
+
 def _perimeter_contains(widget, color: QColor) -> bool:
     image = widget.grab().toImage()
     width = image.width()

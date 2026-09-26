@@ -1735,7 +1735,10 @@ class WidgetUiTest(unittest.TestCase):
         widget.shutdown()
 
         self.assertTrue(event.accepted)
-        dialog.shutdown.assert_called_once_with()
+        dialog.shutdown.assert_called_once()
+        timeout_ms = dialog.shutdown.call_args.kwargs["timeout_ms"]
+        self.assertGreaterEqual(timeout_ms, 0)
+        self.assertLessEqual(timeout_ms, 16_000)
 
     def test_widget_grows_when_model_limit_bar_appears(self):
         widget = self._make_inert_claude_widget()
@@ -2827,8 +2830,15 @@ class WidgetUiTest(unittest.TestCase):
                 self.requestInterruption = Mock()
                 self.wait = Mock(return_value=True)
 
-        workers = [Worker(), Worker(), Worker()]
-        widget._deepseek_worker, widget._ollama_worker, widget._comfyui_worker = workers
+        worker_names = (
+            "_worker", "_deploy_worker", "_runner_worker", "_task_loop_worker",
+            "_task_group_worker", "_cron_worker", "_codex_worker",
+            "_deepseek_worker", "_minimax_worker", "_go_worker", "_grok_worker",
+            "_opencode_worker", "_ollama_worker", "_comfyui_worker", "_terminal_focus_worker",
+        )
+        workers = [Worker() for _ in worker_names]
+        for name, worker in zip(worker_names, workers):
+            setattr(widget, name, worker)
 
         widget.shutdown()
         widget.shutdown()
@@ -2841,6 +2851,24 @@ class WidgetUiTest(unittest.TestCase):
             timeout_ms = worker.wait.call_args.args[0]
             self.assertGreaterEqual(timeout_ms, 0)
             self.assertLessEqual(timeout_ms, 16_000)
+        self.assertFalse(widget._shutdown_workers_pending)
+
+    def test_shutdown_marks_workers_that_exceed_shared_deadline(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        widget._deploy_worker = Mock()
+        widget._deploy_worker.wait.return_value = False
+        with patch.object(claude_widget, "log_line"):
+            widget.shutdown()
+        self.assertTrue(widget._shutdown_workers_pending)
+
+    def test_shutdown_gives_smart_todo_remaining_deadline_and_marks_timeout(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        widget._smart_todo_dialog = Mock()
+        widget._smart_todo_dialog.shutdown.return_value = False
+        with patch.object(claude_widget.time, "monotonic", side_effect=[100, 116]), patch.object(claude_widget, "log_line"):
+            widget.shutdown()
+        widget._smart_todo_dialog.shutdown.assert_called_once_with(timeout_ms=0)
+        self.assertTrue(widget._shutdown_workers_pending)
 
     def test_load_widget_visibility_defaults_and_ignores_unknown_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:

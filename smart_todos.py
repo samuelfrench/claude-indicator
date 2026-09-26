@@ -2607,16 +2607,19 @@ class SmartTodoDialog(QDialog):
         except Exception as error:
             self.status_label.setText(str(error) or error.__class__.__name__)
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_ms: int = 16_000) -> bool:
+        """Stop within the caller's budget; retain ownership of a stuck worker."""
+        first_shutdown = not self._shutting_down
         self._shutting_down = True
         self._refresh_pending = False
         worker = self._worker
         if worker is None:
-            return
-        for signal, slot in (
+            return True
+        signal_slots = (
             (worker.result, self._on_scan_result),
             (worker.failed, self._on_scan_failed),
-        ):
+        ) if first_shutdown else ()
+        for signal, slot in signal_slots:
             try:
                 signal.disconnect(slot)
             except RuntimeError:
@@ -2628,6 +2631,9 @@ class SmartTodoDialog(QDialog):
             except RuntimeError:
                 pass
         if worker.isRunning():
-            worker.wait()
+            worker.requestInterruption()
+            if not worker.wait(max(0, timeout_ms)):
+                return False
         worker.deleteLater()
         self._worker = None
+        return True

@@ -63,6 +63,7 @@ from PySide6.QtWidgets import (
 from smart_todos import SmartTodoDialog
 from terminal_recovery import TerminalRecoveryStore, scan_terminals
 from terminal_recovery_ui import TerminalRecoveryDialog, local_time
+from widget_runtime import InstanceLock, QtServiceRuntime
 
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
@@ -9777,6 +9778,13 @@ class ClaudeWidget(QWidget):
         workers = tuple(
             worker
             for worker in (
+                self._worker,
+                self._deploy_worker,
+                self._runner_worker,
+                self._task_loop_worker,
+                self._task_group_worker,
+                self._cron_worker,
+                self._codex_worker,
                 self._deepseek_worker,
                 self._minimax_worker,
                 self._go_worker,
@@ -9791,12 +9799,17 @@ class ClaudeWidget(QWidget):
         for worker in workers:
             worker.requestInterruption()
         deadline = time.monotonic() + 16.0
+        self._shutdown_workers_pending = False
         for worker in workers:
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             if not worker.wait(remaining_ms):
+                self._shutdown_workers_pending = True
                 log_line(f"shutdown: {type(worker).__name__} did not stop before deadline")
         if self._smart_todo_dialog is not None:
-            self._smart_todo_dialog.shutdown()
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not self._smart_todo_dialog.shutdown(timeout_ms=remaining_ms):
+                self._shutdown_workers_pending = True
+                log_line("shutdown: SmartTodo scan did not stop before deadline")
 
     def closeEvent(self, event):
         if self._tray is not None:
@@ -9838,12 +9851,17 @@ class ClaudeWidget(QWidget):
 
 
 def main():
+    instance_lock = InstanceLock()
+    if not instance_lock.acquire():
+        print("Claude indicator is already running", file=sys.stderr)
+        return
     forced_platform = _preferred_qt_platform(os.environ)
     if forced_platform:
         os.environ["QT_QPA_PLATFORM"] = forced_platform
     app = QApplication(sys.argv)
     app.setApplicationName("Claude Usage Widget")
     app.setQuitOnLastWindowClosed(False)
+    runtime = QtServiceRuntime(app)
 
     widget = ClaudeWidget()
     app.aboutToQuit.connect(widget.shutdown)
@@ -9857,7 +9875,20 @@ def main():
     widget.move(screen.width() - widget.width() - 20, 40)
     widget.clamp_to_available_screen()
 
-    sys.exit(app.exec())
+    runtime.start()
+    try:
+        exit_code = app.exec()
+    finally:
+        runtime.stopping()
+        instance_lock.close()
+    if getattr(widget, "_shutdown_workers_pending", False):
+        # Qt aborts when Python destroys a running QThread. The user already
+        # requested exit and cleanup had its bounded chance: preserve a clean
+        # Quit instead of turning it into a crash/restart during finalization.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
