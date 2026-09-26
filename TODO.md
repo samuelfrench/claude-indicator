@@ -1,5 +1,9 @@
 # Claude Indicator TODO
 
+## Active: restart and crash hardening (2026-09-26)
+
+- [ ] Diagnose reported disappearance, restart, and harden recovery. Initial live evidence: primary checkout HEAD/origin `3b9e4fb`, clean tree; PID 1948450 alive for 10 hours with successful 16:53 usage fetch and X11 windows. Temporary `claude-widget-1790423313.service` has `Restart=no`; crash is not established. Replace temporary launch with reproducible persistent supervision, add meaningful recovery tests, run full pytest, push, and verify real window plus automatic recovery. No external approval clock, upstream dependency fix, or billing change anticipated. Reproduce state with `systemctl --user show claude-widget-1790423313.service -p MainPID -p Restart` and `journalctl --user -b -u claude-widget-1790423313.service`.
+
 ## Known non-blocking failures — check here BEFORE diagnosing a red suite
 
 - Live SuperGrok billing 200 omits `creditUsagePercent` and has `onDemandCap.val=0` while still sending a weekly `currentPeriod` (probed 2026-09-09, HTTP 200, 413-byte JSON, `isUnifiedBillingUser: true`). `parse_grok_credits` raises `Grok billing has no weekly or on-demand meter`; that payload is still a visible error, not 0%; `tests/test_widget_ui.py` covers it. Real fix not done: treat proto3-omitted `creditUsagePercent` as 0% for unified weekly users — the plan forbids guessing 0%. **2026-09-17:** this is not why the GROK row was empty during OpenCode Grok use. Grok CLI `expires_at` is `2026-09-17T03:41:19Z` (expired). OpenCode `xai` oauth against the same endpoint returns `creditUsagePercent: 27` / `GrokBuild` 27% (HTTP 200, 500 bytes). Parser unchanged.
