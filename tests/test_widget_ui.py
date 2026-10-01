@@ -82,6 +82,8 @@ from claude_widget import (
     parse_grok_credits,
     fetch_grok_credits,
     read_grok_bearer,
+    read_claude_oauth_token,
+    parse_unified_ratelimit_headers,
     record_deepseek_snapshot,
     save_last_usage,
     UsageData,
@@ -1221,6 +1223,298 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual([ml.name for ml in data.model_limits], ["Fable", "Minimax"])
         self.assertEqual(data.model_name, "fable")
         self.assertEqual(data.model_pct, 3.0)
+
+    # Captured from a live POST /v1/messages with the long-lived Claude Code
+    # OAuth token on 2026-10-01 (reset epochs = 19:40Z today, 08:00Z Oct 6).
+    _UNIFIED_HEADERS = {
+        "Anthropic-Ratelimit-Unified-5h-Reset": "1790883600",
+        "Anthropic-Ratelimit-Unified-5h-Status": "allowed",
+        "Anthropic-Ratelimit-Unified-5h-Utilization": "0.14",
+        "Anthropic-Ratelimit-Unified-7d-Reset": "1791273600",
+        "Anthropic-Ratelimit-Unified-7d-Status": "allowed",
+        "Anthropic-Ratelimit-Unified-7d-Utilization": "0.32",
+        "Anthropic-Ratelimit-Unified-Overage-Disabled-Reason": "org_level_disabled",
+        "Anthropic-Ratelimit-Unified-Overage-Status": "rejected",
+        "Anthropic-Ratelimit-Unified-Representative-Claim": "five_hour",
+        "Anthropic-Ratelimit-Unified-Status": "allowed",
+        "request-id": "req_test",
+    }
+
+    class _ProbeResponse:
+        def __init__(self, status_code, headers):
+            from requests.structures import CaseInsensitiveDict
+
+            self.status_code = status_code
+            self.headers = CaseInsensitiveDict(headers)
+
+    def test_claude_oauth_token_prefers_env_then_protected_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "claude-oauth-token.txt"
+            path.write_text("sk-ant-oat01-file\n")
+            path.chmod(0o600)
+
+            self.assertEqual(
+                read_claude_oauth_token(
+                    token_path=path,
+                    environ={"CLAUDE_CODE_OAUTH_TOKEN": " sk-ant-oat01-env "},
+                ),
+                "sk-ant-oat01-env",
+            )
+            self.assertEqual(
+                read_claude_oauth_token(token_path=path, environ={}),
+                "sk-ant-oat01-file",
+            )
+
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                read_claude_oauth_token(token_path=path, environ={})
+
+            link = Path(tmpdir) / "link.txt"
+            path.chmod(0o600)
+            link.symlink_to(path)
+            with self.assertRaises(ValueError):
+                read_claude_oauth_token(token_path=link, environ={})
+
+            with self.assertRaises(ValueError):
+                read_claude_oauth_token(
+                    token_path=Path(tmpdir) / "missing.txt", environ={}
+                )
+
+    def test_claude_oauth_token_refuses_api_keys(self):
+        # An API key on /v1/messages bills pay-as-you-go credits; only
+        # subscription OAuth tokens may drive the quota probe.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "claude-oauth-token.txt"
+            path.write_text("sk-ant-api03-secret")
+            path.chmod(0o600)
+            with self.assertRaises(ValueError):
+                read_claude_oauth_token(token_path=path, environ={})
+            with self.assertRaises(ValueError):
+                read_claude_oauth_token(
+                    token_path=path,
+                    environ={"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-api03-secret"},
+                )
+
+    def test_parse_unified_ratelimit_headers_builds_usage(self):
+        data = parse_unified_ratelimit_headers(self._UNIFIED_HEADERS)
+
+        self.assertIsNotNone(data)
+        self.assertEqual(data.error, "")
+        self.assertEqual(data.source, "ratelimit_headers")
+        self.assertEqual(data.five_hour.utilization, 14.0)
+        self.assertEqual(data.five_hour.resets_at, "2026-10-01T19:40:00+00:00")
+        self.assertEqual(data.seven_day.utilization, 32.0)
+        self.assertEqual(data.seven_day.resets_at, "2026-10-06T08:00:00+00:00")
+        self.assertEqual(data.model_limits, [])
+        self.assertFalse(data.extra_usage_enabled)
+
+        allowed = dict(self._UNIFIED_HEADERS)
+        allowed["Anthropic-Ratelimit-Unified-Overage-Status"] = "allowed"
+        self.assertTrue(parse_unified_ratelimit_headers(allowed).extra_usage_enabled)
+
+    def test_parse_unified_ratelimit_headers_requires_both_windows(self):
+        missing = {
+            k: v for k, v in self._UNIFIED_HEADERS.items() if "7d" not in k
+        }
+        self.assertIsNone(parse_unified_ratelimit_headers(missing))
+        self.assertIsNone(parse_unified_ratelimit_headers({}))
+        bad = dict(self._UNIFIED_HEADERS)
+        bad["Anthropic-Ratelimit-Unified-5h-Utilization"] = "nan"
+        self.assertIsNone(parse_unified_ratelimit_headers(bad))
+        negative = dict(self._UNIFIED_HEADERS)
+        negative["Anthropic-Ratelimit-Unified-7d-Utilization"] = "-0.1"
+        self.assertIsNone(parse_unified_ratelimit_headers(negative))
+        no_reset = dict(self._UNIFIED_HEADERS)
+        del no_reset["Anthropic-Ratelimit-Unified-5h-Reset"]
+        self.assertEqual(
+            parse_unified_ratelimit_headers(no_reset).five_hour.resets_at, ""
+        )
+
+    def test_fetch_uses_oauth_token_probe_when_session_token_is_empty(self):
+        client = ClaudeUsageClient()
+        empty_session = {"accessToken": "", "refreshToken": "", "expiresAt": 0}
+        probe = self._ProbeResponse(200, self._UNIFIED_HEADERS)
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=empty_session
+        ), patch.object(
+            ClaudeUsageClient, "_read_oauth_token", return_value="sk-ant-oat01-x"
+        ), patch("claude_widget.requests.get") as get, patch(
+            "claude_widget.requests.post", return_value=probe
+        ) as post:
+            data = client.fetch()
+
+        get.assert_not_called()
+        post.assert_called_once()
+        args, kwargs = post.call_args
+        self.assertEqual(args[0], "https://api.anthropic.com/v1/messages")
+        headers = kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer sk-ant-oat01-x")
+        self.assertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+        self.assertNotIn("x-api-key", {k.lower() for k in headers})
+        self.assertEqual(kwargs["json"]["model"], "claude-haiku-4-5-20251001")
+        self.assertEqual(kwargs["json"]["max_tokens"], 1)
+        self.assertNotIn("system", kwargs["json"])
+        self.assertEqual(data.error, "")
+        self.assertEqual(data.source, "ratelimit_headers")
+        self.assertEqual(data.five_hour.utilization, 14.0)
+        self.assertEqual(data.seven_day.utilization, 32.0)
+        self.assertGreater(data.fetched_at, 0)
+
+    def test_fetch_without_any_token_stays_not_logged_in_and_offline_free(self):
+        client = ClaudeUsageClient()
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=None
+        ), patch.object(
+            ClaudeUsageClient, "_read_oauth_token", return_value=""
+        ), patch("claude_widget.requests.get") as get, patch(
+            "claude_widget.requests.post"
+        ) as post:
+            data = client.fetch()
+
+        self.assertEqual(data.error, "Not Logged In")
+        get.assert_not_called()
+        post.assert_not_called()
+
+    def test_fetch_falls_back_to_probe_when_session_token_is_rejected(self):
+        client = ClaudeUsageClient()
+        session = {"accessToken": "stale", "expiresAt": 4_102_444_800_000}
+        rejected = self._ProbeResponse(401, {})
+        probe = self._ProbeResponse(200, self._UNIFIED_HEADERS)
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=session
+        ), patch.object(
+            ClaudeUsageClient, "_read_oauth_token", return_value="sk-ant-oat01-x"
+        ), patch("claude_widget.requests.get", return_value=rejected), patch(
+            "claude_widget.requests.post", return_value=probe
+        ):
+            data = client.fetch()
+
+        self.assertEqual(data.error, "")
+        self.assertEqual(data.source, "ratelimit_headers")
+
+    def test_fetch_session_rejected_without_oauth_token_reports_expiry(self):
+        client = ClaudeUsageClient()
+        session = {"accessToken": "stale", "expiresAt": 4_102_444_800_000}
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=session
+        ), patch.object(
+            ClaudeUsageClient, "_read_oauth_token", return_value=""
+        ), patch(
+            "claude_widget.requests.get",
+            return_value=self._ProbeResponse(401, {}),
+        ), patch("claude_widget.requests.post") as post:
+            data = client.fetch()
+
+        self.assertEqual(data.error, "Session Expired")
+        post.assert_not_called()
+
+    def test_usage_api_429_uses_probe_and_skips_usage_api_during_retry_window(self):
+        client = ClaudeUsageClient()
+        session = {"accessToken": "live", "expiresAt": 4_102_444_800_000}
+        limited = self._ProbeResponse(429, {"retry-after": "3600"})
+        probe = self._ProbeResponse(200, self._UNIFIED_HEADERS)
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=session
+        ), patch.object(
+            ClaudeUsageClient, "_read_oauth_token", return_value="sk-ant-oat01-x"
+        ), patch("claude_widget.requests.get", return_value=limited) as get, patch(
+            "claude_widget.requests.post", return_value=probe
+        ) as post:
+            first = client.fetch()
+            second = client.fetch()
+
+        self.assertEqual(first.error, "")
+        self.assertEqual(second.error, "")
+        self.assertEqual(second.source, "ratelimit_headers")
+        get.assert_called_once()
+        self.assertEqual(post.call_count, 2)
+
+    def test_probe_429_with_unified_headers_is_an_exhausted_window(self):
+        client = ClaudeUsageClient()
+        exhausted = dict(self._UNIFIED_HEADERS)
+        exhausted["Anthropic-Ratelimit-Unified-5h-Utilization"] = "1.0"
+        exhausted["Anthropic-Ratelimit-Unified-5h-Status"] = "rejected"
+        exhausted["Anthropic-Ratelimit-Unified-Status"] = "rejected"
+        exhausted["retry-after"] = "2400"
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=None
+        ), patch.object(
+            ClaudeUsageClient, "_read_oauth_token", return_value="sk-ant-oat01-x"
+        ), patch(
+            "claude_widget.requests.post",
+            return_value=self._ProbeResponse(429, exhausted),
+        ):
+            data = client.fetch()
+
+        self.assertEqual(data.error, "")
+        self.assertEqual(data.five_hour.utilization, 100.0)
+
+    def test_probe_errors_without_unified_headers(self):
+        client = ClaudeUsageClient()
+        cases = [
+            (self._ProbeResponse(429, {"retry-after": "120"}), "Rate Limited", 120.0),
+            (self._ProbeResponse(401, {}), "OAuth Token Rejected", 0.0),
+            (self._ProbeResponse(200, {}), "Usage Headers Missing", 0.0),
+            (self._ProbeResponse(529, {}), "API Error (529)", 0.0),
+        ]
+        for response, error, retry_after in cases:
+            with self.subTest(error=error), patch.object(
+                ClaudeUsageClient, "_read_credentials", return_value=None
+            ), patch.object(
+                ClaudeUsageClient, "_read_oauth_token", return_value="sk-ant-oat01-x"
+            ), patch("claude_widget.requests.post", return_value=response):
+                data = client.fetch()
+            self.assertEqual(data.error, error)
+            self.assertEqual(data.retry_after_s, retry_after)
+
+        import requests as requests_module
+
+        with patch.object(
+            ClaudeUsageClient, "_read_credentials", return_value=None
+        ), patch.object(
+            ClaudeUsageClient, "_read_oauth_token", return_value="sk-ant-oat01-x"
+        ), patch(
+            "claude_widget.requests.post",
+            side_effect=requests_module.ConnectionError("down"),
+        ):
+            self.assertEqual(client.fetch().error, "Offline")
+
+    def test_last_usage_round_trips_usage_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "last_usage.json"
+            with patch("claude_widget.LAST_USAGE_PATH", path):
+                save_last_usage(
+                    UsageData(
+                        five_hour=UsageEntry(utilization=14.0),
+                        source="ratelimit_headers",
+                        fetched_at=1.0,
+                    )
+                )
+                self.assertEqual(load_last_usage().source, "ratelimit_headers")
+                legacy = json.loads(path.read_text())
+                del legacy["source"]
+                path.write_text(json.dumps(legacy))
+                self.assertEqual(load_last_usage().source, "usage_api")
+
+    def test_status_line_names_oauth_header_source(self):
+        widget = self._make_inert_claude_widget()
+        widget._has_fetched_usage = True
+        widget._rate_limit_until = 0.0
+        widget._usage = UsageData(
+            five_hour=UsageEntry(utilization=14.0),
+            seven_day=UsageEntry(utilization=32.0),
+            source="ratelimit_headers",
+            fetched_at=time.time(),
+        )
+        widget._update_display()
+
+        self.assertIn("OAuth", widget._status_label.toolTip())
+        self.assertIn("Fable", widget._status_label.toolTip())
+        self.assertTrue(widget._model_limits.isHidden())
+
+        widget._usage.source = "usage_api"
+        widget._update_display()
+        self.assertNotIn("OAuth", widget._status_label.toolTip())
 
     def test_display_model_limits_merges_scoped_and_legacy_without_duplicates(self):
         data = UsageData(

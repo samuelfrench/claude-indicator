@@ -72,6 +72,19 @@ DEEPSEEK_AUTH_PATH = Path.home() / ".local" / "share" / "opencode" / "auth.json"
 DEEPSEEK_HISTORY_PATH = Path.home() / ".claude" / "deepseek_balance_history.json"
 OPENCODE_DB_PATH = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# Long-lived Claude Code OAuth token (`claude setup-token`). Claude Code reads
+# it from CLAUDE_CODE_OAUTH_TOKEN; ~/.bashrc exports it from this owner-only
+# file, which autostart/systemd launches never see as an env var.
+CLAUDE_OAUTH_TOKEN_PATH = Path.home() / ".credentials" / "claude-oauth-token.txt"
+CLAUDE_OAUTH_TOKEN_PREFIX = "sk-ant-oat"
+# That token is not usable on USAGE_URL, but every /v1/messages response
+# carries the subscription's unified 5h/7d meters as headers. The probe is the
+# smallest billable request: 8 input + 1 output Haiku tokens per poll.
+CLAUDE_QUOTA_PROBE_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_QUOTA_PROBE_MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_API_VERSION = "2023-06-01"
+USAGE_SOURCE_USAGE_API = "usage_api"
+USAGE_SOURCE_RATELIMIT_HEADERS = "ratelimit_headers"
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -325,6 +338,9 @@ class UsageData:
     error: str = ""
     fetched_at: float = 0.0
     retry_after_s: float = 0.0  # From 429 Retry-After header
+    # USAGE_SOURCE_USAGE_API (full payload) or USAGE_SOURCE_RATELIMIT_HEADERS
+    # (5h/7d only: no model-scoped limits or extra-usage dollars).
+    source: str = USAGE_SOURCE_USAGE_API
 
     @property
     def plan_name(self) -> str:
@@ -1237,8 +1253,8 @@ def _decimal_money(value) -> Decimal:
     return amount
 
 
-def _read_owned_private_json(path: Path) -> dict:
-    """Read a small owner-only regular JSON file without following symlinks."""
+def _read_owned_private_text(path: Path) -> str:
+    """Read a small owner-only regular file without following symlinks."""
     try:
         before = path.lstat()
     except OSError as exc:
@@ -1257,12 +1273,39 @@ def _read_owned_private_json(path: Path) -> dict:
             after = os.fstat(handle.fileno())
             if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
                 raise ValueError("credential file changed while opening")
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+            return handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("credential file unavailable") from exc
+
+
+def _read_owned_private_json(path: Path) -> dict:
+    """Read a small owner-only regular JSON file without following symlinks."""
+    try:
+        data = json.loads(_read_owned_private_text(path))
+    except json.JSONDecodeError as exc:
         raise ValueError("credential file unavailable") from exc
     if not isinstance(data, dict):
         raise ValueError("credential file schema is invalid")
     return data
+
+
+def read_claude_oauth_token(
+    *, token_path: Path | None = None, environ: dict | None = None
+) -> str:
+    """Long-lived Claude Code OAuth token: env first, then the owner-only file.
+
+    Only subscription OAuth tokens are accepted. An `sk-ant-api` key would
+    make the quota probe bill pay-as-you-go API credits, so it is refused.
+    """
+    environment = os.environ if environ is None else environ
+    token = environment.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if not (isinstance(token, str) and token.strip()):
+        path = CLAUDE_OAUTH_TOKEN_PATH if token_path is None else token_path
+        token = _read_owned_private_text(path)
+    token = token.strip()
+    if not token.startswith(CLAUDE_OAUTH_TOKEN_PREFIX):
+        raise ValueError("Claude credential is not an OAuth token")
+    return token
 
 
 def read_deepseek_api_key(
@@ -3582,6 +3625,7 @@ def save_last_usage(data: UsageData) -> None:
         "extra_usage_used_credits": data.extra_usage_used_credits,
         "extra_usage_monthly_limit": data.extra_usage_monthly_limit,
         "fetched_at": data.fetched_at,
+        "source": data.source,
     }
     tmp_path = LAST_USAGE_PATH.with_suffix(".tmp")
     try:
@@ -3620,6 +3664,7 @@ def load_last_usage() -> UsageData | None:
             extra_usage_used_credits=raw.get("extra_usage_used_credits"),
             extra_usage_monthly_limit=raw.get("extra_usage_monthly_limit"),
             fetched_at=float(raw.get("fetched_at", 0.0)),
+            source=str(raw.get("source") or USAGE_SOURCE_USAGE_API),
         )
     except (TypeError, ValueError):
         return None
@@ -4235,8 +4280,112 @@ def fetch_cron_jobs() -> list[CronJobInfo]:
 # API client
 # ---------------------------------------------------------------------------
 
+_UNIFIED_RATELIMIT_PREFIX = "anthropic-ratelimit-unified-"
+
+
+def _unified_window(headers: dict, window: str) -> UsageEntry | None:
+    raw = headers.get(f"{_UNIFIED_RATELIMIT_PREFIX}{window}-utilization")
+    try:
+        fraction = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fraction) or fraction < 0:
+        return None
+    resets_at = ""
+    try:
+        reset = int(headers.get(f"{_UNIFIED_RATELIMIT_PREFIX}{window}-reset"))
+        resets_at = datetime.fromtimestamp(reset, timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    return UsageEntry(utilization=round(fraction * 100, 2), resets_at=resets_at)
+
+
+def parse_unified_ratelimit_headers(headers) -> UsageData | None:
+    """Build 5h/7d usage from `anthropic-ratelimit-unified-*` response headers.
+
+    These are the same subscription meters /api/oauth/usage reports, as
+    0-1 fractions with epoch-second resets. Returns None unless both windows
+    are present and valid.
+    """
+    normalized = {str(k).lower(): v for k, v in dict(headers or {}).items()}
+    five_hour = _unified_window(normalized, "5h")
+    seven_day = _unified_window(normalized, "7d")
+    if five_hour is None or seven_day is None:
+        return None
+    overage = str(normalized.get(f"{_UNIFIED_RATELIMIT_PREFIX}overage-status", ""))
+    return UsageData(
+        five_hour=five_hour,
+        seven_day=seven_day,
+        extra_usage_enabled=overage.lower() in ("allowed", "allowed_warning"),
+        source=USAGE_SOURCE_RATELIMIT_HEADERS,
+    )
+
+
+def _retry_after_seconds(resp) -> float:
+    retry_after = resp.headers.get("retry-after", "")
+    try:
+        return float(retry_after) if retry_after else 0.0
+    except ValueError:
+        return 0.0
+
+
 class ClaudeUsageClient:
-    """Reads OAuth credentials and fetches usage data."""
+    """Reads OAuth credentials and fetches usage data.
+
+    The claude.ai session token in ~/.claude/.credentials.json drives
+    /api/oauth/usage (full payload). Without a usable session token, the
+    long-lived Claude Code OAuth token drives a 1-token /v1/messages probe
+    whose unified rate-limit headers carry the 5h/7d meters.
+    """
+
+    def __init__(self):
+        # /api/oauth/usage 429 windows are skipped while the probe can answer;
+        # each extra call there extends the server-side window.
+        self._usage_api_blocked_until = 0.0
+
+    def _read_oauth_token(self) -> str:
+        try:
+            return read_claude_oauth_token()
+        except ValueError:
+            return ""
+
+    def _fetch_from_ratelimit_headers(self, fallback: UsageData) -> UsageData:
+        token = self._read_oauth_token()
+        if not token:
+            return fallback
+        try:
+            resp = requests.post(
+                CLAUDE_QUOTA_PROBE_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "anthropic-beta": OAUTH_BETA,
+                    "anthropic-version": ANTHROPIC_API_VERSION,
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": CLAUDE_QUOTA_PROBE_MODEL,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "quota"}],
+                },
+                timeout=30,
+            )
+        except requests.RequestException:
+            return UsageData(error="Offline", source=USAGE_SOURCE_RATELIMIT_HEADERS)
+        # A 429 that carries the meters is an exhausted window, not throttling.
+        data = parse_unified_ratelimit_headers(resp.headers)
+        if data is not None:
+            data.fetched_at = time.time()
+            return data
+        if resp.status_code == 429:
+            error = UsageData(error="Rate Limited", retry_after_s=_retry_after_seconds(resp))
+        elif resp.status_code in (401, 403):
+            error = UsageData(error="OAuth Token Rejected")
+        elif resp.status_code == 200:
+            error = UsageData(error="Usage Headers Missing")
+        else:
+            error = UsageData(error=f"API Error ({resp.status_code})")
+        error.source = USAGE_SOURCE_RATELIMIT_HEADERS
+        return error
 
     def _read_credentials(self) -> dict | None:
         try:
@@ -4268,15 +4417,19 @@ class ClaudeUsageClient:
         # `sk-ant-oat01-` tokens generated by `claude setup-token`
         # (verified 2026-04-20: returns HTTP 403). The endpoint only
         # accepts the short-lived claude.ai OAuth session token stored in
-        # ~/.claude/.credentials.json. So we use the credentials file
-        # here regardless of whether CLAUDE_CODE_OAUTH_TOKEN is set.
+        # ~/.claude/.credentials.json. When that session token is missing,
+        # rejected, or rate-limited, the long-lived token feeds the
+        # rate-limit-header probe instead.
         creds = self._read_credentials()
-        if creds is None:
-            return UsageData(error="Not Logged In")
-
-        token = creds.get("accessToken", "")
+        token = creds.get("accessToken", "") if isinstance(creds, dict) else ""
         if not token:
-            return UsageData(error="Not Logged In")
+            return self._fetch_from_ratelimit_headers(UsageData(error="Not Logged In"))
+
+        blocked_s = self._usage_api_blocked_until - time.time()
+        if blocked_s > 0:
+            return self._fetch_from_ratelimit_headers(
+                UsageData(error="Rate Limited", retry_after_s=blocked_s)
+            )
 
         # Check if token is near expiry and refresh if needed
         expires_at = creds.get("expiresAt", 0)
@@ -4309,14 +4462,18 @@ class ClaudeUsageClient:
                 timeout=15,
             )
             if resp.status_code == 401:
-                return UsageData(error="Session Expired")
+                return self._fetch_from_ratelimit_headers(
+                    UsageData(error="Session Expired")
+                )
             if resp.status_code == 429:
-                retry_after = resp.headers.get("retry-after", "")
-                try:
-                    retry_after_s = float(retry_after) if retry_after else 0.0
-                except ValueError:
-                    retry_after_s = 0.0
-                return UsageData(error="Rate Limited", retry_after_s=retry_after_s)
+                retry_after_s = _retry_after_seconds(resp)
+                if self._read_oauth_token():
+                    self._usage_api_blocked_until = time.time() + max(
+                        retry_after_s, RATE_LIMIT_MIN_BACKOFF_S
+                    )
+                return self._fetch_from_ratelimit_headers(
+                    UsageData(error="Rate Limited", retry_after_s=retry_after_s)
+                )
             if resp.status_code != 200:
                 return UsageData(error=f"API Error ({resp.status_code})")
             data = resp.json()
@@ -9067,7 +9224,7 @@ class ClaudeWidget(QWidget):
             log_line(
                 f"fetch ok: 5h={data.five_hour.utilization:.0f}% "
                 f"7d={data.seven_day.utilization:.0f}%{scoped} "
-                f"plan={data.plan_name}"
+                f"plan={data.plan_name} src={data.source}"
             )
         elif data.error:
             log_line(f"fetch error: {data.error}")
@@ -9134,11 +9291,24 @@ class ClaudeWidget(QWidget):
         else:
             remaining = max(0, int(self._next_fetch_at - now))
             age = self._format_age(now - data.fetched_at) if data.fetched_at else "just now"
-            self._set_status_text(f"Updated: {age}  ·  Next: {remaining}s")
+            text = f"Updated: {age}  ·  Next: {remaining}s"
+            if data.source == USAGE_SOURCE_RATELIMIT_HEADERS:
+                self._set_status_text(
+                    f"{text}  ·  OAuth",
+                    tooltip=(
+                        f"{text}. 5-hour and 7-day usage from /v1/messages "
+                        "rate-limit headers via the Claude Code OAuth token. "
+                        "Model-scoped limits (Fable) and extra-usage dollars "
+                        "need a claude.ai session login (/login)."
+                    ),
+                )
+            else:
+                self._set_status_text(text)
 
-    def _set_status_text(self, text: str) -> None:
-        self._status_label.setToolTip(text)
-        self._status_label.setAccessibleDescription(text)
+    def _set_status_text(self, text: str, tooltip: str | None = None) -> None:
+        tooltip = text if tooltip is None else tooltip
+        self._status_label.setToolTip(tooltip)
+        self._status_label.setAccessibleDescription(tooltip)
         self._status_label.setText(self._status_label.fontMetrics().elidedText(
             text, Qt.TextElideMode.ElideMiddle, self._status_label.width()
         ))
