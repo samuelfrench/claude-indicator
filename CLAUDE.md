@@ -7,7 +7,7 @@ local system activity, and Ollama/GPU/ComfyUI status.
 
 ## Architecture
 - **Single-file app**: `claude_widget.py` contains all logic (client, UI, timers, history)
-- **ClaudeUsageClient**: Reads OAuth token from `~/.claude/.credentials.json`, fetches `GET https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` header
+- **ClaudeUsageClient**: With a claude.ai session token in `~/.claude/.credentials.json`, fetches `GET https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` (full payload incl. Fable/extra usage). When that session token is empty, 401s, or 429s, it resolves the long-lived Claude Code OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`, then owner-only mode-`0600` `~/.credentials/claude-oauth-token.txt`; only `sk-ant-oat` tokens, API keys refused) and sends a `max_tokens: 1` Haiku 4.5 `POST /v1/messages` probe, parsing the `anthropic-ratelimit-unified-5h/7d-utilization` + `-reset` headers (also on a 429 that carries them). Header-sourced data has no model-scoped limits, so the Fable bar hides; the status line appends `· OAuth`. A usage-API 429 window is skipped while the probe answers.
 - **ClaudeWidget**: Frameless, translucent, always-on-top PySide6 widget with drag support and fixed 340px width
 - **Traffic Report shortcut**: A keyboard-accessible footer link and tray action open the fixed local dashboard at `http://127.0.0.1:5173/` through `QDesktopServices.openUrl`; the existing report server remains independently managed.
 - **Configure menu**: Header ☰ and tray Configure submenu hide individual sections (Claude usage, history, TABS, deploys, runners, task loops, task groups, cron, system, Local AI) and providers (Codex, DeepSeek, MiniMax, OpenCode Go, Grok, OpenCode ledger, Ollama ledger lines). State is `~/.claude/widget_visibility.json`. Hidden providers skip their fetch; MiniMax/DeepSeek/Go/Ollama hides also filter the OpenCode ledger breakdown.
@@ -68,7 +68,7 @@ local system activity, and Ollama/GPU/ComfyUI status.
   in history, logs, labels, or tooltips
 
 ## Key Decisions
-- Uses `/api/oauth/usage` endpoint (not rate limit headers from `/v1/messages` which are locked to Claude Code sessions)
+- Prefers `/api/oauth/usage` (session token only; the long-lived setup token is not usable there). Since 2026-10-01 Claude Code runs on `CLAUDE_CODE_OAUTH_TOKEN` and the session token is empty, so the `/v1/messages` rate-limit-header probe is the normal path: ~9 Haiku tokens per 5-minute poll against the subscription; overage is org-disabled, so no dollar billing. `count_tokens` returns no rate-limit headers.
 - OAuth tokens with `user:inference` scope work with this endpoint when `anthropic-beta: oauth-2025-04-20` header is included
 - History stored in `~/.claude/usage_history.json` with atomic writes (write to .tmp then os.replace)
 - Graph uses purple accent (#8b5cf6) with gradient fill and red dashed 80% threshold line
