@@ -53,7 +53,7 @@
     "due": null,
     "updated": "2026-10-08",
     "owner": "agent",
-    "brief": "All authorized beta tasks1–8 verified and shipped; private recruiting drafts/tracker remain at0posts/0confirmed users, with future paid-release decisions separate.",
+    "brief": "Beta preparation, Task7 waits and Task8 Cursor are verified and shipped; authorized recruiting replies remain open with 0 posts and 0 confirmed users.",
     "refs": [
       "docs/beta/provider-terms-check.md",
       "docs/beta/privacy-audit.md"

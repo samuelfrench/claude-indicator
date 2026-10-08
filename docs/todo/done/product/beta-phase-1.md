@@ -5,7 +5,7 @@ area: product
 due: null
 updated: 2026-10-08
 owner: agent
-brief: "All authorized beta tasks1–8 verified and shipped; private recruiting drafts/tracker remain at0posts/0confirmed users, with future paid-release decisions separate."
+brief: "Beta preparation, Task7 waits and Task8 Cursor are verified and shipped; authorized recruiting replies remain open with 0 posts and 0 confirmed users."
 refs: ["docs/beta/provider-terms-check.md", "docs/beta/privacy-audit.md"]
 test: null
 ---
@@ -20,7 +20,7 @@ test: null
 - [x] Audit all network calls/data flows, telemetry, credential claim and accurate headline; audit current public files and Git history, safely fix current exposure without rewriting history; record owner-only history/repository decisions in `docs/beta/privacy-audit.md`.
 - [x] Provide one-command beta installation, honest supported-platform requirements, clean fresh-environment proof and sensible tests without touching the running widget.
 - [x] Add `.github/ISSUE_TEMPLATE/beta-signup.yml`, `beta-feedback.yml`, and a short README Beta section with install command and form links; no GIF or launch copy.
-- [x] Find 25–30 recent (roughly 14-day) X/Reddit usage-limit/reset complaints; check community self-promotion rules, skip forbidding communities, and save ranked truthful varied 1–3 sentence replies disclosing “I built”, repo link and provider question to the owner's local recruitment Markdown and CSV. Do not post.
+- [x] Find 25–30 recent (roughly 14-day) X/Reddit usage-limit/reset complaints; check community self-promotion rules, skip forbidding communities, and save ranked truthful varied 1–3 sentence replies disclosing “I built”, repo link and provider question to the owner's local recruitment Markdown and CSV. Draft preparation is complete; later authorized posting is an open task in `docs/todo/product/beta-recruiting-replies.md`.
 - [x] Maintain local recruits tracker with one row per actual signup, source/date/provider requests and running provider tally; check signup/feedback issues each work session.
 - [x] Run actual gates, commit/push tested work with green CI, record isolated-install protection and the separately authorized Task8 production deployment, and reconcile project TODO, owner plan and shared memory before final report.
 
