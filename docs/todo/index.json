@@ -78,6 +78,21 @@
     "test": "tests/test_cursor_usage.py; tests/test_widget_ui.py"
   },
   {
+    "path": "docs/todo/done/product/promo-channel-research-2026-10-08.md",
+    "slug": "promo-channel-research-2026-10-08",
+    "title": "Alternative Indicator promotion channels: research only",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-08",
+    "owner": "agent",
+    "brief": "Research complete: 4 ranked alternatives with primary rules and account/manual requirements; no outreach or publication, no other Indicator work today.",
+    "refs": [
+      "do.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/infra/child-notify-socket.md",
     "slug": "child-notify-socket",
     "title": "Child processes inherit the systemd notification socket",
@@ -102,7 +117,7 @@
     "due": null,
     "updated": "2026-10-08",
     "owner": "sam",
-    "brief": "Posting is authorized within caps, but existing Chrome X/Reddit sessions are signed out; no replies sent. Saved r/codex queue also forbids bots.",
+    "brief": "Reply campaign parked: October8 research-only hold; 0 replies. Existing-session sign-in and r/codex no-bots blockers remain for later authorized sessions.",
     "refs": [
       "docs/todo/done/product/beta-phase-1.md"
     ],
@@ -153,21 +168,6 @@
     "refs": [
       "docs/beta/provider-terms-check.md",
       "docs/beta/privacy-audit.md",
-      "do.md"
-    ],
-    "test": null
-  },
-  {
-    "path": "docs/todo/product/promo-channel-research-2026-10-08.md",
-    "slug": "promo-channel-research-2026-10-08",
-    "title": "Alternative Indicator promotion channels: research only",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-10-08",
-    "owner": "agent",
-    "brief": "Research the best 3–5 alternative channels with current rules, audience fit and manual/account requirements; no publication, sign-ups or sends.",
-    "refs": [
       "do.md"
     ],
     "test": null
