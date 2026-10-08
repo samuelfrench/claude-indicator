@@ -94,6 +94,21 @@
     "test": "journalctl --user -u claude-indicator.service"
   },
   {
+    "path": "docs/todo/product/beta-recruiting-replies.md",
+    "slug": "beta-recruiting-replies",
+    "title": "Authorized beta recruiting replies: existing-session access",
+    "status": "waiting-sam",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-08",
+    "owner": "sam",
+    "brief": "Posting is authorized within caps, but existing Chrome X/Reddit sessions are signed out; no replies sent. Saved r/codex queue also forbids bots.",
+    "refs": [
+      "docs/todo/done/product/beta-phase-1.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/claude-header-limitations.md",
     "slug": "claude-header-limitations",
     "title": "Claude header data limitations and usage API compatibility",
