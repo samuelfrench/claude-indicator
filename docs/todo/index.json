@@ -6,7 +6,7 @@
     "status": "now",
     "area": "ci",
     "due": null,
-    "updated": "2026-10-07",
+    "updated": "2026-10-08",
     "owner": "agent",
     "brief": "Task7: inspect load-sensitive failures, isolated per-project patches only where proven.",
     "refs": [],

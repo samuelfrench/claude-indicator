@@ -3,7 +3,7 @@ title: "Evidence-bound shared-machine test timeouts"
 status: now
 area: ci
 due: null
-updated: 2026-10-07
+updated: 2026-10-08
 owner: agent
 brief: "Task7: inspect load-sensitive failures, isolated per-project patches only where proven."
 refs: []
@@ -11,7 +11,7 @@ test: null
 ---
 - **What:** Read-only inventory across workspace projects, starting BBQ commit001fee3; patch only evidenced load-sensitive timeouts/retries in separate worktrees, each with its own small tested/rebased/pushed commit and generated project notes.
 - **Why:** Concurrent self-hosted jobs can exceed narrow waits; unsupported blanket increases hide unrelated failures.
-- **Next:** BBQ bounded waits are accepted live at529fb99/Flyv289. Coffee reviewed timing commit2e32b365 plus docs-only08605581 are pushed on d64c8735, with88 focused/4346 full tests, lint/types and final TODO/exposure gates passed. Observe exact Deploy37729014740, Guard37729014738 and Exposure37729014695; final build/E2E/deployment/live proof remains pending. No duplicate dispatch or Coffee docs-head push while those runs settle.
+- **Next:** BBQ bounded waits accepted live at529fb99/Flyv289. Coffee timing2e32b365 and docs-only08605581 are pushed; exact CI classification/backend/frontend/quality and repository/exposure guards passed. Observe remaining normal Build/browser/deploy stages in37729014740, then verify exact source/image/live behavior and reconcile records. No duplicate dispatch or Coffee docs-head push during acceptance.
 - **Authority:** Explicit task7 expands the original other-project restriction solely for timeout/retry changes. Roughly1.5–2× proven waits or at most1–2 known-flaky retries; retain assertions/checks. Never weaken Cigar production deployment verification, build the BBQ-owned machine-wide lock, touch other sessions, force-push, skip tests or alter runtime behavior.
 - **External clocks:** Green existing CI and any deploy path depend on each project's current state; record exact code/live identities where applicable. No new services/billing.
 - **Upstream:** No dependency patch or publication needed unless inventory proves a reusable third-party defect.
@@ -45,3 +45,6 @@ test: null
 **2026-10-07 exact Coffee guard milestone:** RepositoryGuards37729014738 and Exposure37729014695 areGREEN at08605581. Actual retained stdout confirms TODO29/29, ratings-removal9/9, catalog reducer51/51, pipeline/rankings556/556 and exposurechecked120794 with0failedsteps. Deploy37729014740 exposure preflight passed but classification is queued; frontend/backend/quality/build/browser stages have not started. Required final build/E2E/deployment/live acceptance remains pending, not inferred from these preliminary guards. Raw logs/metadata are `~/indicator-beta/task7-logs/coffee-ci-37729014738.{log,json}` and the37729014695 pair. Coffee master unchanged08605581; no duplicate dispatch/head mutation.
 
 **2026-10-07 queue evidence at23:51:25 CT:** Official `gh api repos/samuelfrench/coffee-explorer/actions/runners` reports5 online runners, all5busy/0idle; `gh api repos/samuelfrench/coffee-explorer/actions/variables/USE_LOCAL_RUNNER --jq .value` istrue. Deploy37729014740 classification has0startedsteps. Capacity wait is observed, with no offline-runner/test/build failure demonstrated. Keep the normal queue; no new runner, service restart, hosted-variable switch, cancellation or duplicate dispatch is authorized by this timeout lane. Resume by reading exact run status/jobs; once it settles read actual logs, then verify source/image/live and reconcile final task/memory state.
+
+
+**2026-10-08 00:05 CT main CI milestone:** Coffee exact Deploy37729014740 at08605581 has passed classification, backend tests, frontend tests and code quality; Build is pending. RepositoryGuards37729014738 and Exposure37729014695 are green. Final-source build, browser, deployment and live proof remain pending; no failure, duplicate dispatch or runner/service change. Exact job results were read from GitHub; settled full stdout/counts will be preserved after the run completes. Root Indicator prior docs checkpoint950d58d guard37729677233 passed.
