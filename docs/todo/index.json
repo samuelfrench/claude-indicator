@@ -45,6 +45,23 @@
     "test": null
   },
   {
+    "path": "docs/todo/done/product/cursor-provider.md",
+    "slug": "cursor-provider",
+    "title": "Cursor provider with separate Grok Bot line",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Shipped b8d7285 with green517+20 tests; live Cursor/Bot lines verified, sanctioned API key absent.",
+    "refs": [
+      "do.md",
+      "docs/beta/provider-terms-check.md",
+      "docs/beta/privacy-audit.md"
+    ],
+    "test": "tests/test_cursor_usage.py; tests/test_widget_ui.py"
+  },
+  {
     "path": "docs/todo/infra/child-notify-socket.md",
     "slug": "child-notify-socket",
     "title": "Child processes inherit the systemd notification socket",
@@ -91,23 +108,6 @@
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
     "test": null
-  },
-  {
-    "path": "docs/todo/product/cursor-provider.md",
-    "slug": "cursor-provider",
-    "title": "Cursor provider with separate Grok Bot line",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-10-07",
-    "owner": "agent",
-    "brief": "Task8: sanctioned Cursor usage source or explicit disconnected state, tests and widget proof.",
-    "refs": [
-      "do.md",
-      "docs/beta/provider-terms-check.md",
-      "docs/beta/privacy-audit.md"
-    ],
-    "test": "tests/test_cursor_usage.py; tests/test_widget_ui.py"
   },
   {
     "path": "docs/todo/product/grok-missing-meter.md",

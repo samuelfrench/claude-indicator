@@ -8,7 +8,7 @@ Claude Indicator is a Linux PySide6 desktop widget. `claude_widget.py` contains 
 
 ## Beta boundaries and evidence
 
-Current beta scope, policy classifications and data-flow qualifications are recorded in `docs/todo/product/beta-phase-1.md`, `docs/beta/provider-terms-check.md` and `docs/beta/privacy-audit.md`. No public launch, posting, provider testing requests, new billing or live widget restart is authorized by the beta validation lane. Use mocked responses and isolated installation smoke checks. The README is the user-facing install/platform contract.
+Current beta scope, policy classifications and data-flow qualifications are recorded in `docs/todo/product/beta-phase-1.md`, `docs/beta/provider-terms-check.md` and `docs/beta/privacy-audit.md`. No public launch, posting, provider testing requests or new billing is authorized by the beta validation lane. Clean installation tests never alter the live widget; the later explicit Cursor feature task authorizes normal user-service deployment after green CI and independent review. Use mocked responses and isolated installation smoke checks. The README is the user-facing install/platform contract.
 
 ## Implementation rules
 
@@ -23,7 +23,7 @@ Current beta scope, policy classifications and data-flow qualifications are reco
 
 ## Gates
 
-Run focused tests then `QT_QPA_PLATFORM=offscreen python3 -m pytest -q`, `node --test scripts/todo/__tests__/todo.test.mjs`, `node scripts/todo/build.mjs --check`, `python3 scripts/verify_install.py` and `git diff --check`. Tests block unmocked requests/urllib calls. The installation verifier uses a fresh venv and isolated HOME without launching the actual app. Repository guards and Python CI must pass before merging/pushing completion evidence. This desktop beta deliberately leaves the owner's live service untouched.
+Run focused tests then `QT_QPA_PLATFORM=offscreen python3 -m pytest -q`, `node --test scripts/todo/__tests__/todo.test.mjs`, `node scripts/todo/build.mjs --check`, `python3 scripts/verify_install.py` and `git diff --check`. Tests block unmocked requests/urllib calls. The installation verifier uses a fresh venv and isolated HOME without launching the actual app. Repository guards and Python CI must pass before merging/pushing completion evidence. The clean-install verifier leaves the owner's live service untouched. Separately authorized feature deployment uses the existing user service after green CI, then verifies native widget behavior.
 
 ## Optional source helpers
 

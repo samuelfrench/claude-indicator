@@ -28,3 +28,7 @@ The reader makes one hourly `POST https://api.cursor.com/teams/spend` using HTTP
 | Grok Bot | Distinct Cursor subline; `/teams/spend` does not expose a Bot-specific meter. Grok-model use is not evidence of Grok Bot attribution |
 
 These are current-cycle monetary usage figures, not request/token counts or a personal-plan invoice. Cursor's organization pooled usage API reports organization-wide contract data; it is not used as an individual allowance/reset. No guessed monthly reset, fixed plan allowance or overlapping grant is displayed. [Grok Bot billing](https://cursor.com/help/grok-bot/plans) uses Cursor billing and is separate from SuperGrok; a linked plan's included grant is not a second meter to add. [Admin API spending documentation](https://cursor.com/docs/account/teams/admin-api) is the schema source.
+
+## Verified deployment
+
+`b8d72851dd44cf8af0f637b70cf656dc0723f0b1` is pushed with green hosted517 tests+20 subtests and fresh8-module install/render. Task8 was deployed through the existing user service on2026-10-07 at22:16:25 CT; root verified the actual X11 widget’s Cursor and separate Grok Bot lines. The runtime is disconnected because no eligible key or stored snapshot is available. This production update happened after isolated installation validation finished; installation itself never starts or changes services. No new services or paid API testing were introduced.
