@@ -11,7 +11,7 @@ test: null
 ---
 - **What:** Read-only inventory across workspace projects, starting BBQ commit001fee3; patch only evidenced load-sensitive timeouts/retries in separate worktrees, each with its own small tested/rebased/pushed commit and generated project notes.
 - **Why:** Concurrent self-hosted jobs can exceed narrow waits; unsupported blanket increases hide unrelated failures.
-- **Next:** BBQ bounded waits accepted live at529fb99/Flyv289. Coffee timing2e32b365 and docs-only08605581 are pushed; exact CI classification/backend/frontend/quality and repository/exposure guards passed. Observe remaining normal Build/browser/deploy stages in37729014740, then verify exact source/image/live behavior and reconcile records. No duplicate dispatch or Coffee docs-head push during acceptance.
+- **Next:** Coffee exact08605581 passed backend/frontend/quality/full build and225 built-output browser checks. Package Fly image job113161621752 reported failure while separate Live+Visual E2E continues; preserve/read the actual packaging log before deciding bounded recovery. No final deploy/live proof yet. BBQ remains accepted live529fb99/Flyv289. Do not bypass package/source/image guards or mutate runners/services.
 - **Authority:** Explicit task7 expands the original other-project restriction solely for timeout/retry changes. Roughly1.5–2× proven waits or at most1–2 known-flaky retries; retain assertions/checks. Never weaken Cigar production deployment verification, build the BBQ-owned machine-wide lock, touch other sessions, force-push, skip tests or alter runtime behavior.
 - **External clocks:** Green existing CI and any deploy path depend on each project's current state; record exact code/live identities where applicable. No new services/billing.
 - **Upstream:** No dependency patch or publication needed unless inventory proves a reusable third-party defect.
@@ -48,3 +48,6 @@ test: null
 
 
 **2026-10-08 00:05 CT main CI milestone:** Coffee exact Deploy37729014740 at08605581 has passed classification, backend tests, frontend tests and code quality; Build is pending. RepositoryGuards37729014738 and Exposure37729014695 are green. Final-source build, browser, deployment and live proof remain pending; no failure, duplicate dispatch or runner/service change. Exact job results were read from GitHub; settled full stdout/counts will be preserved after the run completes. Root Indicator prior docs checkpoint950d58d guard37729677233 passed.
+
+
+**2026-10-08 00:19 CT build/packaging milestone:** Completed Build113156233015 in37729014740 passed on08605581; retained stdout confirms main179.5s/shops70.3s,7476 valid shop pages,10106 raw HTML checks,7/7 dollar spans, and185+29+1+8+2 successful browser suites (225 total). Package113161621752 reports failure during image build/push; cause not yet established from stdout. Separate live/visual E2E continues. No production change is claimed; preserving failure evidence and diagnosing the actual cause, with no dispatch, cancellation, fallback-variable change or host mutation.
