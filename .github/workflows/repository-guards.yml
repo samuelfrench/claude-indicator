@@ -1,0 +1,22 @@
+name: Repository guards
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  todo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test task workflow
+        run: node --test scripts/todo/__tests__/todo.test.mjs
+      - name: Check generated task state
+        run: node scripts/todo/build.mjs --check

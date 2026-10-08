@@ -1,5 +1,9 @@
 # Claude Indicator
 
+## Repository task tracking
+
+`TODO.md` and `docs/todo/index.json` are generated from one file per task in `docs/todo/`. Edit the linked task source whenever work starts, changes, completes or blocks; run `node scripts/todo/build.mjs` and commit the source plus both outputs together. Do not hand-edit generated task state. Read `docs/todo/README.md` for frontmatter, archival and query rules; use `node scripts/todo/query.mjs --status now,waiting-sam` to resume. Validate with `node --test scripts/todo/__tests__/todo.test.mjs` and `node scripts/todo/build.mjs --check` before pushing.
+
 ## Project Description
 Translucent PySide6 desktop widget combining Claude Code Max and Codex usage,
 DeepSeek API spend/credit, MiniMax/OpenCode Go/SuperGrok quotas, compact

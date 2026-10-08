@@ -1,0 +1,124 @@
+[
+  {
+    "path": "docs/todo/done/infra/restart-crash-hardening.md",
+    "slug": "restart-crash-hardening",
+    "title": "Restart and crash hardening historical release",
+    "status": "done",
+    "area": "infra",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "September release evidence archived; beta work leaves the current live widget alone.",
+    "refs": [
+      "774d625e22e66dbb8fcf3352d6259e040f23fef6",
+      "TODO-archive.md#pre-task-files-2026-10-07"
+    ],
+    "test": null
+  },
+  {
+    "path": "docs/todo/done/process/todo-task-files-migration.md",
+    "slug": "todo-task-files-migration",
+    "title": "Migrate TODO to generated task files",
+    "status": "done",
+    "area": "process",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Original 70-line TODO preserved; generated tasks and CI guards replace manual edits.",
+    "refs": [
+      "docs/todo/migration-2026-10-07.md",
+      "scripts/todo/migrate-monolith.mjs"
+    ],
+    "test": null
+  },
+  {
+    "path": "docs/todo/infra/child-notify-socket.md",
+    "slug": "child-notify-socket",
+    "title": "Child processes inherit the systemd notification socket",
+    "status": "known-failure",
+    "area": "infra",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Historical non-blocking warning; isolate notification environment in a later runtime task.",
+    "refs": [
+      "widget_runtime.py",
+      "TODO-archive.md#pre-task-files-2026-10-07"
+    ],
+    "test": "journalctl --user -u claude-indicator.service"
+  },
+  {
+    "path": "docs/todo/infra/legacy-source-zone-hold.md",
+    "slug": "legacy-source-zone-hold",
+    "title": "Legacy unrelated source-zone hold",
+    "status": "waiting-sam",
+    "area": "infra",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "sam",
+    "brief": "Preserved during migration; privacy review must remove unrelated infrastructure notes from this product repository.",
+    "refs": [],
+    "test": null
+  },
+  {
+    "path": "docs/todo/product/beta-phase-1.md",
+    "slug": "beta-phase-1",
+    "title": "Claude Indicator beta phase 1",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Terms/privacy audit, clean one-command install, issue forms and draft recruiting; no public launch or posting.",
+    "refs": [
+      "docs/beta/provider-terms-check.md",
+      "docs/beta/privacy-audit.md"
+    ],
+    "test": null
+  },
+  {
+    "path": "docs/todo/product/claude-header-limitations.md",
+    "slug": "claude-header-limitations",
+    "title": "Claude header data limitations and usage API compatibility",
+    "status": "next",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Keep header-only meters honest; provider terms review must precede any new authenticated probe.",
+    "refs": [
+      "bd69af3",
+      "TODO-archive.md#pre-task-files-2026-10-07"
+    ],
+    "test": null
+  },
+  {
+    "path": "docs/todo/product/grok-missing-meter.md",
+    "slug": "grok-missing-meter",
+    "title": "Grok billing response can omit a usage meter",
+    "status": "known-failure",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Missing meter remains a visible error; do not guess zero from an absent field.",
+    "refs": [
+      "tests/test_widget_ui.py",
+      "TODO-archive.md#pre-task-files-2026-10-07"
+    ],
+    "test": "tests/test_widget_ui.py Grok billing has no weekly or on-demand meter"
+  },
+  {
+    "path": "docs/todo/product/session-notification-ideas.md",
+    "slug": "session-notification-ideas",
+    "title": "Session notifications and local token-source ideas",
+    "status": "idea",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Deferred ideas; no change or live session interaction in beta phase 1.",
+    "refs": [],
+    "test": null
+  }
+]
