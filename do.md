@@ -32,3 +32,10 @@ These are current-cycle monetary usage figures, not request/token counts or a pe
 ## Verified deployment
 
 `b8d72851dd44cf8af0f637b70cf656dc0723f0b1` is pushed with green hosted517 tests+20 subtests and fresh8-module install/render. Task8 was deployed through the existing user service on2026-10-07 at22:16:25 CT; root verified the actual X11 widget’s Cursor and separate Grok Bot lines. The runtime is disconnected because no eligible key or stored snapshot is available. This production update happened after isolated installation validation finished; installation itself never starts or changes services. No new services or paid API testing were introduced.
+
+
+## Recheck 2026-10-08 01:56 CT
+
+Task 8’s sanctioned-source rules were reread. Configuration-name and file-metadata checks again found no Cursor Admin key or target account email configured for the widget, and no standard local usage database. Current [API overview](https://cursor.com/docs/api), [spending schema](https://cursor.com/docs/account/teams/admin-api) and [Grok Bot billing](https://cursor.com/help/grok-bot/plans) still support the source and display distinctions documented above. Exact settings remain `CURSOR_ADMIN_API_KEY` with an eligible Enterprise Admin `crsr_` key scoped `admin:*`, plus `CURSOR_ACCOUNT_EMAIL`; no browser/session credential is a substitute. No account action or authenticated usage request was made.
+
+The shipped application bytes remain unchanged. Fresh isolated provider/widget tests passed 196 tests plus 13 subtests; a fresh inert render visibly retained Cursor’s disconnected row and the separate Grok Bot unavailable line. The existing deployed service remains active with zero restarts. No service restart or new deployment was needed for this verification. The allowed fallback remains the shipped result until an eligible sanctioned source is supplied.
