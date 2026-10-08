@@ -1,5 +1,18 @@
 [
   {
+    "path": "docs/todo/ci/load-tolerant-timeouts.md",
+    "slug": "load-tolerant-timeouts",
+    "title": "Evidence-bound shared-machine test timeouts",
+    "status": "now",
+    "area": "ci",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Task7: inspect load-sensitive failures, isolated per-project patches only where proven.",
+    "refs": [],
+    "test": null
+  },
+  {
     "path": "docs/todo/done/infra/restart-crash-hardening.md",
     "slug": "restart-crash-hardening",
     "title": "Restart and crash hardening historical release",
@@ -76,6 +89,23 @@
     "refs": [
       "bd69af3",
       "TODO-archive.md#pre-task-files-2026-10-07"
+    ],
+    "test": null
+  },
+  {
+    "path": "docs/todo/product/cursor-provider.md",
+    "slug": "cursor-provider",
+    "title": "Cursor provider with separate Grok Bot line",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "agent",
+    "brief": "Task8: sanctioned Cursor usage source or explicit disconnected state, tests and widget proof.",
+    "refs": [
+      "do.md",
+      "docs/beta/provider-terms-check.md",
+      "docs/beta/privacy-audit.md"
     ],
     "test": null
   },
