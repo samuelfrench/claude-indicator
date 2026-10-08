@@ -29,5 +29,5 @@ Issues = "https://github.com/samuelfrench/claude-indicator/issues"
 [tool.setuptools]
 py-modules = [
   "indicator_cli", "claude_widget", "smart_todos", "smart_todo_workflow",
-  "terminal_recovery", "terminal_recovery_ui", "widget_runtime",
+  "terminal_recovery", "terminal_recovery_ui", "widget_runtime", "cursor_usage",
 ]

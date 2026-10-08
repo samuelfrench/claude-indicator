@@ -107,7 +107,7 @@
       "docs/beta/provider-terms-check.md",
       "docs/beta/privacy-audit.md"
     ],
-    "test": null
+    "test": "tests/test_cursor_usage.py; tests/test_widget_ui.py"
   },
   {
     "path": "docs/todo/product/grok-missing-meter.md",

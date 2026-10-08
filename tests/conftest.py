@@ -24,7 +24,7 @@ def forbid_provider_cli_processes(monkeypatch):
 
     def guarded(command, *args, **kwargs):
         parts = shlex.split(command) if isinstance(command, str) else command
-        if parts and Path(str(parts[0])).name in {"gh", "codex", "claude", "grok", "opencode"}:
+        if parts and Path(str(parts[0])).name in {"gh", "codex", "claude", "grok", "opencode", "cursor", "cursor-agent", "agent"}:
             raise AssertionError("Unmocked provider CLI blocked by the test suite")
         return real_popen(command, *args, **kwargs)
 

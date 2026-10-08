@@ -12,7 +12,7 @@ Current beta scope, policy classifications and data-flow qualifications are reco
 
 ## Implementation rules
 
-- PySide6 and requests are the package dependencies. Package all seven root application modules in `pyproject.toml`; do not accidentally include personal state, documents or service configurations in the wheel.
+- PySide6 and requests are the package dependencies. Package all eight root application modules in `pyproject.toml`; do not accidentally include personal state, documents or service configurations in the wheel.
 - Informational CLI commands must exit before Qt import, credential reading, provider communication or state writes. Installation must not start the GUI or alter autostart/systemd.
 - Credential-bearing HTTPS requests go to their provider endpoint. Keep credentials out of logs, history and UI errors. Local subprocesses and browser/editor/clipboard actions have separate data-flow qualifications in the privacy audit.
 - Hidden provider rows skip their fetches. Missing/error quota data is unavailable, not zero. Cached usage must show age and respect expiry/reset bounds.

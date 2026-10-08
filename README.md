@@ -26,6 +26,7 @@ The widget reuses credentials or local data from tools you have already configur
 |---|---|
 | Claude | Claude Code OAuth credentials; usage endpoint, OAuth refresh, or a minimal inference request whose response headers contain quotas |
 | Codex | Local `codex app-server` account rate-limit protocol, recent local session cache and local SQLite totals |
+| Cursor / Grok Bot | Official Enterprise Admin spending API with an explicitly configured key; separate Grok Bot line with an unavailable meter |
 | DeepSeek | Official balance endpoint plus local OpenCode cost ledger |
 | MiniMax | Coding-plan quota endpoint plus local OpenCode token ledger |
 | OpenCode Go | Go usage endpoint using the existing OpenCode key |
@@ -35,6 +36,8 @@ The widget reuses credentials or local data from tools you have already configur
 Claude's header fallback sends a real `max_tokens: 1` Haiku request to Anthropic and consumes subscription usage. The application cannot guarantee that a user's plan has overage disabled. Header-only mode lacks model-specific limits and extra-usage dollars. No new Anthropic requests were made for beta testing; validation uses mocks. Current OAuth/undocumented-source policy risks are documented in the terms check.
 
 API keys can be provided through `DEEPSEEK_API_KEY`, `MINIMAX_API_KEY` and `OPENCODE_GO_API_KEY`, or read from owner-controlled mode-0600 OpenCode auth. Grok uses `GROK_OAUTH_TOKEN`, its owner-controlled CLI auth file, or OpenCode OAuth. Claude uses its existing CLI credentials and optionally `CLAUDE_CODE_OAUTH_TOKEN` or the private `~/.credentials/claude-oauth-token.txt`. Do not paste any of these values into issues. HTTPS requests send the relevant credential to that provider; Codex's CLI manages its own provider communication.
+
+Cursor starts **not connected / needs API key**. The optional connection requires a Cursor **Enterprise team Admin API key** with `admin:*` scope in `CURSOR_ADMIN_API_KEY`, plus the exact member email in `CURSOR_ACCOUNT_EMAIL`. A protected `cursor-admin-api-key.txt` under `$XDG_CONFIG_HOME/claude-indicator` (default `~/.config/claude-indicator`) can supply the key instead. Personal-plan, Cloud Agents, Origin and xAI keys are not substitutes. The hourly filtered spending API exposes included usage used and on-demand spend, but no included allowance, plan name, reset date or Grok Bot-specific meter; those remain unavailable. Grok Bot is shown under Cursor separately from SuperGrok. See [Cursor setup and available data](do.md); no browser cookies or session-token extraction is used.
 
 ## Local features and storage
 

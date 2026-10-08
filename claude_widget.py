@@ -64,6 +64,7 @@ from smart_todos import SmartTodoDialog
 from terminal_recovery import TerminalRecoveryStore, scan_terminals
 from terminal_recovery_ui import TerminalRecoveryDialog, local_time
 from widget_runtime import InstanceLock, QtServiceRuntime
+from cursor_usage import CURSOR_REFRESH_MS, CursorUsageSummary, read_cursor_usage
 
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
@@ -191,6 +192,7 @@ WIDGET_SECTIONS = (
 )
 WIDGET_PROVIDERS = (
     ("codex", "Codex"),
+    ("cursor", "Cursor"),
     ("deepseek", "DeepSeek"),
     ("minimax", "MiniMax"),
     ("go", "OpenCode Go"),
@@ -4608,6 +4610,21 @@ class OpencodeGoUsageWorker(QThread):
             self.result.emit(summary)
 
 
+class CursorUsageWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        summary = (self._reader or read_cursor_usage)()
+        if not self.isInterruptionRequested():
+            self.result.emit(summary)
+
+
 class GrokUsageWorker(QThread):
     result = Signal(object)
 
@@ -6385,6 +6402,88 @@ def _grok_amount_text(amount: Decimal) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text
+
+
+class CursorUsageRow(QWidget):
+    """Cursor account spending with a separate, explicitly unavailable Bot meter."""
+
+    _COLLAPSED_H = 44
+    _LINE_H = 18
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._summary = CursorUsageSummary()
+        self._expanded = False
+        self.setFixedHeight(self._COLLAPSED_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.set_data(self._summary)
+
+    @staticmethod
+    def _money(amount: Decimal | None) -> str:
+        return "—" if amount is None else f"${amount:.2f}"
+
+    def summary_text(self) -> str:
+        if not self._summary.connected:
+            return "Not connected · needs API key" if "key" in self._summary.error else self._summary.error
+        return (f"Included {self._money(self._summary.included_used)}"
+                f" · OD {self._money(self._summary.on_demand_used)}")
+
+    def bot_text(self) -> str:
+        return "Grok Bot   — · meter unavailable"
+
+    def _detail_lines(self) -> list[str]:
+        summary = self._summary
+        started = (datetime.fromtimestamp(summary.cycle_started_at, timezone.utc).strftime("%d %b %Y UTC")
+                   if summary.cycle_started_at is not None else "—")
+        return [
+            f"INCLUDED   {self._money(summary.included_used)} / — allowance",
+            f"ON-DEMAND  {self._money(summary.on_demand_used)}",
+            "PLAN       — · not exposed",
+            "RESET      — · not exposed",
+            f"CYCLE START  {started}",
+        ]
+
+    def set_data(self, summary: CursorUsageSummary | None):
+        self._summary = summary or CursorUsageSummary()
+        lines = ["Cursor Enterprise Admin API: current billing-cycle spending.",
+                 "\n".join(self._detail_lines()),
+                 "Grok Bot is billed through Cursor, separately from SuperGrok.",
+                 "This endpoint does not expose a Grok Bot meter, plan, allowance or reset."]
+        if self._summary.fetched_at is not None:
+            lines.append("Read " + datetime.fromtimestamp(self._summary.fetched_at, timezone.utc).strftime("%d %b %H:%M UTC") + "; refreshed hourly.")
+        if self._summary.error:
+            lines.append(self._summary.error + ". See do.md for the exact configuration.")
+        self.setToolTip("\n".join(lines))
+        if self._expanded:
+            self.setFixedHeight(self._COLLAPSED_H + len(self._detail_lines()) * self._LINE_H)
+        self.update()
+
+    def mousePressEvent(self, event):
+        self._expanded = not self._expanded
+        self.setFixedHeight(self._COLLAPSED_H + len(self._detail_lines()) * self._LINE_H
+                            if self._expanded else self._COLLAPSED_H)
+        _resize_parent(self)
+        event.accept()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setFont(QFont("sans-serif", 8, QFont.Weight.Medium))
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(4, 17, "CURSOR " + ("▾" if self._expanded else "▸"))
+        header_width = painter.fontMetrics().horizontalAdvance("CURSOR ▸")
+        painter.setFont(QFont("sans-serif", 7))
+        painter.setPen(QColor(160, 160, 180))
+        fm = painter.fontMetrics()
+        available = max(0, self.width() - header_width - 16)
+        text = fm.elidedText(self.summary_text(), Qt.TextElideMode.ElideRight, available)
+        painter.drawText(self.width() - fm.horizontalAdvance(text) - 4, 17, text)
+        painter.drawText(12, 35, fm.elidedText(self.bot_text(), Qt.TextElideMode.ElideRight, self.width() - 16))
+        if self._expanded:
+            for index, line in enumerate(self._detail_lines()):
+                painter.drawText(8, 55 + index * self._LINE_H,
+                                 fm.elidedText(line, Qt.TextElideMode.ElideRight, self.width() - 16))
+        painter.end()
 
 
 class GrokUsageRow(QWidget):
@@ -8473,6 +8572,7 @@ class ClaudeWidget(QWidget):
         self._task_group_worker: TaskGroupFetchWorker | None = None
         self._cron_worker: CronJobsFetchWorker | None = None
         self._codex_worker: CodexUsageWorker | None = None
+        self._cursor_worker: CursorUsageWorker | None = None
         self._deepseek_worker: DeepSeekUsageWorker | None = None
         self._minimax_worker: MinimaxUsageWorker | None = None
         self._go_worker: OpencodeGoUsageWorker | None = None
@@ -8547,6 +8647,7 @@ class ClaudeWidget(QWidget):
                 tstats.get("total_cache", 0),
             )
         self._refresh_codex_usage()
+        self._refresh_cursor_usage()
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
         self._refresh_opencode_go_usage()
@@ -8723,6 +8824,10 @@ class ClaudeWidget(QWidget):
         self._codex_row = CodexUsageRow()
         layout.addWidget(self._codex_row)
 
+        # Cursor account usage and its distinct Grok Bot subline.
+        self._cursor_row = CursorUsageRow()
+        layout.addWidget(self._cursor_row)
+
         # DeepSeek API spend and credit row
         self._deepseek_row = DeepSeekUsageRow()
         layout.addWidget(self._deepseek_row)
@@ -8872,6 +8977,8 @@ class ClaudeWidget(QWidget):
         if kind == "provider":
             if item_id == "codex":
                 self._refresh_codex_usage()
+            elif item_id == "cursor":
+                self._refresh_cursor_usage()
             elif item_id == "deepseek":
                 self._refresh_deepseek_usage()
             elif item_id == "minimax":
@@ -8939,6 +9046,7 @@ class ClaudeWidget(QWidget):
             self._token_row.setVisible(expanded)
 
             self._codex_row.setVisible(self._provider_visible("codex"))
+            self._cursor_row.setVisible(self._provider_visible("cursor"))
             self._deepseek_row.setVisible(self._provider_visible("deepseek"))
             self._minimax_row.setVisible(self._provider_visible("minimax"))
             self._go_row.setVisible(self._provider_visible("go"))
@@ -9082,6 +9190,10 @@ class ClaudeWidget(QWidget):
         self._codex_timer.timeout.connect(self._refresh_codex_usage)
         self._codex_timer.start(CODEX_REFRESH_MS)
 
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.timeout.connect(self._refresh_cursor_usage)
+        self._cursor_timer.start(CURSOR_REFRESH_MS)
+
         self._deepseek_timer = QTimer(self)
         self._deepseek_timer.timeout.connect(self._refresh_deepseek_usage)
         self._deepseek_timer.start(DEEPSEEK_REFRESH_MS)
@@ -9119,6 +9231,7 @@ class ClaudeWidget(QWidget):
     def _refresh_all(self):
         self._fetch_usage(force=True)
         self._refresh_codex_usage()
+        self._refresh_cursor_usage()
         self._refresh_deepseek_usage()
         self._refresh_minimax_usage()
         self._refresh_opencode_go_usage()
@@ -9499,6 +9612,19 @@ class ClaudeWidget(QWidget):
 
     def _on_opencode_go_usage_read(self, summary: OpencodeGoUsageSummary | None):
         self._go_row.set_data(summary)
+        self.adjustSize()
+
+    def _refresh_cursor_usage(self):
+        if self._shutdown_started or not self._provider_visible("cursor"):
+            return
+        if self._cursor_worker and self._cursor_worker.isRunning():
+            return
+        self._cursor_worker = CursorUsageWorker()
+        self._cursor_worker.result.connect(self._on_cursor_usage_read)
+        self._cursor_worker.start()
+
+    def _on_cursor_usage_read(self, summary: CursorUsageSummary | None):
+        self._cursor_row.set_data(summary)
         self.adjustSize()
 
     def _refresh_grok_usage(self):
@@ -9949,6 +10075,7 @@ class ClaudeWidget(QWidget):
                 self._task_group_worker,
                 self._cron_worker,
                 self._codex_worker,
+                self._cursor_worker,
                 self._deepseek_worker,
                 self._minimax_worker,
                 self._go_worker,

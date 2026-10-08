@@ -38,7 +38,7 @@ body:
     id: providers-wanted
     attributes:
       label: Which providers do you want covered?
-      description: Name the providers and plans you want tracked, including ones the beta already covers.
+      description: Name the providers and plans you want tracked, including Cursor, its separate Grok Bot meter, and ones the beta already covers.
     validations:
       required: true
   - type: checkboxes

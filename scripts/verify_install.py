@@ -14,6 +14,7 @@ SMOKE = r"""
 import importlib
 import json
 import platform
+import os
 from importlib.metadata import version
 import subprocess
 from contextlib import ExitStack
@@ -22,7 +23,7 @@ import requests
 import urllib.request
 
 modules = ["indicator_cli", "claude_widget", "smart_todos", "smart_todo_workflow",
-           "terminal_recovery", "terminal_recovery_ui", "widget_runtime"]
+           "terminal_recovery", "terminal_recovery_ui", "widget_runtime", "cursor_usage"]
 for name in modules:
     installed = importlib.import_module(name)
     assert "site-packages" in installed.__file__, installed.__file__
@@ -34,7 +35,7 @@ methods = ["_setup_tray_icon", "_setup_timers", "_fetch_usage", "_fetch_deploys"
            "_fetch_runners", "_fetch_task_loops", "_fetch_task_groups", "_fetch_cron_jobs",
            "_fetch_ollama", "_fetch_comfyui", "_update_system_metrics", "_refresh_codex_usage",
            "_refresh_deepseek_usage", "_refresh_minimax_usage", "_refresh_opencode_go_usage",
-           "_refresh_grok_usage", "_refresh_opencode_usage", "_refresh_terminal_sessions"]
+           "_refresh_grok_usage", "_refresh_cursor_usage", "_refresh_opencode_usage", "_refresh_terminal_sessions"]
 def blocked(*args, **kwargs):
     raise AssertionError("Install smoke cannot use HTTP or subprocesses")
 def inert(*args, **kwargs):
@@ -52,11 +53,20 @@ with ExitStack() as patches:
     app.processEvents()
     image = widget.grab().toImage()
     assert widget.width() == 340 and image.width() == 340 and image.height() > 0
+    assert not widget._cursor_row.isHidden()
+    assert "Not connected" in widget._cursor_row.summary_text()
+    assert widget._cursor_row.bot_text() == "Grok Bot   — · meter unavailable"
+    assert widget._cursor_row is not widget._grok_row
+    image_path = os.environ.get("INDICATOR_SMOKE_IMAGE")
+    if image_path:
+        assert image.save(image_path)
     result = {"modules": modules, "platform": app.platformName(),
               "render_width": image.width(), "render_height": image.height(),
               "provider_http": "blocked", "subprocesses": "blocked",
               "python": platform.python_version(), "pyside6": version("PySide6"),
-              "all_modules_from_installed_package": True}
+              "all_modules_from_installed_package": True,
+              "cursor": widget._cursor_row.summary_text(),
+              "cursor_grok_bot": widget._cursor_row.bot_text()}
     widget.shutdown()
     widget.close()
     app.processEvents()
@@ -66,7 +76,7 @@ print(json.dumps(result))
 
 def isolated_env(home):
     env = dict(os.environ)
-    sensitive_prefixes = ("ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_", "GROK_", "XAI_",
+    sensitive_prefixes = ("ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_", "GROK_", "CURSOR_", "XAI_",
                           "DEEPSEEK_", "MINIMAX_", "OPENCODE_", "GH_", "GITHUB_")
     for key in tuple(env):
         if key.startswith(sensitive_prefixes) or key in {
@@ -90,12 +100,15 @@ def main():
     parser.add_argument("--source", default=str(Path(__file__).resolve().parents[1]),
                         help="Local source or a pip Git URL to install")
     parser.add_argument("--report", type=Path, help="Write non-sensitive JSON evidence")
+    parser.add_argument("--image", type=Path, help="Save the inert offscreen widget image")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="indicator-install-") as tmp:
         work = Path(tmp)
         home = work / "home"
         home.mkdir(mode=0o700)
         env = isolated_env(home)
+        if args.image:
+            env["INDICATOR_SMOKE_IMAGE"] = str(args.image.resolve())
         install_env = work / "venv"
         venv.EnvBuilder(with_pip=True).create(install_env)
         python = install_env / "bin/python"

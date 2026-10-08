@@ -41,6 +41,9 @@ from claude_widget import (
     OpencodeGoUsageRow,
     OpencodeGoUsageSummary,
     OpencodeGoWindow,
+    CursorUsageRow,
+    CursorUsageWorker,
+    CursorUsageSummary,
     GrokUsageRow,
     GrokUsageSummary,
     MoneyBalance,
@@ -833,6 +836,73 @@ class WidgetUiTest(unittest.TestCase):
         go_index = layout.indexOf(widget._go_row)
         self.assertEqual(layout.indexOf(widget._grok_row), go_index + 1)
         self.assertIsInstance(widget._grok_row, GrokUsageRow)
+
+    def test_cursor_has_own_row_and_bot_stays_distinct_from_supergrok(self):
+        widget = self._make_inert_claude_widget()
+        layout = widget._codex_row.parentWidget().layout()
+        self.assertEqual(layout.indexOf(widget._cursor_row), layout.indexOf(widget._codex_row) + 1)
+        self.assertIsInstance(widget._cursor_row, CursorUsageRow)
+        self.assertIsNot(widget._cursor_row, widget._grok_row)
+        self.assertIn("Not connected", widget._cursor_row.summary_text())
+        self.assertEqual(widget._cursor_row.bot_text(), "Grok Bot   — · meter unavailable")
+        self.assertNotIn("$0", widget._cursor_row.toolTip())
+        self.assertIn("SuperGrok", widget._cursor_row.toolTip())
+
+    def test_cursor_row_displays_spend_without_inventing_allowance_plan_reset_or_bot(self):
+        row = CursorUsageRow()
+        row.resize(312, row.height())
+        row.set_data(CursorUsageSummary(connected=True, included_used=Decimal("8.50"),
+                                       on_demand_used=Decimal("1.25"),
+                                       cycle_started_at=1790812800, fetched_at=time.time(), error=""))
+        self.assertEqual(row.summary_text(), "Included $8.50 · OD $1.25")
+        self.assertIn("$8.50 / — allowance", row._detail_lines()[0])
+        self.assertIn("RESET      —", row.toolTip())
+        self.assertIn("PLAN       —", row.toolTip())
+        self.assertIn("01 Oct 2026 UTC", row.toolTip())
+        self.assertNotIn("Grok Bot   $", row.bot_text())
+        row.show()
+        QApplication.processEvents()
+        self.assertEqual(row.grab().height(), CursorUsageRow._COLLAPSED_H)
+        row.mousePressEvent(Mock())
+        QApplication.processEvents()
+        self.assertEqual(row.height(), CursorUsageRow._COLLAPSED_H + 5 * row._LINE_H)
+        self.assertFalse(row.grab().isNull())
+        row.close()
+
+    def test_cursor_row_is_hidden_independently_and_unhide_refreshes(self):
+        widget = self._make_inert_claude_widget()
+        widget.show()
+        widget._set_provider_visible("cursor", False)
+        self.assertTrue(widget._cursor_row.isHidden())
+        self.assertFalse(widget._grok_row.isHidden())
+        stored = json.loads(claude_widget.WIDGET_VISIBILITY_PATH.read_text())
+        self.assertIn("cursor", stored["hidden_providers"])
+        with patch.object(widget, "_refresh_cursor_usage") as refresh:
+            widget._set_provider_visible("cursor", True)
+        refresh.assert_called_once_with()
+        self.assertFalse(widget._cursor_row.isHidden())
+
+    def test_cursor_worker_only_emits_sanitized_reader_result_and_honors_interruption(self):
+        reader = Mock(return_value=CursorUsageSummary())
+        worker = CursorUsageWorker(reader=reader)
+        result = Mock()
+        worker.result.connect(result)
+        worker.run()
+        result.assert_called_once_with(reader.return_value)
+        with patch.object(worker, "isInterruptionRequested", return_value=True):
+            worker.run()
+        reader.assert_called_once_with()
+
+    def test_cursor_refresh_skips_hidden_shutdown_and_running_worker(self):
+        from types import SimpleNamespace
+        for shutdown, visible, running in [(True, True, False), (False, False, False), (False, True, True)]:
+            with self.subTest(shutdown=shutdown, visible=visible, running=running):
+                fake = SimpleNamespace(_shutdown_started=shutdown,
+                                       _provider_visible=lambda provider: visible,
+                                       _cursor_worker=Mock(isRunning=Mock(return_value=running)))
+                with patch.object(claude_widget, "CursorUsageWorker") as constructor:
+                    ClaudeWidget._refresh_cursor_usage(fake)
+                constructor.assert_not_called()
 
     def test_opencode_local_tokens_splits_today_from_all_time(self):
         # 2026-08-19 12:00:00 local; "today" starts at the local midnight before it.
@@ -1681,6 +1751,7 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_refresh_minimax_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_opencode_go_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_grok_usage", lambda self: None),
+            patch.object(ClaudeWidget, "_refresh_cursor_usage", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_opencode_usage", lambda self: None),
             patch.object(
                 ClaudeWidget, "_refresh_terminal_sessions", lambda self: None
@@ -3089,7 +3160,23 @@ class WidgetUiTest(unittest.TestCase):
         self.assertIsInstance(widget._local_ai_section, LocalAISection)
         self.assertEqual(widget.width(), 340)
 
-    def test_tall_sections_are_mutually_exclusive_and_fit_800px_screen(self):
+    def _assert_cursor_panel_budget(self, widget):
+        # Keep the existing providers' 860px budget; Cursor contributes exactly
+        # one 44px row plus the existing layout spacing, not unbounded growth.
+        cursor_height = CursorUsageRow._COLLAPSED_H
+        spacing = widget._cursor_row.parentWidget().layout().spacing()
+        self.assertEqual(widget._cursor_row.height(), cursor_height)
+        with_cursor = widget.height()
+        self.assertLessEqual(with_cursor, 860 + cursor_height + spacing)
+        widget._set_provider_visible("cursor", False)
+        QApplication.processEvents()
+        self.assertLessEqual(widget.height(), 860)
+        self.assertEqual(with_cursor - widget.height(), cursor_height + spacing)
+        widget._set_provider_visible("cursor", True)
+        QApplication.processEvents()
+        self.assertEqual(widget.height(), with_cursor)
+
+    def test_tall_sections_are_mutually_exclusive_and_keep_provider_height_budget(self):
         widget = self._make_inert_claude_widget(tray_available=False)
         widget.show()
         widget._local_ai_section.set_ollama(
@@ -3108,10 +3195,7 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._local_ai_section.is_expanded())
         self.assertFalse(widget._history_expanded)
-        # The collapsed GO + GROK rows grow the panel beyond an 800px work area
-        # (the user accepted the GO tradeoff 2026-09-07; GROK adds one 30px row);
-        # the mutual exclusion keeps the panel bounded at this fixed budget.
-        self.assertLessEqual(widget.height(), 860)
+        self._assert_cursor_panel_budget(widget)
 
         widget._toggle_history()
         widget.adjustSize()
@@ -3119,7 +3203,7 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertTrue(widget._history_expanded)
         self.assertFalse(widget._local_ai_section.is_expanded())
-        self.assertLessEqual(widget.height(), 860)
+        self._assert_cursor_panel_budget(widget)
 
     def test_fable_and_max_expansions_reposition_inside_800px_work_area(self):
         widget = self._make_inert_claude_widget(tray_available=False)
@@ -3158,10 +3242,9 @@ class WidgetUiTest(unittest.TestCase):
         QApplication.processEvents()
 
         frame = widget.frameGeometry()
-        # The GO + GROK rows make the fully expanded panel taller than the
-        # 800px work area (accepted tradeoff, 2026-09-07), so clamp pins it to
-        # the screen top instead of fitting it vertically.
-        self.assertLessEqual(widget.height(), 860)
+        # Expanded providers can exceed this small work area; retain the old
+        # height budget plus only Cursor's row, and keep the top-clamp contract.
+        self._assert_cursor_panel_budget(widget)
         self.assertGreaterEqual(frame.left(), available.left())
         self.assertGreaterEqual(frame.top(), available.top())
         self.assertLessEqual(frame.right(), available.right())
@@ -3183,7 +3266,7 @@ class WidgetUiTest(unittest.TestCase):
 
         worker_names = (
             "_worker", "_deploy_worker", "_runner_worker", "_task_loop_worker",
-            "_task_group_worker", "_cron_worker", "_codex_worker",
+            "_task_group_worker", "_cron_worker", "_codex_worker", "_cursor_worker",
             "_deepseek_worker", "_minimax_worker", "_go_worker", "_grok_worker",
             "_opencode_worker", "_ollama_worker", "_comfyui_worker", "_terminal_focus_worker",
         )
