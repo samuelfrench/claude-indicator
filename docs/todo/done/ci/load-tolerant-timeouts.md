@@ -1,24 +1,24 @@
 ---
 title: "Evidence-bound shared-machine test timeouts"
-status: now
+status: done
 area: ci
 due: null
 updated: 2026-10-08
 owner: agent
-brief: "Task7: inspect load-sensitive failures, isolated per-project patches only where proven."
+brief: "Task7 complete: 37 owned CI repos screened; five scoped wait changes shipped in BBQ/Coffee with green exact-source CI and live desktop/mobile evidence."
 refs: []
 test: null
 ---
 - **What:** Read-only inventory across workspace projects, starting BBQ commit001fee3; patch only evidenced load-sensitive timeouts/retries in separate worktrees, each with its own small tested/rebased/pushed commit and generated project notes.
 - **Why:** Concurrent self-hosted jobs can exceed narrow waits; unsupported blanket increases hide unrelated failures.
-- **Next:** Coffee d7 current-source tests/build/225 built browser, Live+Visual and package passed. Observe running Deploy37732907752, then verify exact source/digest/readiness and public desktop/mobile behavior before completion and final TODO/home/memory reconciliation. Earlier stale-source failures remain retained; no new root retries or host changes.
+- **Next:** Bounded Task7 work is done. Any new recurrence needs exact-source evidence and a separate scoped lane. Coffee historical Back/searchbox follow-up and BBQ machine-wide lock stay with their owners; no host cleanup, global timeout or Cigar production changes.
 - **Authority:** Explicit task7 expands the original other-project restriction solely for timeout/retry changes. Roughly1.5–2× proven waits or at most1–2 known-flaky retries; retain assertions/checks. Never weaken Cigar production deployment verification, build the BBQ-owned machine-wide lock, touch other sessions, force-push, skip tests or alter runtime behavior.
 - **External clocks:** Green existing CI and any deploy path depend on each project's current state; record exact code/live identities where applicable. No new services/billing.
 - **Upstream:** No dependency patch or publication needed unless inventory proves a reusable third-party defect.
 - [x] Inventory recent failures/current fixes and active files for BBQ, Cigar, Coffee, Honey, Chinese and remaining workspace CI projects.
 - [x] Implement only justified conservative changes in isolated worktrees; update each project's generated task notes with old/new values, exact evidence and reproduction.
-- [ ] Run each changed project's appropriate tests, fetch/rebase, commit/push without force and observe required CI/deploy state.
-- [ ] Summarize per-project changes and rejected/no-change cases, with evidence and resume points.
+- [x] Run each changed project's appropriate tests, fetch/rebase, commit/push without force and observe required CI/deploy state.
+- [x] Summarize per-project changes and rejected/no-change cases, with evidence and resume points.
 
 **2026-10-07 evidence milestone:** Reviewer found39 primary workspace repos with CI test/build/verification workflows;37 Sam-owned refs fetched,2 upstream checkouts excluded. Root independently read BBQ failed CI logs: run37708532468 failed exactly CompareTray composition at15,000ms (498/499 tests); run37709190412 failed exactly MeatGuide accessibility at120,000ms (498/499). Current origin values are unchanged. Candidate patch is30,000ms only for the composition case and180,000ms only for the full-rule axe case, with no retries/assertion changes. Commit001fee3 records load24.6–35.1 on32cores and other-repo runner contention; isolated Compare7/7in5.7s and subsequent green001fee3 deploy are supporting evidence. Cigar latest failure is an assertion mismatch rather than load timeout; production verification remains excluded. Wait for the sole Cursor implementer to finish, then make BBQ changes in a new worktree. Full per-project inventory remains pending.
 
@@ -63,3 +63,9 @@ test: null
 
 
 **2026-10-08 00:57 CT current-source acceptance milestone:** Coffee corrected d7f6604f8 passed frontend4346/backend1244/quality, fresh shadow-reference158.2s main55.4s shops with equivalent cached output,225 built browser checks and SSG7476 shops/10106 HTML/7 dollar spans. Live+Visual E2E and image packaging now succeeded by official job metadata; settled live/visual counts remain to be read. Registry proof verifies GH_SHA d7 and digest sha256:5fa47f80e6a03916305e0c0774e98d5797bef9a9a8f87c65632e87f95e6c068b. Deploy37732907752 is running; no settled production/live acceptance yet. Actual completed build/package stdout retained/read. Equivalence artifact11531495347 SHA256 f8551bbb7c1c8487c20925bbeda77ce573eff7f00d23a9ea499ac5a4b0a62f6b proves the input-hash-identical cache matched freshly rendered current-source reference. All actual failures remain separately recorded; no assertion/global timeout or runtime modification from Task7.
+
+
+**2026-10-08 01:10 CT final Coffee live acceptance:** Deploy37732907752 and Exposure37732907737 passed for d7f6604f82be77df7d67f28779dd8390b21802c9 retaining timing2e32b365:4346 frontend/1244 backend, full-render equivalence,225 built browser,19 live/7 visual/1 containment passed. Flyv1610 exact digest sha256:5fa47f80e6a03916305e0c0774e98d5797bef9a9a8f87c65632e87f95e6c068b verified on both healthy machines. Desktop1365/mobile390 Suited filter, reload/direct hash, shop navigation, Back and reset passed without page overflow; four screenshots viewed and normal browser readiness200. Initial network-change timeout and Python403 remain preserved; captured56 advertising/user-sync errors/11 warnings remain qualified, with no first-party bundle/API failure after recovery or uncaught app exception observed. Newer Coffee owner review-snapshot/timer changes are separate from accepted d7 release. BBQ final refresh is later owner price-link source0d8198cd3825b7163d318c6e227dcebe5689d08a; accepted Task7 snapshot529fb99/v289 remains dated proof, not current release identity. Private current receipts/implementation report updated. Final per-project notes and root/home/memory reconciliation underway.
+
+
+**Final closeout 2026-10-08:** BBQ code360ea83d450a29e5bc87af4ec62b87cce73da9f8: CompareTray15,000→30,000ms; full-ruleaxe120,000→180,000ms. Coffee code2e32b365de9944372b0dd857358d9d68330a7b5b: two committed5,000→10,000ms ShopDetail waits; one CityGuide30,000→45,000ms reload/hash case. Exactly5 scoped waits,0 assertion/global-limit/retry/runtime edits in the shipped Task7 patch. No changes Cigar/Honey/Chinese/other32 owned repos: assertion/network causes, readiness fix already shipped, or no load proof. Inventory39 including2 excluded upstream checkouts;37 owned fetched. Immutable reviews, actual local/CI/build/live receipts accepted above. Coffee final task/generated notes pushed0f5911d30; ShopDetail task done, historical CityGuide Back follow-up stays known-failure. BBQ accepted notes b1b76c3; subsequent owner price-link release is separate. Docker rule reaffirmed2026-10-08: never prune builder/system/images/volumes or re-enable GC without Sam explicitly approving in that moment, even when /cache full. Root performed none; the external121GB prune is not precedent/authorization. All prior failed/interrupted/stale-source gates retained, no new root retries. Resume exact reports ~/indicator-beta/task7-timeout-inventory.md, task7-implementation.md and task7-coffee-live-qa.json.

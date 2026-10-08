@@ -1,18 +1,18 @@
 ---
 title: "Claude Indicator beta phase 1"
-status: now
+status: done
 area: product
 due: null
-updated: 2026-10-07
+updated: 2026-10-08
 owner: agent
-brief: "Terms/privacy audit, clean one-command install, issue forms and draft recruiting; no public launch or posting."
+brief: "All authorized beta tasks1–8 verified and shipped; private recruiting drafts/tracker remain at0posts/0confirmed users, with future paid-release decisions separate."
 refs: ["docs/beta/provider-terms-check.md", "docs/beta/privacy-audit.md"]
 test: null
 ---
 - **What:** Complete the authoritative beta plan and its October 7 additions.
 - **Why:** Public distribution and later paid use need provider-policy, privacy and installation evidence first.
-- **Next:** Original beta requirements/recruiting drafts and Cursor deployment are verified. Complete the evidence-bound BBQ/Coffee timeout lane, then reconcile final records; no posting or launch.
-- **Authority:** Requirements 1–6 here; later file additions 7–8 are tracked separately in `docs/todo/ci/load-tolerant-timeouts.md` and `docs/todo/done/product/cursor-provider.md`. Direct thread no-posting instruction remains controlling. No public release, README GIF, Pro tier, HN/Reddit/X launch, replies/DMs/likes/follows, email, money, new Anthropic API test calls or tmux interaction. Use mocks and isolated installation validation; beta install testing leaves the owner's running indicator untouched.
+- **Next:** Phase1 preparation is done. Later launch/Pro/adoption and owner-only source/license/history decisions remain outside this goal in the home sales plan and paid-release task. No posting anywhere.
+- **Authority:** Requirements 1–6 here; later file additions 7–8 are tracked separately in `docs/todo/done/ci/load-tolerant-timeouts.md` and `docs/todo/done/product/cursor-provider.md`. Direct thread no-posting instruction remains controlling. No public release, README GIF, Pro tier, HN/Reddit/X launch, replies/DMs/likes/follows, email, money, new Anthropic API test calls or tmux interaction. Use mocks and isolated installation validation; beta install testing leaves the owner's running indicator untouched.
 - **External clocks:** Terms and public community rules require current read-only evidence. Any later posting needs explicit owner approval; drafts do not start a posting clock. No new billing or account enrollment is needed.
 - **Upstream targets:** No upstream patch/listing is needed for this beta scope; external publication remains held.
 
@@ -22,7 +22,7 @@ test: null
 - [x] Add `.github/ISSUE_TEMPLATE/beta-signup.yml`, `beta-feedback.yml`, and a short README Beta section with install command and form links; no GIF or launch copy.
 - [x] Find 25–30 recent (roughly 14-day) X/Reddit usage-limit/reset complaints; check community self-promotion rules, skip forbidding communities, and save ranked truthful varied 1–3 sentence replies disclosing “I built”, repo link and provider question to the owner's local recruitment Markdown and CSV. Do not post.
 - [x] Maintain local recruits tracker with one row per actual signup, source/date/provider requests and running provider tally; check signup/feedback issues each work session.
-- [ ] Run actual gates, commit/push tested work with green CI, record isolated-install protection and the separately authorized Task8 production deployment, and reconcile project TODO, owner plan and shared memory before final report.
+- [x] Run actual gates, commit/push tested work with green CI, record isolated-install protection and the separately authorized Task8 production deployment, and reconcile project TODO, owner plan and shared memory before final report.
 
 **Started 2026-10-07:** Primary `master` and `origin/master` matched `d857694a050ddfb8774ce99be64e774ded5d9426` before work; tree was clean and no GitHub workflow existed. TODO migration is the first implementation lane. Recruitment and tracker records remain local, with no send/post action authorized.
 
@@ -56,3 +56,6 @@ test: null
 **2026-10-07 final-install reconciliation:** Fixed the install report reference after the completed Cursor task moved to `docs/todo/done/product/cursor-provider.md`. Fresh pinned public8-module installation is already verified; root additionally rechecks the exact advertised unpinned pipx command against current public master while Task7 CI runs, keeping provider HTTP/subprocesses blocked during the inert installed-widget smoke and leaving the production service untouched.
 
 **2026-10-07 latest advertised installation accepted:** Exact unpinned pipx command installeda468bcba5cacdafa8a318b9736712e44e89a77fc from public master in a fresh isolated environment;8 modules, help/version and340×753 inert Cursor/Grok Bot render passed. Provider HTTP/subprocesses blocked, existingPID954015 untouched, temp environment removed. Evidence is in the install report and private final-pipx receipts; no further installation gate remains. Task7 CI/build is the remaining work.
+
+
+**Final acceptance 2026-10-08:** Tasks1–6 reports/current-tree forward cleanup/package/CLI/forms/private recruiting and Task8 Cursor accepted. Runtimeb8d72851dd44cf8af0f637b70cf656dc0723f0b1: green Python/install37721559440 +guard37721559446 with517tests+20subtests,8installedmodules. Exact advertised unpinned pipx installeda468bcba5cacdafa8a318b9736712e44e89a77fc, Python3.12.3/PySide6 6.11.2,8modules/help/version/inert340×753; temp removed and livePID954015 untouched by installation. Separate Task8 service deployment22:16:25CT verified native Cursor/GrokBot lines; current health active/runningPID954015/NRestarts0 and unchanged app hashes. No eligibleCursor key/stored snapshot, so disconnected/meter unavailable is the required honest shipped fallback; do.md names exact officialEnterpriseAdmin settings. Private draft files revalidated28unique opportunities:26top-levelposts(18Reddit+8X) plus2comments,14CSVcolumns,Sep23–Oct7,0600files/0700dir; latest all-state issue refresh01:10CT returned0issues,0confirmed users/feedback/provider requests and0posts. Drafts do not prove delivered recruiting or adoption. Task7 bounded five waits accepted: BBQ499unit/215browser through529fb99/Flyv289 and Coffee4346frontend/1244backend/225built/19live/7visual throughd7f6604f/Flyv1610, exact source/digest and public desktop/mobile proof. Initial network-change and Python403 observations retained; Coffee ad/user-sync console messages explicitly qualified. No public launch, GIF, Pro tier, post/send/account changes, new paid service, new Anthropic testing or history rewrite. Final source/generated TODO, home plan and canonical shared memory are reconciled at closeout; source/package/verifier unchanged since their accepted runtime gates. Future paid-license/provider/MiniMax/history decisions remain waiting-sam and product target1paying+1000freeusers remains unproven.

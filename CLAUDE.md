@@ -8,7 +8,7 @@ Claude Indicator is a Linux PySide6 desktop widget. `claude_widget.py` contains 
 
 ## Beta boundaries and evidence
 
-Current beta scope, policy classifications and data-flow qualifications are recorded in `docs/todo/product/beta-phase-1.md`, `docs/beta/provider-terms-check.md` and `docs/beta/privacy-audit.md`. No public launch, posting, provider testing requests or new billing is authorized by the beta validation lane. Clean installation tests never alter the live widget; the later explicit Cursor feature task authorizes normal user-service deployment after green CI and independent review. Use mocked responses and isolated installation smoke checks. The README is the user-facing install/platform contract.
+Current beta scope, policy classifications and data-flow qualifications are recorded in `docs/todo/done/product/beta-phase-1.md`, `docs/beta/provider-terms-check.md` and `docs/beta/privacy-audit.md`. No public launch, posting, provider testing requests or new billing is authorized by the beta validation lane. Clean installation tests never alter the live widget; the later explicit Cursor feature task authorizes normal user-service deployment after green CI and independent review. Use mocked responses and isolated installation smoke checks. The README is the user-facing install/platform contract.
 
 ## Implementation rules
 
