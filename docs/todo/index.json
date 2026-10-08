@@ -67,7 +67,7 @@
     "status": "done",
     "area": "product",
     "due": null,
-    "updated": "2026-10-07",
+    "updated": "2026-10-08",
     "owner": "agent",
     "brief": "Shipped b8d7285 with green517+20 tests; live Cursor/Bot lines verified, sanctioned API key absent.",
     "refs": [

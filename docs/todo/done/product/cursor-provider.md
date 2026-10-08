@@ -3,7 +3,7 @@ title: "Cursor provider with separate Grok Bot line"
 status: done
 area: product
 due: null
-updated: 2026-10-07
+updated: 2026-10-08
 owner: agent
 brief: "Shipped b8d7285 with green517+20 tests; live Cursor/Bot lines verified, sanctioned API key absent."
 refs: ["do.md", "docs/beta/provider-terms-check.md", "docs/beta/privacy-audit.md"]
@@ -11,7 +11,7 @@ test: "tests/test_cursor_usage.py; tests/test_widget_ui.py"
 ---
 - **What:** Add Cursor alongside the existing providers, with Grok Bot shown under Cursor and separate from SuperGrok. Display included used/allowance, on-demand spend, plan and reset only when exposed by sanctioned data.
 - **Why:** Grok Bot is billed through the Cursor account; conflating it with SuperGrok misstates the quota source.
-- **Next:** Task8 is complete in its expressly allowed disconnected state. Connect only with an owner-supplied eligible Enterprise Admin key and exact account email as documented in `do.md`; no browser/session credential substitution. Full beta goal continues in the separate Task7 timeout lane.
+- **Next:** Task8 is complete in its expressly allowed disconnected state. Connect only with an owner-supplied eligible Enterprise Admin key and exact account email as documented in `do.md`; no browser/session credential substitution. Task7 and the full authorized beta preparation scope are now accepted; see `docs/todo/done/ci/load-tolerant-timeouts.md` and `docs/todo/done/product/beta-phase-1.md`. Future owner source/license decisions remain separate.
 - **Authority:** Explicit task8 in the authoritative goal file. Never extract/copy/print browser cookies, session tokens or passwords. No manual browser steps, invented allowance or model attribution, new Anthropic test calls, billing or account changes. Installation validation remains isolated; record actual desktop deployment separately.
 - **External clocks:** Owner-supplied official API key may be needed; no key request before safe local/context checks. Missing sanctioned source is an expressly accepted shippable disconnected state, not permission to scrape authenticated endpoints.
 - **Upstream:** No external contribution/publication needed.
