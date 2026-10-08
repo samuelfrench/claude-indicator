@@ -48,19 +48,6 @@
     "test": "journalctl --user -u claude-indicator.service"
   },
   {
-    "path": "docs/todo/infra/legacy-source-zone-hold.md",
-    "slug": "legacy-source-zone-hold",
-    "title": "Legacy unrelated source-zone hold",
-    "status": "waiting-sam",
-    "area": "infra",
-    "due": null,
-    "updated": "2026-10-07",
-    "owner": "sam",
-    "brief": "Preserved during migration; privacy review must remove unrelated infrastructure notes from this product repository.",
-    "refs": [],
-    "test": null
-  },
-  {
     "path": "docs/todo/product/beta-phase-1.md",
     "slug": "beta-phase-1",
     "title": "Claude Indicator beta phase 1",
