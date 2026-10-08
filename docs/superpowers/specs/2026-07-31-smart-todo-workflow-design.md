@@ -15,11 +15,11 @@ Turn the Smart TODO command center from a ranked backlog browser into a daily de
 7. Copy Context for a ready-to-use Codex prompt.
 8. Conservative stale review at 30, 60, and 90 days.
 
-Everything remains local, deterministic, inspectable, and free to run. Project TODO files remain read-only. `/home/sam/TODO.md` remains the only TODO source that the Indicator may mutate, and only through its existing managed inbox boundary.
+Everything remains local, deterministic, inspectable, and free to run. Project TODO files remain read-only. `/home/user/TODO.md` remains the only TODO source that the Indicator may mutate, and only through its existing managed inbox boundary.
 
 ## Interaction Model
 
-`Today` becomes the default view. It contains at most seven automatically ranked actionable tasks plus every active task Sam explicitly pins; pinned tasks appear first. Waiting, snoozed, completed, and finished tasks never enter Today automatically.
+`Today` becomes the default view. It contains at most seven automatically ranked actionable tasks plus every active task the user explicitly pins; pinned tasks appear first. Waiting, snoozed, completed, and finished tasks never enter Today automatically.
 
 The view picker contains `Today`, `Focus`, `All open`, `Waiting`, `Snoozed`, `New / changed`, `Duplicates`, `Projects`, `Stale 30+`, `Stale 60+`, `Stale 90+`, `Completed inbox`, and `Finished`.
 

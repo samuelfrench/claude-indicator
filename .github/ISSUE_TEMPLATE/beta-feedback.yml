@@ -1,0 +1,51 @@
+name: Beta feedback
+description: Share what worked, what broke, and which providers you want.
+title: "[Beta feedback]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Redact tokens, account emails, billing identifiers, private paths/tasks and personal data from logs or screenshots. Do not paste credential files. Quote permission is optional and starts unchecked.
+  - type: input
+    id: version
+    attributes:
+      label: Indicator version
+      description: Output of claude-indicator --version, or the Git revision if running a checkout.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Operating system and desktop session
+      placeholder: Ubuntu, GNOME, X11 or Wayland with XWayland
+    validations:
+      required: true
+  - type: textarea
+    id: what-worked
+    attributes:
+      label: What worked?
+      description: Tell us what helped or installed successfully; "not tried yet" is also useful.
+    validations:
+      required: true
+  - type: textarea
+    id: what-broke
+    attributes:
+      label: What broke?
+      description: Include steps, expected and actual behavior, or write "nothing so far". Redact private data.
+    validations:
+      required: true
+  - type: textarea
+    id: providers-wanted
+    attributes:
+      label: Which providers do you want covered?
+      description: Name the providers and plans you want tracked, including ones the beta already covers.
+    validations:
+      required: true
+  - type: checkboxes
+    id: permission-to-quote
+    attributes:
+      label: Permission to quote (optional)
+      description: Leaving this unchecked means no permission to quote your feedback in public product materials.
+      options:
+        - label: I give permission to quote my feedback publicly with attribution to my GitHub username.
+          required: false

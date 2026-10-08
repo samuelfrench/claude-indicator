@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Project TODO files remain read-only; only the managed Indicator Inbox in `/home/sam/TODO.md` may change through existing Add/Complete operations.
+- Project TODO files remain read-only; only the managed Indicator Inbox in `/home/user/TODO.md` may change through existing Add/Complete operations.
 - The deployed `~/.claude/smart_todos_finished.json` version-1 format remains backward-compatible.
 - New workflow state defaults to `~/.claude/smart_todos_workflow.json`, contains no task text, and is injectable in tests.
 - Workflow JSON is strict, canonical, sorted, unique, duplicate-member rejecting, mode-safe, `fsync`ed, and atomically replaced.
@@ -45,7 +45,7 @@
 Add literal temporary-file cases for the exact empty schema, sorted unique pin/snooze/observed output, no task text, duplicate JSON names, missing/unknown fields, wrong version/types, invalid keys/dates, duplicate/unsorted records, symlink/FIFO rejection, `0600` creation, existing-mode preservation, external-change reread, `fsync`, and final `os.replace`. Add Finished restore cases proving one key removal, unknown-key rejection without byte change, and canonical output.
 
 ```bash
-QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_workflow.py tests/test_smart_todos.py -k 'workflow or restore'
+QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_workflow.py tests/test_smart_todos.py -k 'workflow or restore'
 ```
 
 Expected RED: absent `smart_todo_workflow` and `FinishedStore.restore` APIs.
@@ -59,7 +59,7 @@ Implement the interfaces above using duplicate-aware `json.loads`, explicit key 
 Use hand-written observations to prove first baseline has empty change labels and source-mtime seeds, same-location unchanged, moved-content unchanged with oldest date, same-location edit changed today, unseen content new today, second unchanged reconciliation clears labels, expired snoozes prune at equality, future snoozes remain, and missing pin/snooze keys remain stored.
 
 ```bash
-QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_workflow.py -k 'reconcile or snooze or pin'
+QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_workflow.py -k 'reconcile or snooze or pin'
 ```
 
 Expected RED: missing reconciliation and workflow mutations.
@@ -96,7 +96,7 @@ git push -u origin feat/smart-todo-workflow
 Prove scanner modification dates derive from the opened regular file's `st_mtime`, capped at today. Prove state maps to pins/snoozes/changes, finished precedence stays intact, expired snoozes are inactive, duplicate normalization is casefolded collapsed display text, exact groups get correct counts, and unique entries remain count one.
 
 ```bash
-QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todos.py -k 'workflow or modified or duplicate'
+QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todos.py -k 'workflow or modified or duplicate'
 ```
 
 Expected RED: missing fields and enrichment functions.
@@ -110,7 +110,7 @@ Populate immutable fields with `replace`, keep stable sorting, and never change 
 Use literal fixtures to prove pins first, automatic fill to seven, pin overage retained, waiting/snoozed/completed/finished exclusion, stable tie-breaking, undated actionable stale membership at exactly 30/60/90 days, and exact project counts/top-item/sort order.
 
 ```bash
-QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todos.py -k 'today_items or stale or project_summary'
+QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todos.py -k 'today_items or stale or project_summary'
 ```
 
 Expected RED: absent derivation functions.
@@ -142,7 +142,7 @@ git push
 Use real offscreen widgets to prove: no-selection actions hidden; active actionable shows Pin/Snooze/Copy; pinned shows Unpin; snoozed shows Wake/Copy; finished shows Restore/Copy; completed shows only Copy; all controls have exact accessible names and keyboard tab order.
 
 ```bash
-QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_ui.py -k 'action_rail or pin or snooze or restore or copy_context'
+QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_ui.py -k 'action_rail or pin or snooze or restore or copy_context'
 ```
 
 Expected RED: absent controls and workflow-path injection.
@@ -183,7 +183,7 @@ git push
 Build one fixture containing active, waiting, snoozed, new, changed, duplicate, stale-30/60/90, completed, and finished tasks across projects. Assert exact membership/order for all thirteen view labels, Today's seven-item cap plus pin overage, duplicate contiguity and `copy N of M`, and Reset returning to Today.
 
 ```bash
-QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_ui.py -k 'view or docket or duplicate or stale or project'
+QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_ui.py -k 'view or docket or duplicate or stale or project'
 ```
 
 Expected RED: missing view options and rendering branches.
@@ -211,8 +211,8 @@ Document all views, state paths, Today rules, wake semantics, Restore, Copy Cont
 - [ ] **Step 7: Verify, commit, and push**
 
 ```bash
-QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q
-/home/sam/miniconda3/bin/python3 -m py_compile claude_widget.py smart_todos.py smart_todo_workflow.py
+QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q
+/home/user/miniconda3/bin/python3 -m py_compile claude_widget.py smart_todos.py smart_todo_workflow.py
 git diff --check
 git add smart_todos.py tests/test_smart_todo_ui.py README.md TODO.md
 git commit -m "feat: ship Smart TODO daily docket"

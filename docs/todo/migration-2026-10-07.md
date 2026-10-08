@@ -13,3 +13,5 @@ Original: `TODO.md` at `d857694a050ddfb8774ce99be64e774ded5d9426`; 70 lines; SHA
 | Remaining lines | `TODO-archive.md#pre-task-files-2026-10-07` |
 
 **Proof command:** `git show d857694:TODO.md > /tmp/indicator-old-TODO.md`; create an empty `/tmp/indicator-archive-base.md`; run `node scripts/todo/migrate-monolith.mjs verify /tmp/indicator-old-TODO.md . /tmp/indicator-archive-base.md`. The verifier compares non-empty line multiplicities; checkbox comparison separately verifies every original open item.
+
+**Privacy cleanup:** Subsequent beta cleanup redacts private/unrelated history from the current public tree. The zero-loss proof applies to migration commit `130efb9`, not the cleaned tree. To audit the original proof, create an isolated temporary checkout of that commit and run the verifier there. The removed source-zone task was unrelated infrastructure work and is retained only in the owner-local restricted backup and Git history.

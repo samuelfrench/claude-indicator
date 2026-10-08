@@ -41,7 +41,7 @@ def make_proc(
     cpu_ticks: int = 0,
     wchar: int = 0,
     starttime: int = 100_000,
-    cwd: str = "/home/sam/claude-workspace/demo-project",
+    cwd: str = "/home/user/claude-workspace/demo-project",
     children: tuple[int, ...] = (),
 ):
     proc_dir = root / str(pid)
@@ -304,7 +304,7 @@ class TerminalStatePersistenceTest(unittest.TestCase):
 
 def _session(key="1:1", tool="CLAUDE", project="demo", tty="pts/1", pid=None,
              busy=False, parked=False, idle_seconds=0.0, needs_attention=False,
-             cwd="/home/sam/demo"):
+             cwd="/home/user/demo"):
     return TerminalSession(
         key=key, tool=tool, project=project, cwd=cwd, tty=tty,
         pid=pid if pid is not None else int(key.split(":")[0]),
@@ -536,8 +536,8 @@ class TerminalTabsPanelTest(unittest.TestCase):
         visible_labels = [
             label.text() for label in card["widget"].findChildren(QLabel)
         ]
-        self.assertNotIn("/home/sam/demo", visible_labels)
-        self.assertIn("/home/sam/demo", card["widget"].toolTip())
+        self.assertNotIn("/home/user/demo", visible_labels)
+        self.assertIn("/home/user/demo", card["widget"].toolTip())
         self.assertIn("pts/2", card["widget"].accessibleDescription())
         self.assertIn("pid 2", card["widget"].accessibleDescription())
 
@@ -778,7 +778,7 @@ class _FakeGnomeActions:
             if self.persistent_marker:
                 return self.saved_marker
             return self.marker
-        return "coffee-explorer"
+        return "example-project"
 
     def activate(self, wid):
         self.activated.append(wid)
@@ -819,7 +819,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
         stat_path = self.proc / "40" / "stat"
         stat_path.write_text(stat_path.read_text().replace("(xterm)", "(gnome-terminal-)"))
 
-    def _session_(self, project="coffee-explorer"):
+    def _session_(self, project="example-project"):
         return _session(
             key="100:100000", pid=100, project=project, tty="pts/3"
         )
@@ -830,7 +830,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
         self.assertIsNone(_terminal_ancestor_pid(999, self.proc))
 
     def test_direct_title_match_activates_without_cycling(self):
-        runner = _FakeXdotool(titles={10: "Terminal", 20: "coffee-explorer"})
+        runner = _FakeXdotool(titles={10: "Terminal", 20: "example-project"})
 
         ok, detail = focus_terminal_session(
             self._session_(), runner=runner, proc_root=self.proc, settle=0
@@ -843,7 +843,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
     def test_cycles_tabs_until_the_title_matches(self):
         runner = _FakeXdotool(
             titles={10: "zzz", 20: "other-proj"},
-            cycles=["second-proj", "coffee-explorer"],
+            cycles=["second-proj", "example-project"],
         )
 
         ok, detail = focus_terminal_session(
@@ -855,7 +855,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
         # with one ctrl+Prior); window 20 matches after two cycles.
         self.assertEqual(runner.next_sent, 3)
         self.assertEqual(runner.prev_sent, 1)
-        self.assertEqual(runner.titles[20], "coffee-explorer")
+        self.assertEqual(runner.titles[20], "example-project")
 
     def test_never_sends_keys_when_activation_does_not_take(self):
         runner = _FakeXdotool(active_follows=False)
@@ -869,7 +869,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
 
     def test_title_match_does_not_succeed_when_activation_fails(self):
         runner = _FakeXdotool(
-            titles={10: "Terminal", 20: "coffee-explorer"},
+            titles={10: "Terminal", 20: "example-project"},
             active_follows=False,
         )
 
@@ -1027,7 +1027,7 @@ class FocusTerminalSessionTest(unittest.TestCase):
         )
 
         self.assertTrue(ok, detail)
-        self.assertEqual(runner.marker, "coffee-explorer")
+        self.assertEqual(runner.marker, "example-project")
         self.assertGreaterEqual(len(runner.safe_title_calls), 2)
 
     def test_gnome_clean_pop_preserves_restored_custom_title(self):

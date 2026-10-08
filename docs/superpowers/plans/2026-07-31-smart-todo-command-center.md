@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a local-only tray command center that atomically captures overall tasks in `/home/sam/TODO.md` and transparently ranks open tasks from every project TODO file by what needs attention now.
+**Goal:** Add a local-only tray command center that atomically captures overall tasks in `/home/user/TODO.md` and transparently ranks open tasks from every project TODO file by what needs attention now.
 
 **Architecture:** A new `smart_todos.py` module owns Markdown parsing, bounded discovery, explainable ranking, mutation-safe inbox persistence, and the PySide6 dialog. `claude_widget.py` only integrates the lazy dialog, worker-safe shutdown, task-compass tray icon, menu action, and summary tooltip. Existing project TODO files remain read-only; only the exact managed section in the injected home TODO path can change.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Default workspace roots are exactly `/home/sam/claude-workspace` and `/home/sam/codex_workspace`; the default overall TODO is exactly `/home/sam/TODO.md`.
+- Default workspace roots are exactly `/home/user/claude-workspace` and `/home/user/codex_workspace`; the default overall TODO is exactly `/home/user/TODO.md`.
 - Add no dependency, network call, subscription, hosted inference, telemetry, public endpoint, secret read, or memory-file scan.
 - Project TODO files are read-only. Only entries with a `claude-indicator:id=<UUID>` inside the single valid Indicator Inbox marker pair may be completed.
 - Marker corruption or duplication fails closed without modifying the file.
@@ -121,7 +121,7 @@ SIGNALS = (
 )
 ```
 
-Date scoring is `+50` overdue, `+28` due today, `+20` due tomorrow, then `max(0, 14 - days_until_due)` for later dates. Global inbox items receive `+8` and reason `captured in overall inbox`. Explicit `waiting`, `wait for`, `hold`, `blocked by`, `owner action`, `Sam:`, `on or after`, and `no earlier than` language creates a waiting tag. An extracted future gate date creates reason `gated until YYYY-MM-DD`; waiting items have urgency `waiting` and sort after actionable open items regardless of score. Completed items score zero with urgency `completed`. Otherwise urgency is `critical` at 90+, `high` at 65+, and `normal` below 65. `why_now` contains at most four reasons, highest-impact first.
+Date scoring is `+50` overdue, `+28` due today, `+20` due tomorrow, then `max(0, 14 - days_until_due)` for later dates. Global inbox items receive `+8` and reason `captured in overall inbox`. Explicit `waiting`, `wait for`, `hold`, `blocked by`, `owner action`, `the user:`, `on or after`, and `no earlier than` language creates a waiting tag. An extracted future gate date creates reason `gated until YYYY-MM-DD`; waiting items have urgency `waiting` and sort after actionable open items regardless of score. Completed items score zero with urgency `completed`. Otherwise urgency is `critical` at 90+, `high` at 65+, and `normal` below 65. `why_now` contains at most four reasons, highest-impact first.
 
 - [ ] **Step 6: Run domain tests and full baseline**
 
@@ -323,8 +323,8 @@ If already executing on `master`, omit checkout/merge and push the current verif
 
 - [ ] **Step 9: Verify GitHub and restart the production app**
 
-Check `.github/workflows`. If workflows exist, inspect the pushed SHA's Actions run through `gh`; wait for completion and require success. Stop only the exact currently running `/home/sam/miniconda3/bin/python3 /home/sam/claude-workspace/claude-indicator/claude_widget.py` PID, then launch the exact command from `/home/sam/.config/autostart/claude-widget.desktop`. Verify exactly one new PID, process age after the restart, the updated code path, visible main widget and Smart TODO dialog, task-compass tray availability, and no new exceptions in `~/.claude/widget.log`.
+Check `.github/workflows`. If workflows exist, inspect the pushed SHA's Actions run through `gh`; wait for completion and require success. Stop only the exact currently running `/home/user/miniconda3/bin/python3 /home/user/claude-workspace/claude-indicator/claude_widget.py` PID, then launch the exact command from `/home/user/.config/autostart/claude-widget.desktop`. Verify exactly one new PID, process age after the restart, the updated code path, visible main widget and Smart TODO dialog, task-compass tray availability, and no new exceptions in `~/.claude/widget.log`.
 
 - [ ] **Step 10: Record durable state**
 
-Add a terse memory update note under `/home/sam/.codex/memories/extensions/ad_hoc/notes/` with the pushed SHA, test count, production PID, scan roots, managed-section boundary, no-new-billing statement, and any ranking/UI gotcha worth reusing. Do not store task text from Sam's global TODO.
+Add a terse memory update note under `/home/user/.codex/memories/extensions/ad_hoc/notes/` with the pushed SHA, test count, production PID, scan roots, managed-section boundary, no-new-billing statement, and any ranking/UI gotcha worth reusing. Do not store task text from the user's global TODO.

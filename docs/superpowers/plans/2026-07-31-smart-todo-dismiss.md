@@ -45,7 +45,7 @@ Add real temporary-file tests proving literal managed/source keys, line-movement
 
 - [ ] **Step 2: Run domain tests and verify RED**
 
-Run `QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todos.py -k 'finished or dismiss'` and confirm failures are caused by the missing finished-state API.
+Run `QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todos.py -k 'finished or dismiss'` and confirm failures are caused by the missing finished-state API.
 
 - [ ] **Step 3: Implement the minimal domain behavior**
 
@@ -61,7 +61,7 @@ Use real `SmartTodoDialog` widgets and temporary TODO/state files to prove: ever
 
 - [ ] **Step 6: Run UI tests and verify RED**
 
-Run `QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_ui.py -k 'finished or dismiss or 860x680'` and confirm failures are caused by missing UI behavior.
+Run `QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q tests/test_smart_todo_ui.py -k 'finished or dismiss or 860x680'` and confirm failures are caused by missing UI behavior.
 
 - [ ] **Step 7: Implement the minimal UI behavior**
 
@@ -73,7 +73,7 @@ Document the `Dismiss` versus `Complete` distinction, the `Finished` view, and t
 
 - [ ] **Step 9: Verify the task**
 
-Run focused tests, then `QT_QPA_PLATFORM=offscreen /home/sam/miniconda3/bin/python3 -m pytest -q`, `/home/sam/miniconda3/bin/python3 -m py_compile claude_widget.py smart_todos.py`, and `git diff --check`.
+Run focused tests, then `QT_QPA_PLATFORM=offscreen /home/user/miniconda3/bin/python3 -m pytest -q`, `/home/user/miniconda3/bin/python3 -m py_compile claude_widget.py smart_todos.py`, and `git diff --check`.
 
 - [ ] **Step 10: Commit**
 

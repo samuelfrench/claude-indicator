@@ -491,10 +491,10 @@ class WidgetUiTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_grok_credits(legacy)
 
-        # Live SuperGrok unified-billing 200 (2026-09-09): weekly period present,
+        # SuperGrok unified-billing schema fixture: weekly period present,
         # creditUsagePercent omitted, onDemandCap 0. That is a visible error,
         # not 0% — proto3 may omit a zero percent, but the plan forbids guessing.
-        live_unified_zero = {
+        unified_zero_fixture = {
             "config": {
                 "currentPeriod": {
                     "type": "USAGE_PERIOD_TYPE_WEEKLY",
@@ -509,7 +509,7 @@ class WidgetUiTest(unittest.TestCase):
             }
         }
         with self.assertRaises(ValueError):
-            parse_grok_credits(live_unified_zero)
+            parse_grok_credits(unified_zero_fixture)
 
     def test_fetch_grok_credits_sends_cli_gate_header_and_rejects_non_json(self):
         with patch.object(claude_widget.requests, "get") as get:
@@ -1069,7 +1069,7 @@ class WidgetUiTest(unittest.TestCase):
 
     def test_task_loop_status_reads_local_config_without_aws(self):
         config = {
-            "honey-explorer": {
+            "demo-project": {
                 "autonomous": {
                     "enabled": True,
                     "model": "claude-opus-4-6",
@@ -1102,7 +1102,7 @@ class WidgetUiTest(unittest.TestCase):
                 loops = claude_widget.fetch_task_loop_status()
 
         self.assertEqual(len(loops), 1)
-        self.assertEqual(loops[0].name, "honey-explorer")
+        self.assertEqual(loops[0].name, "demo-project")
         self.assertEqual(loops[0].model, "claude-opus-4-6")
         self.assertEqual(loops[0].effort, "high")
         self.assertEqual(loops[0].cooldown_minutes, 10)
@@ -1699,7 +1699,7 @@ class WidgetUiTest(unittest.TestCase):
     @staticmethod
     def _terminal_session(key="1:1", parked=False, needs_attention=False):
         return TerminalSession(
-            key=key, tool="CLAUDE", project="demo", cwd="/home/sam/demo",
+            key=key, tool="CLAUDE", project="demo", cwd="/home/user/demo",
             tty="pts/1", pid=int(key.split(":")[0]), busy=not needs_attention,
             parked=parked, idle_seconds=300.0 if needs_attention else 0.0,
             needs_attention=needs_attention,
@@ -2154,7 +2154,7 @@ class WidgetUiTest(unittest.TestCase):
                 latest_thread_title="Investigate local Codex accounting",
                 latest_model="gpt-5.5",
                 latest_updated_at=1_767_300_000,
-                latest_cwd="/home/sam/claude-workspace/claude-indicator",
+                latest_cwd="/home/user/claude-workspace/claude-indicator",
                 primary_limit_used_percent=37.5,
                 primary_limit_window_minutes=300,
                 primary_limit_resets_at=1_767_318_000,
@@ -3052,7 +3052,7 @@ class WidgetUiTest(unittest.TestCase):
         self.assertTrue(widget._local_ai_section.is_expanded())
         self.assertFalse(widget._history_expanded)
         # The collapsed GO + GROK rows grow the panel beyond an 800px work area
-        # (Sam accepted the GO tradeoff 2026-09-07; GROK adds one 30px row);
+        # (the user accepted the GO tradeoff 2026-09-07; GROK adds one 30px row);
         # the mutual exclusion keeps the panel bounded at this fixed budget.
         self.assertLessEqual(widget.height(), 860)
 

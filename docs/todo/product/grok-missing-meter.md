@@ -9,9 +9,7 @@ brief: "Missing meter remains a visible error; do not guess zero from an absent 
 refs: ["tests/test_widget_ui.py", "TODO-archive.md#pre-task-files-2026-10-07"]
 test: "tests/test_widget_ui.py Grok billing has no weekly or on-demand meter"
 ---
-- **What:** Historical Grok payload shape can omit a valid usage meter.
-- **Why:** Reporting zero would conceal unknown usage.
-- **Next:** Use existing mock response tests; await a documented provider schema before changing absent-meter behavior. No live request is required.
-
-- Live SuperGrok billing 200 omits `creditUsagePercent` and has `onDemandCap.val=0` while still sending a weekly `currentPeriod` (probed 2026-09-09, HTTP 200, 413-byte JSON, `isUnifiedBillingUser: true`). `parse_grok_credits` raises `Grok billing has no weekly or on-demand meter`; that payload is still a visible error, not 0%; `tests/test_widget_ui.py` covers it. Real fix not done: treat proto3-omitted `creditUsagePercent` as 0% for unified weekly users — the plan forbids guessing 0%. **2026-09-17:** this is not why the GROK row was empty during OpenCode Grok use. Grok CLI `expires_at` is `2026-09-17T03:41:19Z` (expired). OpenCode `xai` oauth against the same endpoint returns `creditUsagePercent: 27` / `GrokBuild` 27% (HTTP 200, 500 bytes). Parser unchanged.
-
+- **What:** A billing response can contain a weekly period but omit `creditUsagePercent`, while `onDemandCap.val` is zero.
+- **Why:** `parse_grok_credits` reports `Grok billing has no weekly or on-demand meter`; silently treating an absent field as zero would conceal unknown usage.
+- **Next:** Run `python3 -m pytest -q tests/test_widget_ui.py -k 'grok or parse_grok'` with isolated state and the test HTTP guard. `tests/test_widget_ui.py` covers the missing-meter schema with a fixture. Await a documented provider schema before changing absent-field interpretation; no live request is needed.
+- **Deferred fix:** Add an explicitly supported absent-field interpretation if provider documentation establishes one. Until then the visible unavailable/error state is intentional and unchanged.

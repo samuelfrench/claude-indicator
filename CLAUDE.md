@@ -1,96 +1,30 @@
-# Claude Indicator
+# Claude Indicator development context
 
-## Repository task tracking
+Claude Indicator is a Linux PySide6 desktop widget. `claude_widget.py` contains provider clients, local readers, painted rows, worker timers and the main widget. `smart_todos.py` plus `smart_todo_workflow.py` contain the local TODO command center and state; `terminal_recovery.py` plus `terminal_recovery_ui.py` contain private terminal inventory and recovery UI. `widget_runtime.py` contains process singleton locking and optional systemd readiness/watchdog behavior. `indicator_cli.py` provides the packaged command and performs help/version handling before Qt imports.
 
-`TODO.md` and `docs/todo/index.json` are generated from one file per task in `docs/todo/`. Edit the linked task source whenever work starts, changes, completes or blocks; run `node scripts/todo/build.mjs` and commit the source plus both outputs together. Do not hand-edit generated task state. Read `docs/todo/README.md` for frontmatter, archival and query rules; use `node scripts/todo/query.mjs --status now,waiting-sam` to resume. Validate with `node --test scripts/todo/__tests__/todo.test.mjs` and `node scripts/todo/build.mjs --check` before pushing.
+## Task tracking
 
-## Project Description
-Translucent PySide6 desktop widget combining Claude Code Max and Codex usage,
-DeepSeek API spend/credit, MiniMax/OpenCode Go/SuperGrok quotas, compact
-local system activity, and Ollama/GPU/ComfyUI status.
+`TODO.md` and `docs/todo/index.json` are generated from task sources in `docs/todo/`. Read TODO and the linked task before changing work. Update its source in the same working beat as scope, status, evidence or blocker changes; run `node scripts/todo/build.mjs` and commit the source plus both outputs together. Never hand-edit generated task state. Use `node scripts/todo/query.mjs --status now,waiting-sam` to resume; rules are in `docs/todo/README.md`.
 
-## Architecture
-- **Single-file app**: `claude_widget.py` contains all logic (client, UI, timers, history)
-- **ClaudeUsageClient**: With a claude.ai session token in `~/.claude/.credentials.json`, fetches `GET https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` (full payload incl. Fable/extra usage). When that session token is empty, 401s, or 429s, it resolves the long-lived Claude Code OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`, then owner-only mode-`0600` `~/.credentials/claude-oauth-token.txt`; only `sk-ant-oat` tokens, API keys refused) and sends a `max_tokens: 1` Haiku 4.5 `POST /v1/messages` probe, parsing the `anthropic-ratelimit-unified-5h/7d-utilization` + `-reset` headers (also on a 429 that carries them). Header-sourced data has no model-scoped limits, so the Fable bar hides; the status line appends `· OAuth`. A usage-API 429 window is skipped while the probe answers.
-- **ClaudeWidget**: Frameless, translucent, always-on-top PySide6 widget with drag support and fixed 340px width
-- **Traffic Report shortcut**: A keyboard-accessible footer link and tray action open the fixed local dashboard at `http://127.0.0.1:5173/` through `QDesktopServices.openUrl`; the existing report server remains independently managed.
-- **Configure menu**: Header ☰ and tray Configure submenu hide individual sections (Claude usage, history, TABS, deploys, runners, task loops, task groups, cron, system, Local AI) and providers (Codex, DeepSeek, MiniMax, OpenCode Go, Grok, OpenCode ledger, Ollama ledger lines). State is `~/.claude/widget_visibility.json`. Hidden providers skip their fetch; MiniMax/DeepSeek/Go/Ollama hides also filter the OpenCode ledger breakdown.
-- **UsageBar**: Custom-painted progress bars with color coding (green/yellow/orange/red)
-- **UsageGraph**: QPainter line chart showing 5-hour utilization over last 24 hours with gradient fill, grid lines, and 80% threshold
-- **StatsRow**: Compact custom-painted row with AVG, PEAK, TREND, and EXTRA usage stats
-- **CodexUsageRow**: Reads live Codex rate limits through the local `codex app-server` JSONL protocol (`account/rateLimits/read`), falls back only to unexpired cached `~/.codex/sessions/**/*.jsonl` token-count events at most five minutes old, visibly marks cached values, and combines them with `~/.codex/state_*.sqlite` latest-thread/lifetime totals; renders only the rate-limit windows the server provides
-- **DeepSeekUsageRow**: Sums numeric DeepSeek assistant-message costs from the read-only local OpenCode SQLite ledger for rolling 24-hour spend and reads current credit from official `GET /user/balance` in a background thread
-- **MinimaxUsageRow**: Reads MiniMax coding-plan quota from `GET https://api.minimax.io/v1/token_plan/remains` (`general` family) in a background thread, inverting the API's *remaining* percentages into 5-hour/weekly utilization, and pairs it with 24-hour token volume, message count, and latest model from the read-only local OpenCode SQLite ledger. The plan is a subscription, so OpenCode records `cost = 0` for every MiniMax message and no dollar figure is shown.
-- **OpencodeGoUsageRow**: Reads OpenCode Go subscription usage from `GET https://opencode.ai/zen/go/v1/usage` in a background thread with the `opencode-go` API key (env `OPENCODE_GO_API_KEY` first, then the same owner-controlled mode-`0600` OpenCode auth file). The row shows the dollar-metered 5-hour/`$12`, weekly/`$30` and monthly/`$60` utilization percents with reset times and dollar used per window; a `!` suffix and tooltip flag cap-locked (`rate-limited`) windows. This row grows the panel past the old 800px budget (Sam approved 2026-09-07).
-- **GrokUsageRow**: Reads SuperGrok/Grok Build billing from `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits` in a background thread. Bearer is `GROK_OAUTH_TOKEN` first, else the owner-only mode-`0600` `~/.grok/auth.json` (`GROK_HOME` if set), preferring the current `https://auth.x.ai::<client-id>` entry's `key` over the legacy `https://accounts.x.ai/sign-in` key, else the owner-only mode-`0600` OpenCode `xai` oauth `access` token in `~/.local/share/opencode/auth.json`. Requests send `X-XAI-Token-Auth: xai-grok-cli`. An `xai-` management/API key is rejected; an expired cached access token fails closed without refresh (refresh-token rotation would knock out Grok CLI or OpenCode). Collapsed summary is the weekly `creditUsagePercent` (or `onDemandUsed/onDemandCap` when that is the only meter); expanded/tooltip text includes the reset from `config.currentPeriod.end` (else `billingPeriodEnd`), product percents from `productUsage`, and a positive prepaid/on-demand cap. Failures show `—` / the error string. Tokens, refresh tokens, and emails never appear in logs, history, labels, or tooltips. The collapsed row adds 30px; the tall-sections test budget is 860.
-- **OpencodeUsageRow**: DeepSeek, MiniMax and ollama all write to the same read-only OpenCode SQLite ledger, so this row breaks the last 24 hours down per model — every line tagged with its provider (`minimax` / `deepseek` / `ollama`), with tokens, cost, and message counts — above a `LOCAL` line carrying today (since local midnight) and all-time local-model token volume plus the ledger start date. Collapsed it shows the 24-hour token total and the model count. MiniMax cost always reads `$0.00` because the coding plan is a subscription.
-- **TerminalSessionsRow + TerminalTabsPanel**: The 22px `TABS` row summarises agent CLI sessions holding terminal tabs (`claude`/`codex`/`opencode`/`grok` processes with a controlling pts, scanned from `/proc` every 5s, nested agents deduped via the ppid chain). A session is WORKING when its CPU delta beats a per-tool threshold, its terminal write rate (`/proc/<pid>/io` wchar) beats a per-tool bytes/s threshold (`TERMINAL_SESSION_TOOLS`), or it has a child forked >90s after session start (quiet tools like `gh run watch`); otherwise it is WAITING, and after 120s idle it flags NEEDS YOU. The write-rate signal is what keeps API-bound sessions marked WORKING: a claude waiting on the API uses ~0 CPU but redraws its spinner at 2-3 KB/s, while an idle prompt writes ~10 B/s (calibrated 2026-08-19). Clicking the row slides a compact 320px `TerminalTabsPanel` with 62px cards from the widget's left edge (right when needed); full cwd/TTY/PID detail remains in tooltips and accessibility metadata. GNOME Terminal navigation revalidates the live PID start time and pts, then selects the exact TTY through its GTK `active-tab` action plus a temporary VTE title marker; nonmatching/error paths restore original tab indices and the title, and failures fail closed without ambiguous title cycling. Other terminal emulators retain title matching and verified keyboard cycling only as a best-effort compatibility path. Dragging the selector header/background moves the main-window anchor and keeps both surfaces docked; minimizing the main widget leaves/opens the selector beside its restore sliver, while tray hide hides all surfaces. Cards remain grouped under NEEDS YOU / WAITING / WORKING / PARKED, with PARK/UNPARK and persistent notes in `~/.claude/terminal_sessions.json` (atomic, keyed `pid:starttime`, pruned when sessions exit). Card rebuilds defer while a note editor has focus. Only one `TerminalFocusWorker` runs at a time — replacing a live QThread is fatal.
-- **TerminalRecoveryStore + TerminalRecoveryDialog**: `terminal_recovery.py` scans every owned controlling terminal (ordinary shells, agent/non-agent commands, multiplexer PTYs, and physical terminals) every 5 seconds through the widget terminal timer. Boot-scoped identities and full-synchronous SQLite transactions preserve the final snapshot of each boot plus previously closed terminals at `~/.local/state/claude-indicator/terminals.sqlite3` (directory 0700, file 0600); no auto-expiry, argv, environment, or scrollback collection. `terminal_recovery_ui.py` is opened through the TABS footer or tray Terminal recovery action, with Live/Last boot snapshot/All saved, directory/program/date search, copy details, timestamps, and explicit errors retaining last-good history. Required proc metadata failures abort the capture; real process exits are skipped. The previous-boot snapshot remains available after empty startup scans. Records describe work; they do not restart processes.
-- **LocalAISection**: Collapsed Ollama/GPU summary with expandable loaded-model, GPU/VRAM, ComfyUI, and local-config Ollama task-loop details; it does not query DynamoDB
-- **SystemMetricsReader + SystemMetricsRow**: Samples CPU/RAM/GPU every 3 seconds and reads `/proc/net/route` plus `/proc/net/dev` directly for receive/transmit byte rates on all active lowest-metric UP IPv4 default-route interfaces. The first sample, route/interface-set changes, missing counters, and counter resets replace the baseline and show zero instead of a spike. The 340px collapsed row keeps CPU/RAM/GPU plus unambiguous download/upload rates (temperature moves to expanded detail); expansion adds an explicit `NET` row, while the tooltip names selected interfaces and sources.
-- **Per-disk rows in SystemMetricsRow**: `SystemMetricsReader._read_disks` lists physical, unhidden block devices from `/sys/block` (entries with a `device` link, so loop/zram/dm/md are skipped), reads sector and `io_ticks` counters from `/proc/diskstats`, and sums df-style used/total bytes over each disk's mounted `/dev/<partition>` entries from `/proc/mounts` via `statvfs` (mapper/LVM sources are not attributed). Each `DiskMetrics` renders one expanded bar row between GPU and NET labelled with the kernel name: bar = filesystem fill % (red when nearly full), detail = `<free> free · R<rate> W<rate>` (`unmounted` when no filesystem is mounted); busy % (io_ticks delta / elapsed) lives in the tooltip. First sample, per-disk counter decreases, and missing `/proc/diskstats` read zero / `disk_error`; the tooltip lists HDD/SSD, model, decimal TB size, GiB free of total, busy % and mount points.
-- **DeepSeek balance history**: Currency-separated snapshots in `~/.claude/deepseek_balance_history.json` use a strict schema, mode `0600`, fsync, and atomic replacement
-- **Expansion geometry**: Usage History and Ollama are mutually exclusive so
-  the fixed-width panel remains usable on 800px-tall screens; DeepSeek, MiniMax,
-  OpenCode Go, and Grok remain independently expandable. `ClaudeWidget.adjustSize()`
-  clamps the full frame into the primary screen's available geometry after every
-  size change. The collapsed GO + GROK rows grow the panel past 800px (tall-sections
-  budget 860); clamp pins the top when the window is taller than the screen.
-- **UsageHistory**: Persists data points to `~/.claude/usage_history.json` (max 288 points / 24h), atomic writes via os.replace()
-- **Dynamic plan name**: Title detects CLAUDE MAX (opus present), CLAUDE PRO (sonnet present), or CLAUDE (neither)
-- Token refresh via `https://platform.claude.com/v1/oauth/token` with client_id `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
+## Beta boundaries and evidence
 
-## Scripts
-- `scripts/ollama_watchdog.py`: systemd-timer watchdog that restarts `ollama` after its
-  scheduler has been wedged for 15 minutes. Detects the 0.32.14 deadlock signature — a model
-  held past its keep-alive expiry, or a no-token load probe that hangs past 60s — without
-  paying for a generation and without extending the model's keep-alive. Installed copies live
-  at `/usr/local/bin/ollama-watchdog` and `/etc/systemd/system/ollama-watchdog.{service,timer}`;
-  re-run the install command after editing the repo copy.
-  On this host it currently runs as a **user** timer instead (`scripts/user/*`, linked into
-  `~/.config/systemd/user/`), which needs no sudo because polkit lets an active session restart
-  `ollama.service`. The user units run the repo script in place, so edits take effect on the next
-  tick. `OLLAMA_WATCHDOG_RESTART_CMD` overrides the recovery command so the restart path can be
-  exercised against a dummy unit without disturbing ollama.
+Current beta scope, policy classifications and data-flow qualifications are recorded in `docs/todo/product/beta-phase-1.md`, `docs/beta/provider-terms-check.md` and `docs/beta/privacy-audit.md`. No public launch, posting, provider testing requests, new billing or live widget restart is authorized by the beta validation lane. Use mocked responses and isolated installation smoke checks. The README is the user-facing install/platform contract.
 
-## Running
-- **Forces XWayland on a Wayland session**: `main()` sets `QT_QPA_PLATFORM=xcb;wayland`
-  when `WAYLAND_DISPLAY`/`XDG_SESSION_TYPE=wayland` is set, a `DISPLAY` exists, and the
-  user has not chosen a platform themselves. A Wayland client cannot position its own
-  top-level window, which breaks drag-to-move, the docked tabs panel, `clamp_to_available_screen`,
-  always-on-top, and the xdotool terminal jump (xdotool cannot see native Wayland surfaces).
-  If it does end up on Wayland anyway, dragging falls back to `QWindow.startSystemMove()`;
-  X11 keeps the manual `move()` drag so the WM's edge snapping never grabs the window.
-- May require `LD_LIBRARY_PATH=<path-to-miniconda>/lib` on some systems for xcb-cursor
-- Autostart configured at `~/.config/autostart/claude-widget.desktop`
-- The desktop autostart now launches a persistent `claude-indicator.service` user unit through `scripts/indicator_service.py launch`. Reinstall with `/home/sam/miniconda3/bin/python3 scripts/indicator_service.py install --python /home/sam/miniconda3/bin/python3`; the checkout path is detected automatically. Installation writes the unit and autostart entry and reloads systemd; it does not stop or start the widget. Stop any older direct/transient launch before migration, then run `/home/sam/miniconda3/bin/python3 scripts/indicator_service.py launch` from the graphical session. The launcher imports only display/session variables, clears absent stale display variables, and starts the service idempotently. The desktop entry, rather than enabling the unit at boot, controls graphical login startup; `PartOf=graphical-session.target` stops it at logout.
-- `widget_runtime.py` holds a process-lifetime singleton lock shared by direct and service launches. The Qt main event loop sends readiness after widget construction and a heartbeat every 30 seconds; a blocked event loop triggers the service's 90-second watchdog. Failures restart after five seconds, capped at five starts per five minutes. Native crashes/watchdog aborts produce Python thread stacks in `journalctl --user -u claude-indicator.service`; core files are disabled. Startup has a 120-second timeout, shutdown 30 seconds, and watchdog abort handling 10 seconds. Use `systemctl --user reset-failed claude-indicator.service` then the launcher after repairing a failure that exhausted the restart limit.
-- Tray Quit and SIGTERM are intentional clean exits and do not restart. Shutdown interrupts all 15 widget background worker types and the Smart Todo scan within a shared 16-second deadline. If workers remain when the Qt loop exits, the process flushes diagnostics and exits directly with the loop's status, avoiding a running-QThread destructor abort that would otherwise restart a deliberate Quit. A Smart Todo scan that exceeds the remaining deadline retains its QThread ownership until the bounded process exit; systemd also bounds overall service stop time. Direct `python claude_widget.py` launches have the singleton guard and graceful termination but no automatic restart/watchdog supervisor.
-- Dependencies: PySide6, requests
-- DeepSeek credentials resolve from `DEEPSEEK_API_KEY` first, then the existing
-  owner-controlled mode-`0600` OpenCode auth file; credentials are never stored
-  in history, logs, labels, or tooltips
+## Implementation rules
 
-## Key Decisions
-- Prefers `/api/oauth/usage` (session token only; the long-lived setup token is not usable there). Since 2026-10-01 Claude Code runs on `CLAUDE_CODE_OAUTH_TOKEN` and the session token is empty, so the `/v1/messages` rate-limit-header probe is the normal path: ~9 Haiku tokens per 5-minute poll against the subscription; overage is org-disabled, so no dollar billing. `count_tokens` returns no rate-limit headers.
-- OAuth tokens with `user:inference` scope work with this endpoint when `anthropic-beta: oauth-2025-04-20` header is included
-- History stored in `~/.claude/usage_history.json` with atomic writes (write to .tmp then os.replace)
-- Graph uses purple accent (#8b5cf6) with gradient fill and red dashed 80% threshold line
-- DeepSeek has no rolling-spend API: local OpenCode numeric request cost is the
-  immediate 24-hour source; protected balance decreases are a marked fallback.
-- Last-known DeepSeek credit is shown for at most 15 minutes and always includes
-  its snapshot age; older snapshots remain history-only and are not displayed.
-- MiniMax credentials resolve from `MINIMAX_API_KEY` first, then the same
-  owner-controlled mode-`0600` OpenCode auth file (`minimax-coding-plan.key`);
-  the key reaches only the Authorization header, never history, logs, or tooltips.
-- Grok credentials resolve from `GROK_OAUTH_TOKEN` first, then owner-only
-  mode-`0600` `~/.grok/auth.json` (`GROK_HOME` if set), then owner-only
-  mode-`0600` OpenCode `xai` oauth `access` (the token OpenCode uses for
-  `xai/grok-*`). Prefer `https://auth.x.ai::<client-id>` over
-  `https://accounts.x.ai/sign-in`. The bearer reaches only
-  `cli-chat-proxy.grok.com` with `X-XAI-Token-Auth: xai-grok-cli`. `xai-` API
-  keys are never sent; expired access tokens fail closed without OAuth refresh.
-  Tokens, refresh tokens, and emails never appear in logs, history, labels, or
-  tooltips.
-- Clawd task-loop rows remain local-configuration-only. The unified Ollama
-  section reuses those results and adds no boto3/DynamoDB polling.
+- PySide6 and requests are the package dependencies. Package all seven root application modules in `pyproject.toml`; do not accidentally include personal state, documents or service configurations in the wheel.
+- Informational CLI commands must exit before Qt import, credential reading, provider communication or state writes. Installation must not start the GUI or alter autostart/systemd.
+- Credential-bearing HTTPS requests go to their provider endpoint. Keep credentials out of logs, history and UI errors. Local subprocesses and browser/editor/clipboard actions have separate data-flow qualifications in the privacy audit.
+- Hidden provider rows skip their fetches. Missing/error quota data is unavailable, not zero. Cached usage must show age and respect expiry/reset bounds.
+- Keep private state confined to user-controlled locations. Do not commit live logs, tokens, tasks, personal screenshots or workflow documents.
+- XWayland is selected under a Wayland session with DISPLAY for positioning, docking and xdotool navigation. Native Wayland is unsupported by the beta.
+- Keep child Qt workers alive through bounded shutdown; replacing a running QThread can abort the process. Keep intentional Quit/SIGTERM closed even when optional supervision is installed.
+- Generalize optional task groups through `TASK_GROUPS_CONFIG`; the distributed default is empty. Do not hardcode a user's private project list.
+
+## Gates
+
+Run focused tests then `QT_QPA_PLATFORM=offscreen python3 -m pytest -q`, `node --test scripts/todo/__tests__/todo.test.mjs`, `node scripts/todo/build.mjs --check`, `python3 scripts/verify_install.py` and `git diff --check`. Tests block unmocked requests/urllib calls. The installation verifier uses a fresh venv and isolated HOME without launching the actual app. Repository guards and Python CI must pass before merging/pushing completion evidence. This desktop beta deliberately leaves the owner's live service untouched.
+
+## Optional source helpers
+
+`scripts/indicator_service.py` installs or launches an optional user service plus graphical-login desktop entry. The helper detects checkout and Python paths; installation renders files and reloads systemd without starting the widget. The service uses Qt event-loop readiness/heartbeat, singleton locking, failure restart after five seconds, a 90-second watchdog and bounded stop behavior. Run it only when user scope authorizes service changes. `scripts/ollama_watchdog.py` and `scripts/user/` are optional source tooling, excluded from normal installation.

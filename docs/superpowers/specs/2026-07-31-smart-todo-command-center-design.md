@@ -4,9 +4,9 @@
 
 ## Purpose
 
-Add a local-first task command center to Claude Indicator. It must let Sam capture overall tasks in `/home/sam/TODO.md`, continuously read project `TODO.md` files under `/home/sam/claude-workspace` and `/home/sam/codex_workspace`, and explain which work deserves attention now.
+Add a local-first task command center to Claude Indicator. It must let the user capture overall tasks in `/home/user/TODO.md`, continuously read project `TODO.md` files under `/home/user/claude-workspace` and `/home/user/codex_workspace`, and explain which work deserves attention now.
 
-The command center does not call a hosted model. Its ranking is deterministic, fast, inspectable, and free to run. Existing project TODO files are read-only; only the command center's managed section in `/home/sam/TODO.md` is mutated.
+The command center does not call a hosted model. Its ranking is deterministic, fast, inspectable, and free to run. Existing project TODO files are read-only; only the command center's managed section in `/home/user/TODO.md` is mutated.
 
 ## User Experience
 
@@ -14,7 +14,7 @@ The system tray uses a new task-compass icon: a warm-gold ring, a white check st
 
 The dialog is a dark, restrained command center rather than a generic form. Its signature element is the `Why now` rail: every ranked task shows a score, urgency band, project, due state, and a short plain-language explanation such as `overdue by 3 days · P0 section · billing risk`. The header shows open, overdue, urgent, and waiting counts.
 
-The top capture row accepts a task and an optional due date. `Add task` atomically appends an unchecked item to a clearly delimited `## Indicator Inbox` section in `/home/sam/TODO.md`. Empty tasks are rejected inline. The item immediately appears in the ranked list without restarting the app.
+The top capture row accepts a task and an optional due date. `Add task` atomically appends an unchecked item to a clearly delimited `## Indicator Inbox` section in `/home/user/TODO.md`. Empty tasks are rejected inline. The item immediately appears in the ranked list without restarting the app.
 
 Controls provide text search, project filter, and view filters for `Focus`, `All open`, `Waiting`, and `Completed inbox`. Double-clicking a result opens its source file at the task line with the system's configured editor. Managed inbox tasks expose a completion control; discovered project tasks never do. A refresh action rescans disk immediately.
 
@@ -39,14 +39,14 @@ The module contains four bounded units:
 
 1. `TodoScanner` discovers and reads TODO files with depth and size limits, parses Markdown checkboxes plus their heading path, and returns typed `TodoItem` values and scan warnings.
 2. `TodoRanker` classifies due dates, explicit priorities, blockers, revenue/billing risk, verification work, waiting/future gates, owner-only action, and staleness. It returns a score, urgency band, tags, and ordered `why_now` reasons. Future-gated or explicitly waiting tasks are separated from the actionable focus queue instead of being falsely promoted by urgent vocabulary.
-3. `InboxStore` owns only the delimited Indicator Inbox section of `/home/sam/TODO.md`. It uses same-directory temporary files plus `os.replace()` for atomic writes, preserves unrelated content byte-for-byte, assigns stable HTML-comment IDs to managed entries, and supports add and complete operations.
+3. `InboxStore` owns only the delimited Indicator Inbox section of `/home/user/TODO.md`. It uses same-directory temporary files plus `os.replace()` for atomic writes, preserves unrelated content byte-for-byte, assigns stable HTML-comment IDs to managed entries, and supports add and complete operations.
 4. `SmartTodoDialog` renders capture, summary, filters, task rows, source navigation, completion, refresh, loading, empty, and warning states. A `TodoScanWorker` runs discovery and ranking on a `QThread` so multi-megabyte TODO files cannot freeze the tray.
 
 `claude_widget.py` creates one lazy dialog instance, adds the tray menu action, and refreshes the tray tooltip with the latest focus/overdue summary. Closing the dialog hides and reuses it; quitting the tray app closes its worker safely.
 
 ## Discovery and Parsing
 
-Workspace roots default to `/home/sam/claude-workspace` and `/home/sam/codex_workspace`; the overall file defaults to `/home/sam/TODO.md`. Tests can inject all paths and today's date.
+Workspace roots default to `/home/user/claude-workspace` and `/home/user/codex_workspace`; the overall file defaults to `/home/user/TODO.md`. Tests can inject all paths and today's date.
 
 Discovery walks no deeper than three directories below each project root and skips `.git`, `.worktrees`, `node_modules`, `dist`, `build`, `target`, caches, virtual environments, Playwright output, and hidden directories. Resolved file paths are deduplicated. Files are read as UTF-8 with replacement and capped at 4 MiB; an oversized or unreadable file produces a visible warning and does not abort other projects.
 

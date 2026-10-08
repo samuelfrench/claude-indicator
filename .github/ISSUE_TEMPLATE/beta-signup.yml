@@ -1,0 +1,50 @@
+name: Beta signup
+description: Tell us which AI plans and providers you want to track.
+title: "[Beta signup]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue is public. Share plan names only; do not paste tokens, account emails, billing identifiers, private tasks, logs or screenshots containing personal information. The current beta supports Linux with X11 or XWayland; interest in other platforms helps planning.
+  - type: dropdown
+    id: paid-plans
+    attributes:
+      label: Which AI plans do you currently pay for?
+      multiple: true
+      options:
+        - Claude Pro / Max
+        - ChatGPT / Codex paid plan
+        - SuperGrok / Grok Build
+        - OpenCode Go
+        - MiniMax coding plan
+        - DeepSeek API
+        - Another plan (describe below)
+        - None
+    validations:
+      required: true
+  - type: textarea
+    id: requested-providers
+    attributes:
+      label: Which providers would you want covered?
+      description: Name the providers you would most want to track and any plan details you want to share.
+      placeholder: Claude and Codex; I mainly want to understand reset times.
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system and desktop session
+      options:
+        - Linux / X11
+        - Linux / Wayland with XWayland
+        - Linux / native Wayland
+        - macOS (currently unsupported)
+        - Windows (currently unsupported)
+        - Other / unsure (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context (optional)
+      description: Distribution, desktop environment, or what you hope this beta helps with.

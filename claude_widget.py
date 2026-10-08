@@ -381,8 +381,8 @@ class UsageData:
 
 @dataclass
 class DeployInfo:
-    project_name: str      # e.g. "coffee-explorer"
-    repo_slug: str         # e.g. "owner/coffee-explorer"
+    project_name: str      # e.g. "example-project"
+    repo_slug: str         # e.g. "owner/example-project"
     last_deploy_at: str    # ISO 8601 timestamp or ""
     workflow_name: str     # e.g. "Deploy"
     error: str             # "" if ok, error message otherwise
@@ -3980,13 +3980,7 @@ def fetch_task_loop_status() -> list[TaskLoopInfo]:
 # Path-scoped task groups: (label, repo_path, sub_path).
 # Status = last commit touching <repo>/<sub_path>; sub_path "" means whole repo.
 # Append a tuple to add a new group (e.g. SEO content, distribution drafts).
-TASK_GROUPS_CONFIG: list[tuple[str, Path, str]] = [
-    (
-        "honey-explorer outreach",
-        Path.home() / "claude-workspace" / "honey-explorer",
-        "outreach/",
-    ),
-]
+TASK_GROUPS_CONFIG: list[tuple[str, Path, str]] = []
 
 
 def fetch_task_groups() -> list[TaskGroupInfo]:

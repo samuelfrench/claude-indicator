@@ -25,3 +25,7 @@ env/
 .env
 .worktrees/
 *.log
+
+# Agent reports and local installation evidence are not product source.
+.superpowers/
+install-validation.json

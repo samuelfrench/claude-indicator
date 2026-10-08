@@ -21,15 +21,15 @@ from claude_widget import (
 
 SAMPLE_CRONTAB = """\
 # GSC batch submissions
-0 10 1 3 * cd /home/sam/proj && python3 scripts/batch.py --batch 4 >> /tmp/b4.log 2>&1
-0 10 2 3 * cd /home/sam/proj && python3 scripts/batch.py --batch 5 >> /tmp/b5.log 2>&1
+0 10 1 3 * cd /home/user/proj && python3 scripts/batch.py --batch 4 >> /tmp/b4.log 2>&1
+0 10 2 3 * cd /home/user/proj && python3 scripts/batch.py --batch 5 >> /tmp/b5.log 2>&1
 
-*/15 * * * * /home/sam/scripts/watchdog.sh  # weather-capture watchdog
+*/15 * * * * /home/user/scripts/watchdog.sh  # weather-capture watchdog
 17 3 * * * do_thing --quiet
 
 # supabase keep-alive
-@reboot /home/sam/keepalive/backup.sh >> /home/sam/keepalive/cron.log 2>&1
-0 */6 * * * /home/sam/keepalive/backup.sh >> /home/sam/keepalive/cron.log 2>&1
+@reboot /home/user/keepalive/backup.sh >> /home/user/keepalive/cron.log 2>&1
+0 */6 * * * /home/user/keepalive/backup.sh >> /home/user/keepalive/cron.log 2>&1
 SHELL=/bin/bash
 """
 
@@ -44,7 +44,7 @@ class CronParsingTest(unittest.TestCase):
         self.assertEqual(jobs[0].label, "GSC batch submissions")
         self.assertEqual(
             jobs[0].command,
-            "cd /home/sam/proj && python3 scripts/batch.py --batch 4 >> /tmp/b4.log 2>&1",
+            "cd /home/user/proj && python3 scripts/batch.py --batch 4 >> /tmp/b4.log 2>&1",
         )
         # Preceding comment applies to consecutive jobs
         self.assertEqual(jobs[1].label, "GSC batch submissions")
@@ -55,7 +55,7 @@ class CronParsingTest(unittest.TestCase):
         self.assertEqual(jobs[2].label, "weather-capture watchdog")
         self.assertEqual(
             jobs[2].command,
-            "/home/sam/scripts/watchdog.sh  # weather-capture watchdog",
+            "/home/user/scripts/watchdog.sh  # weather-capture watchdog",
         )
 
         # Blank line clears the pending comment; label falls back to command
@@ -133,11 +133,11 @@ class CronHealthTest(unittest.TestCase):
 
     def test_attach_cron_run_history_sets_last_run_and_status(self):
         jobs = parse_crontab_text(
-            "*/15 * * * * /home/sam/scripts/watchdog.sh  # watchdog\n"
+            "*/15 * * * * /home/user/scripts/watchdog.sh  # watchdog\n"
             "17 3 * * * do_thing --quiet\n"
             "0 10 1 3 * yearly_thing\n"
         )
-        watchdog_cmd = "/home/sam/scripts/watchdog.sh  # watchdog"
+        watchdog_cmd = "/home/user/scripts/watchdog.sh  # watchdog"
         entries = [
             (self.NOW - 420, watchdog_cmd),   # 12:00 run
             (self.NOW - 1320, watchdog_cmd),  # 11:45 run
@@ -228,11 +228,11 @@ class CronWidgetTest(unittest.TestCase):
         return [
             CronJobInfo(
                 label="watchdog", schedule="*/15 * * * *",
-                command="/home/sam/scripts/watchdog.sh", status="ok",
+                command="/home/user/scripts/watchdog.sh", status="ok",
             ),
             CronJobInfo(
                 label="backup", schedule="0 */6 * * *",
-                command="/home/sam/keepalive/backup.sh", status="late",
+                command="/home/user/keepalive/backup.sh", status="late",
             ),
         ]
 
@@ -269,7 +269,7 @@ class CronWidgetTest(unittest.TestCase):
     def test_widget_tooltip_lists_full_commands(self):
         w = CronJobsWidget()
         w.set_data(self._jobs())
-        self.assertIn("/home/sam/scripts/watchdog.sh", w.toolTip())
+        self.assertIn("/home/user/scripts/watchdog.sh", w.toolTip())
         self.assertIn("0 */6 * * *", w.toolTip())
 
 
