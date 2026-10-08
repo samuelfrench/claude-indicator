@@ -2943,7 +2943,7 @@ class WidgetUiTest(unittest.TestCase):
 
         metrics.net_rx_bps = 1024**8
         metrics.net_tx_bps = 1024**8
-        _, max_header_width, max_layout, _, max_width, max_available = (
+        max_header, max_header_width, max_layout, _, max_width, max_available = (
             row._collapsed_presentation(metrics, fm, content_width)
         )
         self.assertLessEqual(max_width, max_available)
@@ -2963,7 +2963,12 @@ class WidgetUiTest(unittest.TestCase):
         shortest, _, shortest_width = row._collapsed_layout(
             metrics, fm, full_header_available
         )
-        self.assertLessEqual(shortest_width, full_header_available)
+        if shortest_width > full_header_available:
+            # The helper returns its minimum layout even when the long header
+            # leaves too little space; the caller must recover that space.
+            self.assertEqual(max_header, "SYS ▸")
+            self.assertGreater(max_available, full_header_available)
+            self.assertLessEqual(shortest_width, max_available)
         self.assertIn(
             [label.strip() for label, _, _ in shortest],
             (["CPU", "RAM", "GPU", "↓", "↑"], ["C", "R", "G", "↓", "↑"]),
@@ -3006,6 +3011,16 @@ class WidgetUiTest(unittest.TestCase):
                 )
                 self.assertLessEqual(used, available)
                 self.assertLessEqual(4 + header_width + used + 4, content_width)
+                if content_width == 242:
+                    full_header_available = (
+                        content_width - 4
+                        - FixedFontMetrics().horizontalAdvance("SYSTEM ▸") - 8 - 4
+                    )
+                    _, _, helper_width = SystemMetricsRow._collapsed_layout(
+                        metrics, FixedFontMetrics(), full_header_available
+                    )
+                    self.assertGreater(helper_width, full_header_available)
+                    self.assertLessEqual(helper_width, available)
 
     def test_system_metrics_network_unavailable_state_is_explicit(self):
         row = SystemMetricsRow()
