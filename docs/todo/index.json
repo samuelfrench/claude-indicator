@@ -158,6 +158,21 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/promo-channel-research-2026-10-08.md",
+    "slug": "promo-channel-research-2026-10-08",
+    "title": "Alternative Indicator promotion channels: research only",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-08",
+    "owner": "agent",
+    "brief": "Research the best 3–5 alternative channels with current rules, audience fit and manual/account requirements; no publication, sign-ups or sends.",
+    "refs": [
+      "do.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/session-notification-ideas.md",
     "slug": "session-notification-ideas",
     "title": "Session notifications and local token-source ideas",
