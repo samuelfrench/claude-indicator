@@ -126,6 +126,23 @@
     "test": "tests/test_widget_ui.py Grok billing has no weekly or on-demand meter"
   },
   {
+    "path": "docs/todo/product/paid-release-source-and-license-decisions.md",
+    "slug": "paid-release-source-and-license-decisions",
+    "title": "Resolve provider sources and license before a later paid release",
+    "status": "waiting-sam",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-07",
+    "owner": "sam",
+    "brief": "Dated terms review is complete; choose source license, supported adapters and any historical privacy cleanup before future distribution.",
+    "refs": [
+      "docs/beta/provider-terms-check.md",
+      "docs/beta/privacy-audit.md",
+      "do.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/session-notification-ideas.md",
     "slug": "session-notification-ideas",
     "title": "Session notifications and local token-source ideas",
