@@ -2932,25 +2932,29 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertLessEqual(used, available)
         self.assertLessEqual(4 + header_width + used + 4, content_width)
-        self.assertEqual(header, "SYS ▸")
+        self.assertIn(header, ("SYSTEM ▸", "SYS ▸"))
         labels = [label.strip() for label, _, _ in segments]
-        self.assertEqual(labels, ["CPU", "RAM", "GPU", "↓", "↑"])
+        self.assertIn(
+            labels,
+            (["CPU", "RAM", "GPU", "↓", "↑"], ["C", "R", "G", "↓", "↑"]),
+        )
         values = [value for _, value, _ in segments]
-        self.assertEqual(values[-2:], ["999M/s", "999M/s"])
+        self.assertEqual(values, ["100%", "100%", "100%", "999M/s", "999M/s"])
 
         metrics.net_rx_bps = 1024**8
         metrics.net_tx_bps = 1024**8
-        _, _, max_layout, _, max_width, max_available = (
+        _, max_header_width, max_layout, _, max_width, max_available = (
             row._collapsed_presentation(metrics, fm, content_width)
         )
         self.assertLessEqual(max_width, max_available)
-        self.assertEqual(
+        self.assertLessEqual(4 + max_header_width + max_width + 4, content_width)
+        self.assertIn(
             [label.strip() for label, _, _ in max_layout],
-            ["CPU", "RAM", "GPU", "↓", "↑"],
+            (["CPU", "RAM", "GPU", "↓", "↑"], ["C", "R", "G", "↓", "↑"]),
         )
         self.assertEqual(
-            [value for _, value, _ in max_layout][-2:],
-            ["999+T/s", "999+T/s"],
+            [value for _, value, _ in max_layout],
+            ["100%", "100%", "100%", "999+T/s", "999+T/s"],
         )
 
         full_header_available = (
@@ -2960,10 +2964,48 @@ class WidgetUiTest(unittest.TestCase):
             metrics, fm, full_header_available
         )
         self.assertLessEqual(shortest_width, full_header_available)
-        self.assertEqual(
+        self.assertIn(
             [label.strip() for label, _, _ in shortest],
-            ["C", "R", "G", "↓", "↑"],
+            (["CPU", "RAM", "GPU", "↓", "↑"], ["C", "R", "G", "↓", "↑"]),
         )
+
+    def test_system_metrics_presentation_adapts_header_and_labels_without_losing_signals(self):
+        class FixedFontMetrics:
+            def horizontalAdvance(self, text):
+                return len(text) * 6
+
+        metrics = SystemMetrics(
+            cpu_pct=100,
+            mem_used_gb=16,
+            mem_total_gb=16,
+            gpu_available=True,
+            gpu_pct=100,
+            net_available=True,
+            net_rx_bps=999 * 1024**2,
+            net_tx_bps=999 * 1024**2,
+        )
+        cases = (
+            (400, "SYSTEM ▸", ["CPU", "RAM", "GPU", "↓", "↑"]),
+            (280, "SYS ▸", ["CPU", "RAM", "GPU", "↓", "↑"]),
+            (242, "SYS ▸", ["C", "R", "G", "↓", "↑"]),
+        )
+        for content_width, expected_header, expected_labels in cases:
+            with self.subTest(content_width=content_width):
+                header, header_width, segments, _, used, available = (
+                    SystemMetricsRow._collapsed_presentation(
+                        metrics, FixedFontMetrics(), content_width
+                    )
+                )
+                self.assertEqual(header, expected_header)
+                self.assertEqual(
+                    [label.strip() for label, _, _ in segments], expected_labels
+                )
+                self.assertEqual(
+                    [value for _, value, _ in segments],
+                    ["100%", "100%", "100%", "999M/s", "999M/s"],
+                )
+                self.assertLessEqual(used, available)
+                self.assertLessEqual(4 + header_width + used + 4, content_width)
 
     def test_system_metrics_network_unavailable_state_is_explicit(self):
         row = SystemMetricsRow()
