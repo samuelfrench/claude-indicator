@@ -11,7 +11,7 @@ test: null
 ---
 - **What:** Complete the authoritative beta plan and its October 7 additions.
 - **Why:** Public distribution and later paid use need provider-policy, privacy and installation evidence first.
-- **Next:** Original beta requirements and recruiting drafts are verified. Reconcile final records while the separately tracked Cursor and evidence-bound cross-project timeout additions proceed; no posting or launch.
+- **Next:** Original beta requirements/recruiting drafts and Cursor deployment are verified. Complete the evidence-bound BBQ/Coffee timeout lane, then reconcile final records; no posting or launch.
 - **Authority:** Requirements 1–6 here; later file additions 7–8 are tracked separately in `docs/todo/ci/load-tolerant-timeouts.md` and `docs/todo/done/product/cursor-provider.md`. Direct thread no-posting instruction remains controlling. No public release, README GIF, Pro tier, HN/Reddit/X launch, replies/DMs/likes/follows, email, money, new Anthropic API test calls or tmux interaction. Use mocks and isolated installation validation; beta install testing leaves the owner's running indicator untouched.
 - **External clocks:** Terms and public community rules require current read-only evidence. Any later posting needs explicit owner approval; drafts do not start a posting clock. No new billing or account enrollment is needed.
 - **Upstream targets:** No upstream patch/listing is needed for this beta scope; external publication remains held.
@@ -22,7 +22,7 @@ test: null
 - [x] Add `.github/ISSUE_TEMPLATE/beta-signup.yml`, `beta-feedback.yml`, and a short README Beta section with install command and form links; no GIF or launch copy.
 - [x] Find 25–30 recent (roughly 14-day) X/Reddit usage-limit/reset complaints; check community self-promotion rules, skip forbidding communities, and save ranked truthful varied 1–3 sentence replies disclosing “I built”, repo link and provider question to the owner's local recruitment Markdown and CSV. Do not post.
 - [x] Maintain local recruits tracker with one row per actual signup, source/date/provider requests and running provider tally; check signup/feedback issues each work session.
-- [ ] Run actual gates, commit/push tested work with green CI, record that live-widget deployment is explicitly held, and reconcile project TODO, owner plan and shared memory before final report.
+- [ ] Run actual gates, commit/push tested work with green CI, record isolated-install protection and the separately authorized Task8 production deployment, and reconcile project TODO, owner plan and shared memory before final report.
 
 **Started 2026-10-07:** Primary `master` and `origin/master` matched `d857694a050ddfb8774ce99be64e774ded5d9426` before work; tree was clean and no GitHub workflow existed. TODO migration is the first implementation lane. Recruitment and tracker records remain local, with no send/post action authorized.
 
