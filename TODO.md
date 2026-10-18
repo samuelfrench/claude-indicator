@@ -6,7 +6,7 @@
 
 ## Now
 
-- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — Hosted530+31 tests passed, then inherited Qt teardown crash139; fixing test cleanup before restart. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
+- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — Tray fix validated; CI exposed a reproducible PySide6/Python3.10 binding defect; measuring compatible dependency guard before restart. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
 
 ## Waiting on Sam
 
