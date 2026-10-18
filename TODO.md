@@ -6,7 +6,7 @@
 
 ## Now
 
-- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — Tray fix validated; CI exposed a reproducible PySide6/Python3.10 binding defect; measuring compatible dependency guard before restart. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
+- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — 78f8448 pushed;531+31 tests and compatible fresh install passed locally; hosted CI running before app restart. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
 
 ## Waiting on Sam
 

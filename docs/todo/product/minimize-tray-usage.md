@@ -5,7 +5,7 @@ area: product
 due: null
 updated: 2026-10-18
 owner: agent
-brief: "Tray fix validated; CI exposed a reproducible PySide6/Python3.10 binding defect; measuring compatible dependency guard before restart."
+brief: "78f8448 pushed;531+31 tests and compatible fresh install passed locally; hosted CI running before app restart."
 refs: ["claude_widget.py", "tests/test_widget_ui.py"]
 test: null
 ---
@@ -47,4 +47,5 @@ test: null
 - Standalone 1000-call QFont probe on Python3.10.19: PySide6 **6.12.0 loses1000 None references and exits134**, while **6.11.2 and6.10.2 lose0 and exit0**. Exact scripts/receipts: `~/indicator-beta/minimize-tray-2026-10-18/qt_binding_probe.py`, `qt310-{610,611,612}-probe.log`.
 - Both `pyproject.toml` and `requirements.txt` now exclude **only PySide6 6.12.0 on Python<3.12**; newer Python constraints stay unchanged. Added `tests/test_widget_runtime.py::test_qt_void_calls_preserve_none_references_and_exit_cleanly` to catch reference loss in a child process and require a clean exit. The probe fails on the bad binding, passes on both measured healthy releases, and does not suppress failures. Ineffective fixture changes were fully reverted.
 - Independent compatibility review approved all4 changed files without findings. Root full isolated suites each passed **531 tests +31 subtests**: default Python3.13.9/PySide6 6.10.2 in6.50s and Python3.10.19/PySide6 6.11.2 in6.79s, both exit0. Receipts: `full-tests-compat-default.log` and `full-tests-compat-qt611.log`. Earlier root recheck of the intentionally bad6.12 environment failed the new probe as expected; it is not the healthy environment.
-- Final local Python3.10 fresh install is running. Local uv standalone Python needs a **symlinked** bootstrap venv: the stock verifier's copied interpreter cannot locate `/install/lib/python3.10/encodings`; the same verifier is being run with only `EnvBuilder(symlinks=True)` adapted locally. No repository verifier change or CI workaround. The unmodified verifier must still pass on hosted Python3.10; retain that distinction in final evidence. No app restart yet.
+- Final local Python3.10 fresh install **passed**, resolving PySide6 **6.11.2**, importing all8 modules from installed site-packages, passing help/version and rendering the inert340x753 widget with HTTP/subprocesses blocked. Image inspected. Receipt `install-compat-validation.json` records the local adaptation: uv standalone Python needs a **symlinked** bootstrap venv; stock copied interpreters cannot locate `/install/lib/python3.10/encodings`. Same verifier ran with only `EnvBuilder(symlinks=True)` adapted locally. No repository verifier change or CI workaround; unmodified verifier must still pass on hosted Python3.10.
+- Compatibility source **78f8448e36be48e7f079be6150da44c89d696009** is pushed; both [Python/install39145804950](https://github.com/samuelfrench/claude-indicator/actions/runs/39145804950) and [repository guard39145804944](https://github.com/samuelfrench/claude-indicator/actions/runs/39145804944) are live. Observe existing runs; no app restart yet. Application bytes still match feature89cea8a and the widget SHA256 above.

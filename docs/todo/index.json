@@ -164,7 +164,7 @@
     "due": null,
     "updated": "2026-10-18",
     "owner": "agent",
-    "brief": "Tray fix validated; CI exposed a reproducible PySide6/Python3.10 binding defect; measuring compatible dependency guard before restart.",
+    "brief": "78f8448 pushed;531+31 tests and compatible fresh install passed locally; hosted CI running before app restart.",
     "refs": [
       "claude_widget.py",
       "tests/test_widget_ui.py"
