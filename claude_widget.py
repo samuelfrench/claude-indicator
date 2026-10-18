@@ -280,6 +280,56 @@ def build_task_compass_icon(size: int = 64) -> QIcon:
     return QIcon(px)
 
 
+def build_quota_tray_icon(
+    label: str, used_percent: float | None, cached: bool = False,
+) -> QIcon:
+    """Paint a readable provider letter and percent at native tray sizes.
+
+    C is Claude's 5-hour window; X is Codex's 7-day window. A small amber
+    dot marks cached values. Unknown usage is a question mark, never zero.
+    """
+    icon = QIcon()
+    for size in (16, 22, 24, 32, 48, 64, 128):
+        px = QPixmap(size, size)
+        px.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        scale = size / 64.0
+        painter.scale(scale, scale)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#14141e"))
+        painter.drawRoundedRect(QRectF(0, 0, 64, 64), 7, 7)
+        color = QColor("#d4a574" if label == "C" else "#a5b4fc")
+        if used_percent is not None and used_percent >= 90:
+            color = QColor("#f87171")
+        elif used_percent is not None and used_percent >= 75:
+            color = QColor("#fbbf24")
+        painter.setPen(color)
+        font = QFont("sans-serif")
+        font.setPixelSize(21)
+        font.setWeight(QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(QRectF(1, 0, 62, 24), Qt.AlignmentFlag.AlignCenter, label)
+        if cached:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#fbbf24"))
+            painter.drawEllipse(QRectF(48, 5, 8, 8))
+        painter.setPen(QColor("#ffffff"))
+        font.setPixelSize(32 if used_percent != 100 else 29)
+        painter.setFont(font)
+        text = "?" if used_percent is None else f"{used_percent:.0f}"
+        painter.drawText(QRectF(0, 22, 64, 35), Qt.AlignmentFlag.AlignCenter, text)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#525264"))
+        painter.drawRect(QRectF(5, 58, 54, 4))
+        if used_percent is not None:
+            painter.setBrush(color)
+            painter.drawRect(QRectF(5, 58, 54 * used_percent / 100, 4))
+        painter.end()
+        icon.addPixmap(px)
+    return icon
+
+
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
@@ -585,6 +635,13 @@ class CodexRateLimit:
     rate_limit_reached_type: str = ""
     source: str = ""
     observed_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class TrayQuotaState:
+    used_percent: float | None = None
+    cached: bool = False
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -8550,6 +8607,10 @@ class ClaudeWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedWidth(340)
         self._tray: QSystemTrayIcon | None = None
+        self._codex_tray: QSystemTrayIcon | None = None
+        self._tray_icon_states: dict[str, tuple] = {}
+        self._todo_tray_summary = "Smart TODOs"
+        self._minimize_pending_tray = False
         self._smart_todo_action: QAction | None = None
         self._smart_todo_dialog: SmartTodoDialog | None = None
         self._shutdown_started = False
@@ -8564,6 +8625,7 @@ class ClaudeWidget(QWidget):
         self._drag_pos = QPoint()
         self._system_move_active = False
         self._usage: UsageData | None = load_last_usage()
+        self._codex_summary: CodexUsageSummary | None = None
         self._client = ClaudeUsageClient()
         self._worker: FetchWorker | None = None
         self._deploy_worker: DeployFetchWorker | None = None
@@ -8729,8 +8791,9 @@ class ClaudeWidget(QWidget):
             "color: #666680; font-size: 14px; padding: 2px 6px;"
         )
         self._minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._minimize_btn.setToolTip("Collapse to screen edge")
-        self._minimize_btn.mousePressEvent = lambda _: self.collapse_to_sliver()
+        self._minimize_btn.setToolTip("Minimize to tray (screen edge if unavailable)")
+        self._minimize_btn.setAccessibleName("Minimize to tray")
+        self._minimize_btn.mousePressEvent = lambda _: self.minimize_to_tray()
         header.addWidget(self._minimize_btn)
 
         # Close button
@@ -8957,6 +9020,7 @@ class ClaudeWidget(QWidget):
         else:
             self._hidden_sections.add(section_id)
         self._persist_visibility()
+        self._update_tray_quotas()
         self.adjustSize()
         if visible:
             self._refresh_after_unhide("section", section_id)
@@ -8969,6 +9033,7 @@ class ClaudeWidget(QWidget):
         else:
             self._hidden_providers.add(provider_id)
         self._persist_visibility()
+        self._update_tray_quotas()
         self.adjustSize()
         if visible:
             self._refresh_after_unhide("provider", provider_id)
@@ -9301,6 +9366,7 @@ class ClaudeWidget(QWidget):
             QTimer.singleShot(int(delay * 1000) + 1000, self._fetch_usage)
             if self._usage and not self._usage.error:
                 # Preserve last-good _usage; just annotate status
+                self._update_tray_quotas()
                 return
             # First fetch ever returned 429; store the error so display shows it
             self._usage = data
@@ -9347,6 +9413,7 @@ class ClaudeWidget(QWidget):
         self._update_display()
 
     def _update_display(self):
+        self._update_tray_quotas()
         data = self._usage
         if data is None:
             return
@@ -9476,8 +9543,14 @@ class ClaudeWidget(QWidget):
 
     def _update_countdowns(self):
         """Update countdown strings every second without re-fetching."""
+        if (self._minimize_pending_tray and not self._shutdown_started
+                and not self._restore_sliver.isVisible()
+                and not QSystemTrayIcon.isSystemTrayAvailable()):
+            self.minimize_to_tray()
         if self._usage:
             self._update_display()
+        else:
+            self._update_tray_quotas()
 
     def _fetch_deploys(self):
         if not self._section_visible("deploy"):
@@ -9566,6 +9639,8 @@ class ClaudeWidget(QWidget):
         self._codex_worker.start()
 
     def _on_codex_usage_read(self, summary: CodexUsageSummary | None):
+        self._codex_summary = summary
+        self._update_tray_quotas()
         self._codex_row.set_data(summary)
         self.adjustSize()
 
@@ -9902,7 +9977,7 @@ class ClaudeWidget(QWidget):
         p.end()
 
     def _setup_tray_icon(self):
-        if self._shutdown_started or self._tray is not None:
+        if self._shutdown_started:
             return
         if not QSystemTrayIcon.isSystemTrayAvailable():
             if not self._tray_unavailable_logged:
@@ -9913,12 +9988,16 @@ class ClaudeWidget(QWidget):
             return
 
         self._tray_retry_timer.stop()
-        icon = build_task_compass_icon()
-        self._tray = QSystemTrayIcon(icon, self)
-        self._tray.setToolTip("Claude Indicator · Smart TODOs")
+        if self._tray is not None:
+            if self._minimize_pending_tray and self._restore_sliver.isVisible():
+                self.hide_to_tray()
+            return
+        self._tray = QSystemTrayIcon(self)
+        self._codex_tray = QSystemTrayIcon(self)
         self._tray.activated.connect(self._on_tray_activated)
+        self._codex_tray.activated.connect(self._on_tray_activated)
 
-        menu = QMenu()
+        menu = QMenu(self)
         self._smart_todo_action = QAction("Smart TODOs…", self)
         self._smart_todo_action.triggered.connect(self._show_smart_todos)
         menu.addAction(self._smart_todo_action)
@@ -9942,7 +10021,130 @@ class ClaudeWidget(QWidget):
         quit_action.triggered.connect(QApplication.quit)
         menu.addAction(quit_action)
         self._tray.setContextMenu(menu)
+        self._codex_tray.setContextMenu(menu)
+        self._update_tray_quotas()
         self._tray.show()
+        self._codex_tray.show()
+        if self._minimize_pending_tray and self._restore_sliver.isVisible():
+            self.hide_to_tray()
+
+    @staticmethod
+    def _valid_tray_percent(value) -> bool:
+        return (
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and 0 <= value <= 100
+        )
+
+    @staticmethod
+    def _tray_reset_description(resets_at: float, now: float) -> str:
+        minutes = max(1, math.ceil((resets_at - now) / 60))
+        if minutes >= 24 * 60:
+            remaining = f"{minutes // (24 * 60)}d {minutes // 60 % 24}h"
+        elif minutes >= 60:
+            remaining = f"{minutes // 60}h {minutes % 60}m"
+        else:
+            remaining = f"{minutes}m"
+        return f"resets in {remaining}"
+
+    def _claude_tray_quota(self, now: float) -> TrayQuotaState:
+        label = "Claude 5-hour usage"
+        def unavailable(reason):
+            return TrayQuotaState(detail=f"{label}: unavailable — {reason}")
+
+        if not (self._section_visible("claude") or self._section_visible("history")):
+            return unavailable("Claude sections hidden; polling paused")
+        data = self._usage
+        if data is None:
+            return unavailable("waiting for usage")
+        if data.error:
+            return unavailable(data.error)
+        if not self._valid_tray_percent(data.five_hour.utilization):
+            return unavailable("invalid usage snapshot")
+        observed_at = data.fetched_at
+        if not math.isfinite(observed_at) or observed_at <= 0 or observed_at > now + 60:
+            return unavailable("snapshot time unknown")
+        age = max(0, now - observed_at)
+        if age > MAX_HISTORY_AGE_S:
+            return unavailable("usage snapshot expired")
+        reset = data.five_hour.reset_dt
+        if reset is None or reset.tzinfo is None:
+            return unavailable("5-hour reset time unknown")
+        if reset.timestamp() <= now:
+            return unavailable("5-hour window reset; waiting for refresh")
+        cached = (
+            not self._has_fetched_usage or age >= REFRESH_INTERVAL_MS / 1000
+            or now < self._rate_limit_until
+        )
+        source = "Cached snapshot" if cached else "Usage snapshot"
+        if now < self._rate_limit_until:
+            source += "; rate limited"
+        used = data.five_hour.utilization
+        return TrayQuotaState(
+            used, cached,
+            f"{label}: {used:.0f}% used\n{source}; updated {self._format_age(age)}; "
+            f"{self._tray_reset_description(reset.timestamp(), now)}",
+        )
+
+    def _codex_tray_quota(self, now: float) -> TrayQuotaState:
+        label = "Codex 7-day usage"
+        def unavailable(reason):
+            return TrayQuotaState(detail=f"{label}: unavailable — {reason}")
+
+        if not self._provider_visible("codex"):
+            return unavailable("Codex hidden; polling paused")
+        summary = self._codex_summary
+        if summary is None:
+            return unavailable("waiting for usage")
+        # Match the window duration, rather than assuming secondary always
+        # means weekly. Local token totals are never a quota substitute.
+        weekly = next((
+            (percent, reset) for percent, duration, reset in (
+                (summary.primary_limit_used_percent,
+                 summary.primary_limit_window_minutes, summary.primary_limit_resets_at),
+                (summary.secondary_limit_used_percent,
+                 summary.secondary_limit_window_minutes, summary.secondary_limit_resets_at),
+            ) if duration == 7 * 24 * 60
+        ), None)
+        if weekly is None or not self._valid_tray_percent(weekly[0]):
+            return unavailable("7-day quota not reported")
+        used, reset = weekly
+        observed_at = summary.rate_limit_observed_at
+        if (summary.rate_limit_source not in ("live", "cached")
+                or not math.isfinite(observed_at) or observed_at <= 0
+                or observed_at > now + CODEX_REFRESH_MS / 1000):
+            return unavailable("quota source or snapshot time unknown")
+        age = max(0, now - observed_at)
+        if age > CODEX_CACHED_RATE_LIMIT_MAX_AGE_S:
+            return unavailable("quota snapshot expired; waiting for refresh")
+        if not reset:
+            return unavailable("7-day reset time unknown")
+        if reset <= now:
+            return unavailable("7-day window reset; waiting for refresh")
+        cached = summary.rate_limit_source == "cached" or age >= CODEX_REFRESH_MS / 1000
+        source = "Cached local session fallback" if summary.rate_limit_source == "cached" else "Codex account snapshot"
+        return TrayQuotaState(
+            used, cached,
+            f"{label}: {used:.0f}% used\n{source}; updated {self._format_age(age)}; "
+            f"{self._tray_reset_description(reset, now)}",
+        )
+
+    def _update_tray_quotas(self):
+        if self._tray is None or self._shutdown_started:
+            return
+        now = time.time()
+        for label, tray, state in (
+            ("C", self._tray, self._claude_tray_quota(now)),
+            ("X", self._codex_tray, self._codex_tray_quota(now)),
+        ):
+            icon_state = (state.used_percent, state.cached)
+            if self._tray_icon_states.get(label) != icon_state:
+                tray.setIcon(build_quota_tray_icon(label, *icon_state))
+                self._tray_icon_states[label] = icon_state
+            cached_note = "\nAmber dot: cached usage" if state.cached else ""
+            tray.setToolTip(
+                f"{state.detail}{cached_note}\nClick to show/hide Claude Indicator"
+                f"\n{self._todo_tray_summary} · right-click for menu"
+            )
 
     def _open_traffic_report(self):
         if not QDesktopServices.openUrl(QUrl(TRAFFIC_REPORT_URL)):
@@ -9963,11 +10165,8 @@ class ClaudeWidget(QWidget):
         self._smart_todo_dialog.activateWindow()
 
     def _on_todo_summary_changed(self, focus_count: int, overdue_count: int):
-        if self._tray is not None:
-            self._tray.setToolTip(
-                f"Claude Indicator · {focus_count} focus · "
-                f"{overdue_count} overdue"
-            )
+        self._todo_tray_summary = f"Smart TODOs · {focus_count} focus · {overdue_count} overdue"
+        self._update_tray_quotas()
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -9977,7 +10176,8 @@ class ClaudeWidget(QWidget):
         if self._tray is None:
             return
         self._restore_sliver.hide()
-        self.show()
+        self._minimize_pending_tray = False
+        self.showNormal()
         if self._tabs_panel.isVisible():
             self._tabs_panel.move(self._panel_positions()[0])
             self._tabs_panel.raise_()
@@ -9987,11 +10187,24 @@ class ClaudeWidget(QWidget):
     def hide_to_tray(self):
         if self._tray is None:
             return
+        self._minimize_pending_tray = True
         if self._recovery_dialog is not None:
             self._recovery_dialog.hide()
         self._hide_tabs_panel()
         self._restore_sliver.hide()
         self.hide()
+
+    def minimize_to_tray(self):
+        """Minimize with an accessible restore control, even without a tray host."""
+        if self._shutdown_started:
+            return
+        self._minimize_pending_tray = True
+        self._setup_tray_icon()
+        self._update_tray_quotas()
+        if self._tray is not None and QSystemTrayIcon.isSystemTrayAvailable():
+            self.hide_to_tray()
+        else:
+            self.collapse_to_sliver()
 
     def _hide_tabs_panel(self):
         # Immediate hide for tray/sliver/shutdown paths — no slide animation.
@@ -10002,7 +10215,7 @@ class ClaudeWidget(QWidget):
             self._terminal_sessions_row.set_panel_open(False)
 
     def collapse_to_sliver(self):
-        """Hide the main panel but keep the terminal selector usable."""
+        """Keep a restore handle, preserving the selector's existing visibility."""
         if self._shutdown_started:
             return
         screen = QApplication.screenAt(self.frameGeometry().center())
@@ -10017,21 +10230,23 @@ class ClaudeWidget(QWidget):
             available.bottom() - self._restore_sliver.height() + 1,
         )
         left = available.right() - self._restore_sliver.width() + 1
-        self._tabs_panel_anim.stop()
-        self._tabs_panel_closing = False
-        if self._section_visible("tabs"):
-            self._terminal_sessions_row.set_panel_open(True)
+        panel_open = self._tabs_panel.isVisible() and not self._tabs_panel_closing
+        if panel_open:
+            self._tabs_panel_anim.stop()
             self._tabs_panel.move(self._panel_positions()[0])
-            self._tabs_panel.show()
+        else:
+            self._hide_tabs_panel()
         self.hide()
         self._restore_sliver.move(left, top)
         self._restore_sliver.show()
-        self._tabs_panel.raise_()
+        if panel_open:
+            self._tabs_panel.raise_()
         self._restore_sliver.raise_()
 
     def _restore_from_sliver(self):
         self._restore_sliver.hide()
-        self.show()
+        self._minimize_pending_tray = False
+        self.showNormal()
         self.adjustSize()
         self.clamp_to_available_screen()
         if self._tabs_panel.isVisible():
@@ -10043,19 +10258,29 @@ class ClaudeWidget(QWidget):
         self.activateWindow()
 
     def _toggle_from_tray(self):
-        if (
-            self.isVisible()
-            or self._tabs_panel.isVisible()
-            or self._restore_sliver.isVisible()
-        ):
+        if self.isVisible():
             self.hide_to_tray()
         else:
             self._show_from_tray()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.WindowStateChange and self.isMinimized()
+                and hasattr(self, "_shutdown_started") and not self._shutdown_started):
+            # Wait until the window manager has finished its state change.
+            QTimer.singleShot(0, self._on_window_minimized)
+
+    def _on_window_minimized(self):
+        if self.isMinimized() and not self._shutdown_started:
+            self.minimize_to_tray()
 
     def shutdown(self):
         if self._shutdown_started:
             return
         self._shutdown_started = True
+        for tray in (self._tray, self._codex_tray):
+            if tray is not None:
+                tray.hide()
         if self._recovery_dialog is not None:
             self._recovery_dialog.close()
         self._tabs_panel.hide()

@@ -1901,6 +1901,7 @@ class WidgetUiTest(unittest.TestCase):
         available = QApplication.primaryScreen().availableGeometry()
         widget.show()
         widget.move(500, available.bottom() - widget.height() + 1)
+        widget._toggle_tabs_panel()
         widget.collapse_to_sliver()
         anchor_before = widget.pos()
 
@@ -1972,6 +1973,151 @@ class WidgetUiTest(unittest.TestCase):
                 self.assertFalse(icon.isNull())
                 self.assertFalse(icon.pixmap(size, size).isNull())
 
+    def test_quota_icons_render_distinct_values_and_cache_marker_at_tray_sizes(self):
+        for size in (16, 22, 24, 32, 64):
+            with self.subTest(size=size):
+                images = [
+                    claude_widget.build_quota_tray_icon(label, used, cached)
+                    .pixmap(size, size).toImage()
+                    for label, used, cached in (
+                        ("C", None, False), ("C", 0, False), ("C", 47, False),
+                        ("C", 47, True), ("X", 47, False), ("X", 100, False),
+                    )
+                ]
+                self.assertTrue(all(not image.isNull() for image in images))
+                for i, image in enumerate(images):
+                    for other in images[i + 1:]:
+                        self.assertNotEqual(image, other)
+
+    @staticmethod
+    def _seed_tray_quotas(widget, now):
+        widget._usage = UsageData(
+            five_hour=UsageEntry(
+                utilization=43,
+                resets_at=datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+            ),
+            fetched_at=now,
+        )
+        widget._has_fetched_usage = True
+        widget._rate_limit_until = 0
+        widget._codex_summary = CodexUsageSummary(
+            primary_limit_used_percent=13,
+            primary_limit_window_minutes=300,
+            primary_limit_resets_at=int(now + 3600),
+            secondary_limit_used_percent=87,
+            secondary_limit_window_minutes=10080,
+            secondary_limit_resets_at=int(now + 86400),
+            rate_limit_source="live",
+            rate_limit_observed_at=now,
+        )
+
+    def test_quota_trays_update_from_results_and_countdowns_while_main_hidden(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        self._seed_tray_quotas(widget, now)
+        widget.show()
+        widget.minimize_to_tray()
+        self.assertIn("Claude 5-hour usage: 43% used", widget._tray.toolTip())
+        self.assertIn("Codex 7-day usage: 87% used", widget._codex_tray.toolTip())
+        previous_icons = (widget._tray.icon().cacheKey(), widget._codex_tray.icon().cacheKey())
+
+        widget._usage.five_hour.utilization = 54
+        codex = widget._codex_summary
+        codex.secondary_limit_used_percent = 91
+        widget._on_codex_usage_read(codex)
+        widget._update_countdowns()
+
+        self.assertFalse(widget.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        self.assertIn("54% used", widget._tray.toolTip())
+        self.assertIn("91% used", widget._codex_tray.toolTip())
+        self.assertNotEqual(previous_icons[0], widget._tray.icon().cacheKey())
+        self.assertNotEqual(previous_icons[1], widget._codex_tray.icon().cacheKey())
+        with patch.object(claude_widget.time, "time", return_value=now + 90):
+            widget._update_countdowns()
+        self.assertIn("updated 1m ago", widget._codex_tray.toolTip())
+        self.assertIn("Amber dot: cached usage", widget._codex_tray.toolTip())
+
+    def test_claude_tray_labels_persisted_and_rate_limited_snapshots_as_cached(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        self._seed_tray_quotas(widget, now)
+        widget._has_fetched_usage = False
+        self.assertTrue(widget._claude_tray_quota(now).cached)
+        widget._has_fetched_usage = True
+        widget._rate_limit_until = now + 120
+        state = widget._claude_tray_quota(now)
+        self.assertEqual(state.used_percent, 43)
+        self.assertTrue(state.cached)
+        self.assertIn("rate limited", state.detail)
+
+    def test_quota_trays_show_unavailable_instead_of_zero_for_missing_errors_and_expiry(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        for case in ("missing", "error", "reset", "expired", "missing-reset", "invalid"):
+            with self.subTest(case=case):
+                self._seed_tray_quotas(widget, now)
+                if case == "missing":
+                    widget._usage = None
+                    widget._codex_summary = None
+                elif case == "error":
+                    widget._usage = UsageData(error="Not connected")
+                    widget._codex_summary = CodexUsageSummary(total_tokens=999999, thread_count=3)
+                elif case == "reset":
+                    widget._usage.five_hour.resets_at = datetime.fromtimestamp(now - 1, timezone.utc).isoformat()
+                    widget._codex_summary.secondary_limit_resets_at = int(now - 1)
+                elif case == "expired":
+                    widget._usage.fetched_at = now - claude_widget.MAX_HISTORY_AGE_S - 1
+                    widget._codex_summary.rate_limit_observed_at = now - claude_widget.CODEX_CACHED_RATE_LIMIT_MAX_AGE_S - 1
+                elif case == "missing-reset":
+                    widget._usage.five_hour.resets_at = ""
+                    widget._codex_summary.secondary_limit_resets_at = 0
+                elif case == "invalid":
+                    widget._usage.five_hour.utilization = float("nan")
+                    widget._codex_summary.secondary_limit_used_percent = -1
+                for state in (widget._claude_tray_quota(now), widget._codex_tray_quota(now)):
+                    self.assertIsNone(state.used_percent)
+                    self.assertIn("unavailable", state.detail)
+
+    def test_hidden_quota_sources_show_unavailable_without_starting_fetches(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        self._seed_tray_quotas(widget, now)
+        with patch.object(widget, "_fetch_usage") as claude_fetch, patch.object(widget, "_refresh_codex_usage") as codex_fetch:
+            widget._set_section_visible("claude", False)
+            widget._set_section_visible("history", False)
+            widget._set_provider_visible("codex", False)
+            widget._update_countdowns()
+            claude_fetch.assert_not_called()
+            codex_fetch.assert_not_called()
+        self.assertIsNone(widget._claude_tray_quota(now).used_percent)
+        self.assertIsNone(widget._codex_tray_quota(now).used_percent)
+        self.assertIn("polling paused", widget._tray.toolTip())
+        self.assertIn("polling paused", widget._codex_tray.toolTip())
+
+    def test_codex_tray_selects_only_the_actual_weekly_window(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        self._seed_tray_quotas(widget, now)
+        widget._codex_summary.primary_limit_window_minutes = 10080
+        widget._codex_summary.secondary_limit_window_minutes = 300
+        self.assertEqual(widget._codex_tray_quota(now).used_percent, 13)
+        widget._codex_summary.primary_limit_window_minutes = 300
+        self.assertIsNone(widget._codex_tray_quota(now).used_percent)
+
+    def test_codex_cached_tray_data_includes_age_and_expires_while_hidden(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        self._seed_tray_quotas(widget, now)
+        widget._codex_summary.rate_limit_source = "cached"
+        state = widget._codex_tray_quota(now + 120)
+        self.assertTrue(state.cached)
+        self.assertEqual(state.used_percent, 87)
+        self.assertIn("Cached local session fallback; updated 2m ago", state.detail)
+        with patch.object(claude_widget.time, "time", return_value=now + 301):
+            widget._update_countdowns()
+        self.assertIn("quota snapshot expired", widget._codex_tray.toolTip())
+
     def test_claude_tray_menu_places_smart_todos_first(self):
         widget = self._make_inert_claude_widget(tray_available=True)
 
@@ -1983,10 +2129,19 @@ class WidgetUiTest(unittest.TestCase):
         )
         self.assertTrue(actions[5].isSeparator())
 
-    def test_smart_todo_tray_has_exact_initial_tooltip(self):
+    def test_quota_trays_have_distinct_windows_and_share_the_existing_menu(self):
         widget = self._make_inert_claude_widget(tray_available=True)
+        widget._usage = None
+        widget._update_tray_quotas()
 
-        self.assertEqual(widget._tray.toolTip(), "Claude Indicator · Smart TODOs")
+        self.assertIn("Claude 5-hour usage: unavailable", widget._tray.toolTip())
+        self.assertIn("Codex 7-day usage: unavailable", widget._codex_tray.toolTip())
+        self.assertIn("Smart TODOs", widget._tray.toolTip())
+        self.assertIs(widget._tray.contextMenu(), widget._codex_tray.contextMenu())
+        self.assertTrue(widget._tray.isVisible())
+        self.assertTrue(widget._codex_tray.isVisible())
+        self.assertFalse(widget._tray.icon().isNull())
+        self.assertFalse(widget._codex_tray.icon().isNull())
 
     def test_smart_todo_action_creates_one_dialog_and_reuses_it(self):
         dialog_factory = Mock(side_effect=self._FakeSmartTodoDialog)
@@ -2012,15 +2167,16 @@ class WidgetUiTest(unittest.TestCase):
 
         widget._smart_todo_dialog.summary_changed.emit(7, 2)
 
-        self.assertEqual(
-            widget._tray.toolTip(),
-            "Claude Indicator · 7 focus · 2 overdue",
-        )
+        self.assertIn("Claude 5-hour usage", widget._tray.toolTip())
+        self.assertIn("Codex 7-day usage", widget._codex_tray.toolTip())
+        for tray in (widget._tray, widget._codex_tray):
+            self.assertIn("Smart TODOs · 7 focus · 2 overdue", tray.toolTip())
 
     def test_tray_unavailable_does_not_create_smart_todo_action(self):
         widget = self._make_inert_claude_widget(tray_available=False)
 
         self.assertIsNone(widget._tray)
+        self.assertIsNone(widget._codex_tray)
         self.assertIsNone(widget._smart_todo_action)
         self.assertIsNone(widget._smart_todo_dialog)
 
@@ -2049,6 +2205,90 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertIs(widget._tray, tray)
         self.assertEqual(len(tray.contextMenu().actions()), 7)
+        self.assertEqual(len(widget.findChildren(QSystemTrayIcon)), 2)
+
+    def test_minimize_fallback_moves_into_tray_when_host_becomes_available(self):
+        available = [False]
+        widget = self._make_inert_claude_widget(tray_available=lambda: available[0])
+        widget.show()
+
+        widget.minimize_to_tray()
+
+        self.assertFalse(widget.isVisible())
+        self.assertTrue(widget._restore_sliver.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        available[0] = True
+        widget._tray_retry_timer.timeout.emit()
+
+        self.assertFalse(widget.isVisible())
+        self.assertFalse(widget._restore_sliver.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        self.assertTrue(widget._tray.isVisible())
+        self.assertTrue(widget._codex_tray.isVisible())
+        widget._codex_tray.activated.emit(QSystemTrayIcon.ActivationReason.Trigger)
+        self.assertTrue(widget.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+
+    def test_minimize_falls_back_when_tray_host_disappears_and_reuses_icons_on_return(self):
+        available = [True]
+        widget = self._make_inert_claude_widget(tray_available=lambda: available[0])
+        original_icons = (widget._tray, widget._codex_tray)
+        widget.show()
+        available[0] = False
+
+        widget.minimize_to_tray()
+
+        self.assertTrue(widget._restore_sliver.isVisible())
+        self.assertTrue(widget._tray_retry_timer.isActive())
+        available[0] = True
+        widget._tray_retry_timer.timeout.emit()
+        self.assertFalse(widget._restore_sliver.isVisible())
+        self.assertFalse(widget._tray_retry_timer.isActive())
+        self.assertEqual((widget._tray, widget._codex_tray), original_icons)
+        self.assertEqual(len(widget.findChildren(QSystemTrayIcon)), 2)
+
+    def test_minimized_widget_gets_restore_handle_if_tray_host_disappears(self):
+        available = [True]
+        widget = self._make_inert_claude_widget(tray_available=lambda: available[0])
+        widget.show()
+        widget.minimize_to_tray()
+        available[0] = False
+
+        widget._update_countdowns()
+
+        self.assertFalse(widget.isVisible())
+        self.assertTrue(widget._restore_sliver.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        available[0] = True
+        widget._tray_retry_timer.timeout.emit()
+        self.assertFalse(widget._restore_sliver.isVisible())
+
+    def test_sliver_minimize_finishes_selector_close_without_reopening_it(self):
+        widget = self._make_inert_claude_widget(tray_available=False)
+        widget.show()
+        widget._toggle_tabs_panel()
+        widget._toggle_tabs_panel()
+        self.assertTrue(widget._tabs_panel_closing)
+
+        widget.minimize_to_tray()
+        QApplication.processEvents()
+
+        self.assertTrue(widget._restore_sliver.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        self.assertFalse(widget._terminal_sessions_row._panel_open)
+
+    def test_restoring_sliver_cancels_pending_tray_minimize(self):
+        available = [False]
+        widget = self._make_inert_claude_widget(tray_available=lambda: available[0])
+        widget.show()
+        widget.minimize_to_tray()
+        widget._restore_from_sliver()
+
+        available[0] = True
+        widget._tray_retry_timer.timeout.emit()
+
+        self.assertTrue(widget.isVisible())
+        self.assertFalse(widget._restore_sliver.isVisible())
 
     def test_repeated_unavailable_tray_retries_log_only_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2129,14 +2369,35 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertGreater(widget.height(), before)
 
-    def test_claude_header_minimize_button_collapses_to_visible_sliver(self):
+    def test_claude_header_minimize_button_hides_to_available_tray(self):
         widget = self._make_inert_claude_widget(tray_available=True)
-        calls = []
-        widget.collapse_to_sliver = lambda: calls.append("collapse")
+        widget.show()
 
         widget._minimize_btn.mousePressEvent(None)
 
-        self.assertEqual(calls, ["collapse"])
+        self.assertFalse(widget.isVisible())
+        self.assertFalse(widget._restore_sliver.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        self.assertTrue(widget._tray.isVisible())
+        self.assertTrue(widget._codex_tray.isVisible())
+        widget._tray.activated.emit(QSystemTrayIcon.ActivationReason.Trigger)
+        self.assertTrue(widget.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+
+    def test_native_minimize_uses_tray_and_restores_normal_window_state(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        widget.show()
+        widget.showMinimized()
+        QApplication.processEvents()
+
+        self.assertFalse(widget.isVisible())
+        self.assertFalse(widget._restore_sliver.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
+        widget._show_hide_action.trigger()
+        QApplication.processEvents()
+
+        self.assertTrue(widget.isVisible())
+        self.assertFalse(widget.isMinimized())
 
     def test_claude_header_minimize_uses_sliver_without_tray(self):
         widget = self._make_inert_claude_widget(tray_available=False)
@@ -2159,9 +2420,8 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertFalse(widget.isVisible())
         self.assertTrue(widget._restore_sliver.isVisible())
-        self.assertTrue(widget._tabs_panel.isVisible())
-        self.assertTrue(widget._terminal_sessions_row._panel_open)
-        self.assertEqual(widget._tabs_panel.pos(), widget._panel_positions()[0])
+        self.assertFalse(widget._tabs_panel.isVisible())
+        self.assertFalse(widget._terminal_sessions_row._panel_open)
         self.assertEqual(widget._restore_sliver.frameGeometry().right(), available.right())
         self.assertEqual(widget._restore_sliver.frameGeometry().top(), available.top() + 40)
         self.assertEqual(widget._restore_sliver.toolTip(), "Expand Claude Indicator")
@@ -2171,19 +2431,18 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertFalse(widget._restore_sliver.isVisible())
         self.assertTrue(widget.isVisible())
-        self.assertTrue(widget._tabs_panel.isVisible())
-        self.assertEqual(widget._tabs_panel.pos(), widget._panel_positions()[0])
+        self.assertFalse(widget._tabs_panel.isVisible())
 
-    def test_tray_toggle_hides_selector_and_sliver_when_main_is_collapsed(self):
+    def test_tray_toggle_restores_main_when_collapsed_to_sliver(self):
         widget = self._make_inert_claude_widget(tray_available=True)
         widget.show()
         widget.collapse_to_sliver()
-        self.assertTrue(widget._tabs_panel.isVisible())
+        self.assertFalse(widget._tabs_panel.isVisible())
         self.assertTrue(widget._restore_sliver.isVisible())
 
         widget._toggle_from_tray()
 
-        self.assertFalse(widget.isVisible())
+        self.assertTrue(widget.isVisible())
         self.assertFalse(widget._tabs_panel.isVisible())
         self.assertFalse(widget._restore_sliver.isVisible())
 

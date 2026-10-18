@@ -6,7 +6,7 @@
 
 ## Now
 
-- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — Fix minimize opening the terminal manager; expose both quotas in the tray, validate, push and restart the existing app. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
+- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — Implemented, independently reviewed and locally validated; push, hosted CI and native service restart verification remain. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
 
 ## Waiting on Sam
 

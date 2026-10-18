@@ -5,7 +5,7 @@ area: product
 due: null
 updated: 2026-10-18
 owner: agent
-brief: "Fix minimize opening the terminal manager; expose both quotas in the tray, validate, push and restart the existing app."
+brief: "Implemented, independently reviewed and locally validated; push, hosted CI and native service restart verification remain."
 refs: ["claude_widget.py", "tests/test_widget_ui.py"]
 test: null
 ---
@@ -24,3 +24,10 @@ test: null
 - Native baseline: X11 tray host is present; main window mapped, terminal manager and edge sliver both unmapped. No live app interaction or restart yet. Private cropped baseline evidence is under `~/indicator-beta/minimize-tray-2026-10-18/`.
 - Sole implementer is replacing the compass with Claude C and Codex X quota icons, adding header/native minimize routing, and retaining sliver recovery only when needed. Existing polling results supply all data; no new provider request path. Parent inspected 22px and 32px icon previews: provider letters, quota numbers, unavailable question mark and cache dot are distinguishable. Tests/review remain pending; these previews are not deployment proof.
 - Task workflow passed 25 tests and generated-state check (13 tasks). Planning checkpoint `cc456d47cac3ae0b85aaebcaced5c25bb4ddb7c0` has green repository guard run 39144295197.
+
+## Local validation and review
+
+- Frozen implementation covers header and native minimize-to-tray, closed-manager preservation, two visible C/X quota icons from existing polling data, actual duration-selected Codex weekly quota, unavailable/error/reset/expiry states, cached age marking, hidden-window updates, shared existing menus, restore, host-loss fallback and shutdown. README explains usage. No adapter or new provider call was added.
+- Final full offline suite with isolated HOME passed **530 tests +31 subtests in 6.74s**, exit 0. Implementer widget suite passed **160 tests +24 subtests**; independent reviewer passed **28 focused tests +14 subtests** and approved the frozen diff without actionable findings. `git diff --check` passed. Receipt: `~/indicator-beta/minimize-tray-2026-10-18/full-tests-final.log`.
+- Final clean-install smoke passed 8 installed modules, help/version and an inert 340x753 widget, with HTTP/subprocess creation blocked (Python 3.13.9, PySide6 6.12.0). This second fresh install started after the last host-loss fix and validates the frozen source. Receipt and rendered image: `~/indicator-beta/minimize-tray-2026-10-18/install-validation-final.json` and `install-widget-final.png`. No live service was changed during installation tests.
+- Next: commit/push source and this task, observe exact-source Python/install plus repository guard CI, then restart the existing user service and verify native minimize/restore and both indicators. Runtime is still the pre-task process until that explicit deployment step.

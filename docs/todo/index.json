@@ -164,7 +164,7 @@
     "due": null,
     "updated": "2026-10-18",
     "owner": "agent",
-    "brief": "Fix minimize opening the terminal manager; expose both quotas in the tray, validate, push and restart the existing app.",
+    "brief": "Implemented, independently reviewed and locally validated; push, hosted CI and native service restart verification remain.",
     "refs": [
       "claude_widget.py",
       "tests/test_widget_ui.py"
