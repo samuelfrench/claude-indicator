@@ -18,3 +18,9 @@ test: null
 - Start: clean `master` equals `origin/master` at `0272298`; existing service active with PID 8248 and main-checkout ExecStart. Existing minimization uses an edge sliver and opens the terminal panel; tray currently displays a Smart TODO compass only.
 - No new provider adapter, direct authenticated probe, billing, account action, outreach or upstream contribution is needed. Existing provider refreshes continue normally when the app is restarted. External verification clock: hosted Python/install and repository guard runs after the code push. Native tray/window behavior must be checked after deployment.
 - Done means the requested behavior is implemented, tested, independently reviewed, pushed with green CI, deployed through the existing user service, and verified on the desktop; generated TODO and shared memory agree with those receipts.
+
+## October 18 implementation checkpoint
+
+- Native baseline: X11 tray host is present; main window mapped, terminal manager and edge sliver both unmapped. No live app interaction or restart yet. Private cropped baseline evidence is under `~/indicator-beta/minimize-tray-2026-10-18/`.
+- Sole implementer is replacing the compass with Claude C and Codex X quota icons, adding header/native minimize routing, and retaining sliver recovery only when needed. Existing polling results supply all data; no new provider request path. Parent inspected 22px and 32px icon previews: provider letters, quota numbers, unavailable question mark and cache dot are distinguishable. Tests/review remain pending; these previews are not deployment proof.
+- Task workflow passed 25 tests and generated-state check (13 tasks). Planning checkpoint `cc456d47cac3ae0b85aaebcaced5c25bb4ddb7c0` has green repository guard run 39144295197.
