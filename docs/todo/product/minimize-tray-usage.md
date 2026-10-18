@@ -5,7 +5,7 @@ area: product
 due: null
 updated: 2026-10-18
 owner: agent
-brief: "89cea8a pushed after local gates/review; hosted Python/install CI running, then restart and native verification."
+brief: "Hosted530+31 tests passed, then inherited Qt teardown crash139; fixing test cleanup before restart."
 refs: ["claude_widget.py", "tests/test_widget_ui.py"]
 test: null
 ---
@@ -35,5 +35,6 @@ test: null
 ## Pushed checkpoint
 
 - Source `89cea8a91e488d85a2501cba1e2ab32b5b31838d` is pushed to `origin/master`; working tree was clean after push. Widget SHA-256: `54228b9aec5e4a8491431af52f50f6c1026c062985d1d16220f6da3c3cd910a7`.
-- Exact-source repository guard [39144830445](https://github.com/samuelfrench/claude-indicator/actions/runs/39144830445) passed; Python/install [39144830504](https://github.com/samuelfrench/claude-indicator/actions/runs/39144830504) is live and running. Observe that existing run with `gh run view 39144830504 --json status,conclusion,jobs`; do not restart the app before it succeeds.
+- Exact-source repository guard [39144830445](https://github.com/samuelfrench/claude-indicator/actions/runs/39144830445) passed. Python/install [39144830504](https://github.com/samuelfrench/claude-indicator/actions/runs/39144830504) finished with **530 tests +31 subtests passed in 11.15s**, then `QObject: shared QObject was deleted directly` and interpreter segmentation fault (exit139); installation was skipped. Same teardown signature was previously recorded at `db215ed` in the completed promotion-research task. The failed receipt is retained at `~/indicator-beta/minimize-tray-2026-10-18/hosted-ci-failed.log`; reproduce with `gh run view 39144830504 --log-failed`.
+- Scoped prerequisite is now Qt test lifecycle diagnosis/cleanup to unblock actual full CI; no workflow failure suppression or provider work. Sole implementer owns this fix; independent review and renewed full gates follow. App restart remains pending until green CI.
 - Existing service is still active/running PID 8248 with 0 automatic restarts. Next after green CI: `systemctl --user restart claude-indicator.service`, verify changed PID/current source, use the real header minimize control, confirm main/terminal/sliver windows are unmapped and both quota icons visible, then restore from each icon and confirm manager stays closed. Capture only private app/tray crops and scoped service/error evidence under `~/indicator-beta/minimize-tray-2026-10-18/`.

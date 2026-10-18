@@ -6,7 +6,7 @@
 
 ## Now
 
-- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — 89cea8a pushed after local gates/review; hosted Python/install CI running, then restart and native verification. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
+- [ ] Minimize to tray with Claude 5-hour and Codex 7-day indicators — Hosted530+31 tests passed, then inherited Qt teardown crash139; fixing test cleanup before restart. · _product_ · [details](docs/todo/product/minimize-tray-usage.md)
 
 ## Waiting on Sam
 

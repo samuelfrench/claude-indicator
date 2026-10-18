@@ -164,7 +164,7 @@
     "due": null,
     "updated": "2026-10-18",
     "owner": "agent",
-    "brief": "89cea8a pushed after local gates/review; hosted Python/install CI running, then restart and native verification.",
+    "brief": "Hosted530+31 tests passed, then inherited Qt teardown crash139; fixing test cleanup before restart.",
     "refs": [
       "claude_widget.py",
       "tests/test_widget_ui.py"
