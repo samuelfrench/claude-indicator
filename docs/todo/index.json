@@ -164,7 +164,7 @@
     "due": null,
     "updated": "2026-10-18",
     "owner": "agent",
-    "brief": "78f8448 pushed;531+31 tests and compatible fresh install passed locally; hosted CI running before app restart.",
+    "brief": "Green531+31 CI; app restarted and native tray behavior verified; final GNOME restore-help copy clarification underway.",
     "refs": [
       "claude_widget.py",
       "tests/test_widget_ui.py"

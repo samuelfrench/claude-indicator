@@ -10142,7 +10142,7 @@ class ClaudeWidget(QWidget):
                 self._tray_icon_states[label] = icon_state
             cached_note = "\nAmber dot: cached usage" if state.cached else ""
             tray.setToolTip(
-                f"{state.detail}{cached_note}\nClick to show/hide Claude Indicator"
+                f"{state.detail}{cached_note}\nTray menu: Show/Hide to restore Claude Indicator"
                 f"\n{self._todo_tray_summary} · right-click for menu"
             )
 
