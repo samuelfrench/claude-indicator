@@ -78,6 +78,24 @@
     "test": "tests/test_cursor_usage.py; tests/test_widget_ui.py"
   },
   {
+    "path": "docs/todo/done/product/minimize-tray-usage.md",
+    "slug": "minimize-tray-usage",
+    "title": "Minimize to tray with Claude 5-hour and Codex 7-day indicators",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-18",
+    "owner": "agent",
+    "brief": "Shipped b87256d; green531+31 CI, real tray/minimize/restore/update proof, existing app restarted.",
+    "refs": [
+      "claude_widget.py",
+      "tests/test_widget_ui.py",
+      "tests/test_widget_runtime.py",
+      "b87256ddebfc3138d0eff237609826d38d0b64ca"
+    ],
+    "test": "QT_QPA_PLATFORM=offscreen python3 -m pytest -q; python3 scripts/verify_install.py"
+  },
+  {
     "path": "docs/todo/done/product/promo-channel-research-2026-10-08.md",
     "slug": "promo-channel-research-2026-10-08",
     "title": "Alternative Indicator promotion channels: research only",
@@ -107,6 +125,22 @@
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
     "test": "journalctl --user -u claude-indicator.service"
+  },
+  {
+    "path": "docs/todo/infra/portable-python-install-verifier.md",
+    "slug": "portable-python-install-verifier",
+    "title": "Fresh-install verifier copies uv standalone Python incorrectly",
+    "status": "known-failure",
+    "area": "infra",
+    "due": null,
+    "updated": "2026-10-18",
+    "owner": "agent",
+    "brief": "Local uv Python3.10 copied-venv bootstrap fails before install; symlink bootstrap and unmodified hosted verifier pass.",
+    "refs": [
+      "scripts/verify_install.py",
+      "docs/todo/done/product/minimize-tray-usage.md"
+    ],
+    "test": "python scripts/verify_install.py under uv standalone Python3.10"
   },
   {
     "path": "docs/todo/product/beta-recruiting-replies.md",
@@ -154,22 +188,6 @@
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
     "test": "tests/test_widget_ui.py Grok billing has no weekly or on-demand meter"
-  },
-  {
-    "path": "docs/todo/product/minimize-tray-usage.md",
-    "slug": "minimize-tray-usage",
-    "title": "Minimize to tray with Claude 5-hour and Codex 7-day indicators",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-10-18",
-    "owner": "agent",
-    "brief": "Green531+31 CI; app restarted and native tray behavior verified; final GNOME restore-help copy clarification underway.",
-    "refs": [
-      "claude_widget.py",
-      "tests/test_widget_ui.py"
-    ],
-    "test": null
   },
   {
     "path": "docs/todo/product/paid-release-source-and-license-decisions.md",
