@@ -13,6 +13,34 @@ from scripts import indicator_service
 from widget_runtime import InstanceLock, notify, watchdog_interval
 
 
+def test_qt_void_calls_preserve_none_references_and_exit_cleanly(tmp_path):
+    """Catch ABI wheel regressions that can pass assertions then abort at exit."""
+    code = """
+import sys
+import PySide6
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QApplication
+app = QApplication([])
+font = QFont()
+font.setPixelSize(12)
+before = sys.getrefcount(None)
+for _ in range(1000):
+    font.setPixelSize(12)
+after = sys.getrefcount(None)
+assert after >= before, (
+    f'PySide6 {PySide6.__version__} on Python {sys.version.split()[0]} '
+    f'lost {before - after} None references during 1000 void Qt calls'
+)
+app.shutdown()
+"""
+    env = dict(os.environ, HOME=str(tmp_path), QT_QPA_PLATFORM="offscreen")
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=env,
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_instance_lock_released_on_process_death(tmp_path):
     path = tmp_path / "widget.lock"
     code = """

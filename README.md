@@ -16,6 +16,8 @@ Installation creates the `claude-indicator` command. It does not launch the widg
 
 The beta supports **Linux with X11 or XWayland**, tested on Ubuntu/GNOME. It depends on Linux `/proc` and `/sys`; macOS, Windows and native Wayland are unsupported. Under Wayland, XWayland and a valid `DISPLAY` are required for reliable positioning and terminal navigation. On Ubuntu, Qt requires the EGL runtime (`sudo apt-get install libegl1`), including for offscreen tests; graphical sessions may also need XCB libraries such as `libxcb-cursor0`. GNOME Terminal supports exact TTY selection; other terminal emulators use a limited best-effort path. NVIDIA, Ollama, ComfyUI, systemd and individual AI CLIs are optional features rather than installation requirements.
 
+On Python 3.10 and 3.11, installation excludes PySide6 6.12.0 to avoid a wheel reference-counting crash. The Qt team records the related ABI incompatibility as PYSIDE-3424 in its [development notes](https://wiki.qt.io/Qt_for_Python_Development_Notes#20._August_2026).
+
 Use the [beta signup form](https://github.com/samuelfrench/claude-indicator/issues/new?template=beta-signup.yml) to share your paid AI plans, wanted providers and OS, and the [beta feedback form](https://github.com/samuelfrench/claude-indicator/issues/new?template=beta-feedback.yml) for what worked and broke. Issues are public: omit tokens, account identifiers, private tasks and unredacted logs/screenshots. Permission to quote feedback is optional and unchecked by default.
 
 ## Provider data and credentials
