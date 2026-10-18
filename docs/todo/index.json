@@ -156,6 +156,22 @@
     "test": "tests/test_widget_ui.py Grok billing has no weekly or on-demand meter"
   },
   {
+    "path": "docs/todo/product/minimize-tray-usage.md",
+    "slug": "minimize-tray-usage",
+    "title": "Minimize to tray with Claude 5-hour and Codex 7-day indicators",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-18",
+    "owner": "agent",
+    "brief": "Fix minimize opening the terminal manager; expose both quotas in the tray, validate, push and restart the existing app.",
+    "refs": [
+      "claude_widget.py",
+      "tests/test_widget_ui.py"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/paid-release-source-and-license-decisions.md",
     "slug": "paid-release-source-and-license-decisions",
     "title": "Resolve provider sources and license before a later paid release",
