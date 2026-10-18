@@ -164,7 +164,7 @@
     "due": null,
     "updated": "2026-10-18",
     "owner": "agent",
-    "brief": "Implemented, independently reviewed and locally validated; push, hosted CI and native service restart verification remain.",
+    "brief": "89cea8a pushed after local gates/review; hosted Python/install CI running, then restart and native verification.",
     "refs": [
       "claude_widget.py",
       "tests/test_widget_ui.py"

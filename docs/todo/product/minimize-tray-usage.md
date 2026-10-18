@@ -5,7 +5,7 @@ area: product
 due: null
 updated: 2026-10-18
 owner: agent
-brief: "Implemented, independently reviewed and locally validated; push, hosted CI and native service restart verification remain."
+brief: "89cea8a pushed after local gates/review; hosted Python/install CI running, then restart and native verification."
 refs: ["claude_widget.py", "tests/test_widget_ui.py"]
 test: null
 ---
@@ -31,3 +31,9 @@ test: null
 - Final full offline suite with isolated HOME passed **530 tests +31 subtests in 6.74s**, exit 0. Implementer widget suite passed **160 tests +24 subtests**; independent reviewer passed **28 focused tests +14 subtests** and approved the frozen diff without actionable findings. `git diff --check` passed. Receipt: `~/indicator-beta/minimize-tray-2026-10-18/full-tests-final.log`.
 - Final clean-install smoke passed 8 installed modules, help/version and an inert 340x753 widget, with HTTP/subprocess creation blocked (Python 3.13.9, PySide6 6.12.0). This second fresh install started after the last host-loss fix and validates the frozen source. Receipt and rendered image: `~/indicator-beta/minimize-tray-2026-10-18/install-validation-final.json` and `install-widget-final.png`. No live service was changed during installation tests.
 - Next: commit/push source and this task, observe exact-source Python/install plus repository guard CI, then restart the existing user service and verify native minimize/restore and both indicators. Runtime is still the pre-task process until that explicit deployment step.
+
+## Pushed checkpoint
+
+- Source `89cea8a91e488d85a2501cba1e2ab32b5b31838d` is pushed to `origin/master`; working tree was clean after push. Widget SHA-256: `54228b9aec5e4a8491431af52f50f6c1026c062985d1d16220f6da3c3cd910a7`.
+- Exact-source repository guard [39144830445](https://github.com/samuelfrench/claude-indicator/actions/runs/39144830445) passed; Python/install [39144830504](https://github.com/samuelfrench/claude-indicator/actions/runs/39144830504) is live and running. Observe that existing run with `gh run view 39144830504 --json status,conclusion,jobs`; do not restart the app before it succeeds.
+- Existing service is still active/running PID 8248 with 0 automatic restarts. Next after green CI: `systemctl --user restart claude-indicator.service`, verify changed PID/current source, use the real header minimize control, confirm main/terminal/sliver windows are unmapped and both quota icons visible, then restore from each icon and confirm manager stays closed. Capture only private app/tray crops and scoped service/error evidence under `~/indicator-beta/minimize-tray-2026-10-18/`.
