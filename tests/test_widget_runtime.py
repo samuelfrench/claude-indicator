@@ -13,6 +13,21 @@ from scripts import indicator_service
 from widget_runtime import InstanceLock, notify, watchdog_interval
 
 
+def test_widget_import_does_not_load_retired_smart_todo_modules(tmp_path):
+    code = """
+import sys
+import claude_widget
+assert 'smart_todos' not in sys.modules
+assert 'smart_todo_workflow' not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=dict(os.environ, HOME=str(tmp_path), QT_QPA_PLATFORM="offscreen"),
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_qt_void_calls_preserve_none_references_and_exit_cleanly(tmp_path):
     """Catch ABI wheel regressions that can pass assertions then abort at exit."""
     code = """

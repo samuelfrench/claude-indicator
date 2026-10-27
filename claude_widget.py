@@ -60,7 +60,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from smart_todos import SmartTodoDialog
 from terminal_recovery import TerminalRecoveryStore, scan_terminals
 from terminal_recovery_ui import TerminalRecoveryDialog, local_time
 from widget_runtime import InstanceLock, QtServiceRuntime
@@ -8609,10 +8608,7 @@ class ClaudeWidget(QWidget):
         self._tray: QSystemTrayIcon | None = None
         self._codex_tray: QSystemTrayIcon | None = None
         self._tray_icon_states: dict[str, tuple] = {}
-        self._todo_tray_summary = "Smart TODOs"
         self._minimize_pending_tray = False
-        self._smart_todo_action: QAction | None = None
-        self._smart_todo_dialog: SmartTodoDialog | None = None
         self._shutdown_started = False
         self._tray_unavailable_logged = False
         self._tray_retry_timer = QTimer(self)
@@ -9998,9 +9994,6 @@ class ClaudeWidget(QWidget):
         self._codex_tray.activated.connect(self._on_tray_activated)
 
         menu = QMenu(self)
-        self._smart_todo_action = QAction("Smart TODOs…", self)
-        self._smart_todo_action.triggered.connect(self._show_smart_todos)
-        menu.addAction(self._smart_todo_action)
         traffic_report_action = QAction("Traffic Report", self)
         traffic_report_action.triggered.connect(self._open_traffic_report)
         menu.addAction(traffic_report_action)
@@ -10143,7 +10136,7 @@ class ClaudeWidget(QWidget):
             cached_note = "\nAmber dot: cached usage" if state.cached else ""
             tray.setToolTip(
                 f"{state.detail}{cached_note}\nTray menu: Show/Hide to restore Claude Indicator"
-                f"\n{self._todo_tray_summary} · right-click for menu"
+                "\nRight-click for menu"
             )
 
     def _open_traffic_report(self):
@@ -10153,20 +10146,6 @@ class ClaudeWidget(QWidget):
                 f"Could not open Traffic Report.\nOpen {TRAFFIC_REPORT_URL} in your browser.",
                 msecShowTime=5000,
             )
-
-    def _show_smart_todos(self):
-        if self._smart_todo_dialog is None:
-            self._smart_todo_dialog = SmartTodoDialog(parent=self)
-            self._smart_todo_dialog.summary_changed.connect(
-                self._on_todo_summary_changed
-            )
-        self._smart_todo_dialog.show_and_refresh()
-        self._smart_todo_dialog.raise_()
-        self._smart_todo_dialog.activateWindow()
-
-    def _on_todo_summary_changed(self, focus_count: int, overdue_count: int):
-        self._todo_tray_summary = f"Smart TODOs · {focus_count} focus · {overdue_count} overdue"
-        self._update_tray_quotas()
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -10321,11 +10300,6 @@ class ClaudeWidget(QWidget):
             if not worker.wait(remaining_ms):
                 self._shutdown_workers_pending = True
                 log_line(f"shutdown: {type(worker).__name__} did not stop before deadline")
-        if self._smart_todo_dialog is not None:
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            if not self._smart_todo_dialog.shutdown(timeout_ms=remaining_ms):
-                self._shutdown_workers_pending = True
-                log_line("shutdown: SmartTodo scan did not stop before deadline")
 
     def closeEvent(self, event):
         if self._tray is not None:

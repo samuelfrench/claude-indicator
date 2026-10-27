@@ -1,6 +1,6 @@
 # Claude Indicator development context
 
-Claude Indicator is a Linux PySide6 desktop widget. `claude_widget.py` contains provider clients, local readers, painted rows, worker timers and the main widget. `smart_todos.py` plus `smart_todo_workflow.py` contain the local TODO command center and state; `terminal_recovery.py` plus `terminal_recovery_ui.py` contain private terminal inventory and recovery UI. `widget_runtime.py` contains process singleton locking and optional systemd readiness/watchdog behavior. `indicator_cli.py` provides the packaged command and performs help/version handling before Qt imports.
+Claude Indicator is a Linux PySide6 desktop widget. `claude_widget.py` contains provider clients, local readers, painted rows, worker timers and the main widget. Smart TODO is retired at Sam's request: the widget must not import `smart_todos.py` or `smart_todo_workflow.py`, expose its GUI or start its scanner. Those modules remain dormant for compatibility; preserve existing task files and workflow state. `terminal_recovery.py` plus `terminal_recovery_ui.py` contain private terminal inventory and recovery UI. `widget_runtime.py` contains process singleton locking and optional systemd readiness/watchdog behavior. `indicator_cli.py` provides the packaged command and performs help/version handling before Qt imports.
 
 ## Task tracking
 

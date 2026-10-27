@@ -1693,36 +1693,12 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(widget.model_bars, [])
         self.assertEqual(widget.height(), 20)
 
-    class _FakeSignal:
-        def __init__(self):
-            self.slot = None
-
-        def connect(self, slot):
-            self.slot = slot
-
-        def emit(self, *args):
-            if self.slot is not None:
-                self.slot(*args)
-
-    class _FakeSmartTodoDialog:
-        def __init__(self, *, parent=None):
-            self.parent = parent
-            self.summary_changed = WidgetUiTest._FakeSignal()
-            self.show_and_refresh = Mock()
-            self.raise_ = Mock()
-            self.activateWindow = Mock()
-            self.shutdown = Mock()
-
     def _make_inert_claude_widget(
         self,
         *,
         tray_available: bool = False,
-        smart_todo_dialog_factory=None,
         visibility=None,
     ):
-        dialog_factory = smart_todo_dialog_factory or Mock(
-            side_effect=self._FakeSmartTodoDialog
-        )
         vis_dir = tempfile.TemporaryDirectory()
         self.addCleanup(vis_dir.cleanup)
         vis_path = Path(vis_dir.name) / "widget_visibility.json"
@@ -1758,7 +1734,6 @@ class WidgetUiTest(unittest.TestCase):
             ),
             patch.object(ClaudeWidget, "_fetch_ollama", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_comfyui", lambda self: None),
-            patch.object(claude_widget, "SmartTodoDialog", dialog_factory),
         ]
         for active_patch in patches:
             active_patch.start()
@@ -2118,16 +2093,18 @@ class WidgetUiTest(unittest.TestCase):
             widget._update_countdowns()
         self.assertIn("quota snapshot expired", widget._codex_tray.toolTip())
 
-    def test_claude_tray_menu_places_smart_todos_first(self):
+    def test_quota_tray_menus_exclude_retired_smart_todos(self):
         widget = self._make_inert_claude_widget(tray_available=True)
 
-        actions = widget._tray.contextMenu().actions()
-
-        self.assertEqual(
-            [action.text() for action in actions],
-            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
-        )
-        self.assertTrue(actions[5].isSeparator())
+        for tray in (widget._tray, widget._codex_tray):
+            actions = tray.contextMenu().actions()
+            self.assertEqual(
+                [action.text() for action in actions],
+                ["Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
+            )
+            self.assertTrue(actions[4].isSeparator())
+        self.assertFalse(hasattr(widget, "_smart_todo_dialog"))
+        self.assertFalse(hasattr(widget, "_show_smart_todos"))
 
     def test_quota_trays_have_distinct_windows_and_share_the_existing_menu(self):
         widget = self._make_inert_claude_widget(tray_available=True)
@@ -2136,49 +2113,20 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertIn("Claude 5-hour usage: unavailable", widget._tray.toolTip())
         self.assertIn("Codex 7-day usage: unavailable", widget._codex_tray.toolTip())
-        self.assertIn("Smart TODOs", widget._tray.toolTip())
+        for tray in (widget._tray, widget._codex_tray):
+            self.assertNotIn("TODO", tray.toolTip())
         self.assertIs(widget._tray.contextMenu(), widget._codex_tray.contextMenu())
         self.assertTrue(widget._tray.isVisible())
         self.assertTrue(widget._codex_tray.isVisible())
         self.assertFalse(widget._tray.icon().isNull())
         self.assertFalse(widget._codex_tray.icon().isNull())
 
-    def test_smart_todo_action_creates_one_dialog_and_reuses_it(self):
-        dialog_factory = Mock(side_effect=self._FakeSmartTodoDialog)
-        widget = self._make_inert_claude_widget(
-            tray_available=True,
-            smart_todo_dialog_factory=dialog_factory,
-        )
-
-        widget._smart_todo_action.trigger()
-        dialog = widget._smart_todo_dialog
-        widget._smart_todo_action.trigger()
-
-        dialog_factory.assert_called_once_with(parent=widget)
-        self.assertIsNotNone(dialog)
-        self.assertIs(widget._smart_todo_dialog, dialog)
-        self.assertEqual(dialog.show_and_refresh.call_count, 2)
-        self.assertEqual(dialog.raise_.call_count, 2)
-        self.assertEqual(dialog.activateWindow.call_count, 2)
-
-    def test_smart_todo_summary_updates_tray_tooltip(self):
-        widget = self._make_inert_claude_widget(tray_available=True)
-        widget._smart_todo_action.trigger()
-
-        widget._smart_todo_dialog.summary_changed.emit(7, 2)
-
-        self.assertIn("Claude 5-hour usage", widget._tray.toolTip())
-        self.assertIn("Codex 7-day usage", widget._codex_tray.toolTip())
-        for tray in (widget._tray, widget._codex_tray):
-            self.assertIn("Smart TODOs · 7 focus · 2 overdue", tray.toolTip())
-
-    def test_tray_unavailable_does_not_create_smart_todo_action(self):
+    def test_tray_unavailable_does_not_create_controls(self):
         widget = self._make_inert_claude_widget(tray_available=False)
 
         self.assertIsNone(widget._tray)
         self.assertIsNone(widget._codex_tray)
-        self.assertIsNone(widget._smart_todo_action)
-        self.assertIsNone(widget._smart_todo_dialog)
+        self.assertFalse(hasattr(widget, "_smart_todo_dialog"))
 
     def test_tray_unavailable_retries_and_creates_controls_exactly_once(self):
         available = [False]
@@ -2198,13 +2146,13 @@ class WidgetUiTest(unittest.TestCase):
         self.assertFalse(retry_timer.isActive())
         self.assertEqual(
             [action.text() for action in tray.contextMenu().actions()],
-            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
+            ["Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
         )
 
         retry_timer.timeout.emit()
 
         self.assertIs(widget._tray, tray)
-        self.assertEqual(len(tray.contextMenu().actions()), 7)
+        self.assertEqual(len(tray.contextMenu().actions()), 6)
         self.assertEqual(len(widget.findChildren(QSystemTrayIcon)), 2)
 
     def test_minimize_fallback_moves_into_tray_when_host_becomes_available(self):
@@ -2322,12 +2270,10 @@ class WidgetUiTest(unittest.TestCase):
 
         self.assertFalse(retry_timer.isActive())
         self.assertIsNone(widget._tray)
-        self.assertIsNone(widget._smart_todo_action)
+        self.assertIsNone(widget._codex_tray)
 
-    def test_close_and_application_shutdown_stop_dialog_exactly_once(self):
+    def test_close_and_application_shutdown_finish_without_smart_todo_dialog(self):
         widget = self._make_inert_claude_widget(tray_available=False)
-        dialog = self._FakeSmartTodoDialog(parent=widget)
-        widget._smart_todo_dialog = dialog
 
         class Event:
             accepted = False
@@ -2340,10 +2286,9 @@ class WidgetUiTest(unittest.TestCase):
         widget.shutdown()
 
         self.assertTrue(event.accepted)
-        dialog.shutdown.assert_called_once()
-        timeout_ms = dialog.shutdown.call_args.kwargs["timeout_ms"]
-        self.assertGreaterEqual(timeout_ms, 0)
-        self.assertLessEqual(timeout_ms, 16_000)
+        self.assertTrue(widget._shutdown_started)
+        self.assertFalse(widget._shutdown_workers_pending)
+        self.assertFalse(hasattr(widget, "_smart_todo_dialog"))
 
     def test_widget_grows_when_model_limit_bar_appears(self):
         widget = self._make_inert_claude_widget()
@@ -3554,15 +3499,6 @@ class WidgetUiTest(unittest.TestCase):
             widget.shutdown()
         self.assertTrue(widget._shutdown_workers_pending)
 
-    def test_shutdown_gives_smart_todo_remaining_deadline_and_marks_timeout(self):
-        widget = self._make_inert_claude_widget(tray_available=False)
-        widget._smart_todo_dialog = Mock()
-        widget._smart_todo_dialog.shutdown.return_value = False
-        with patch.object(claude_widget.time, "monotonic", side_effect=[100, 116]), patch.object(claude_widget, "log_line"):
-            widget.shutdown()
-        widget._smart_todo_dialog.shutdown.assert_called_once_with(timeout_ms=0)
-        self.assertTrue(widget._shutdown_workers_pending)
-
     def test_load_widget_visibility_defaults_and_ignores_unknown_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             missing = Path(tmpdir) / "missing.json"
@@ -3670,7 +3606,7 @@ class WidgetUiTest(unittest.TestCase):
         actions = widget._tray.contextMenu().actions()
         self.assertEqual(
             [action.text() for action in actions],
-            ["Smart TODOs…", "Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
+            ["Traffic Report", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
         )
         menu = QMenu()
         widget._populate_config_menu(menu)
@@ -3735,9 +3671,7 @@ class WindowDragTest(unittest.TestCase):
             self.accepted = True
 
     def _widget(self, platform_name, system_move_result):
-        widget = WidgetUiTest._make_inert_claude_widget(
-            self, smart_todo_dialog_factory=Mock()
-        )
+        widget = WidgetUiTest._make_inert_claude_widget(self)
         started = []
 
         class _Handle:
