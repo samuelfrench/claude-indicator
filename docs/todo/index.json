@@ -111,6 +111,23 @@
     "test": null
   },
   {
+    "path": "docs/todo/done/product/retire-smart-todo.md",
+    "slug": "retire-smart-todo",
+    "title": "Retire unused Smart TODO GUI and scanner integration",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-26",
+    "owner": "agent",
+    "brief": "Smart TODO retired and live; 529 tests plus 31 subtests, 25 task tests, clean install and CI passed.",
+    "refs": [
+      "claude_widget.py",
+      "smart_todos.py",
+      "smart_todo_workflow.py"
+    ],
+    "test": "QT_QPA_PLATFORM=offscreen python3 -m pytest -q; python3 scripts/verify_install.py"
+  },
+  {
     "path": "docs/todo/infra/child-notify-socket.md",
     "slug": "child-notify-socket",
     "title": "Child processes inherit the systemd notification socket",
@@ -203,23 +220,6 @@
       "docs/beta/provider-terms-check.md",
       "docs/beta/privacy-audit.md",
       "do.md"
-    ],
-    "test": null
-  },
-  {
-    "path": "docs/todo/product/retire-smart-todo.md",
-    "slug": "retire-smart-todo",
-    "title": "Retire unused Smart TODO GUI and scanner integration",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-10-26",
-    "owner": "agent",
-    "brief": "Remove Smart TODO from the running indicator and future starts; verify no separate scheduler or model calls.",
-    "refs": [
-      "claude_widget.py",
-      "smart_todos.py",
-      "smart_todo_workflow.py"
     ],
     "test": null
   },
