@@ -5,6 +5,7 @@ area: product
 due: null
 updated: 2026-10-26
 owner: agent
+test: null
 brief: Remove Smart TODO from the running indicator and future starts; verify no separate scheduler or model calls.
 refs:
   - claude_widget.py

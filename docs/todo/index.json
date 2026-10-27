@@ -207,6 +207,23 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/retire-smart-todo.md",
+    "slug": "retire-smart-todo",
+    "title": "Retire unused Smart TODO GUI and scanner integration",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-26",
+    "owner": "agent",
+    "brief": "Remove Smart TODO from the running indicator and future starts; verify no separate scheduler or model calls.",
+    "refs": [
+      "claude_widget.py",
+      "smart_todos.py",
+      "smart_todo_workflow.py"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/session-notification-ideas.md",
     "slug": "session-notification-ideas",
     "title": "Session notifications and local token-source ideas",
