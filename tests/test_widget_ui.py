@@ -3010,6 +3010,15 @@ class WidgetUiTest(unittest.TestCase):
         with patch.object(claude_widget, "deepseek_pricing_status", return_value="OFF-PEAK"):
             row._pricing_timer.timeout.emit()
         self.assertEqual(row._pricing_status, "OFF-PEAK")
+        with patch.object(claude_widget.time, "time", return_value=1793241000):
+            row._pricing_timer.timeout.emit()
+        self.assertEqual(row._pricing_clock, "NOW 02:30:00 UTC")
+        self.assertIn("NOW 02:30:00 UTC", row.toolTip())
+        with patch.object(claude_widget.time, "time", return_value=1793241001):
+            row._pricing_timer.timeout.emit()
+        self.assertEqual(row._pricing_clock, "NOW 02:30:01 UTC")
+        with patch.object(claude_widget, "deepseek_pricing_status", return_value="OFF-PEAK"):
+            row._refresh_pricing()
         self.assertIn("Direct API pricing now: OFF-PEAK", row.toolTip())
         row.resize(340, row.height())
         self.assertFalse(row.grab().isNull())
@@ -3403,16 +3412,16 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(widget.width(), 340)
 
     def _assert_cursor_panel_budget(self, widget):
-        # Keep the existing providers' 860px budget; Cursor contributes exactly
-        # one 44px row plus the existing layout spacing, not unbounded growth.
+        # Existing 860px provider budget plus 30px for visible DeepSeek windows/clock;
+        # Cursor contributes exactly one 44px row plus layout spacing.
         cursor_height = CursorUsageRow._COLLAPSED_H
         spacing = widget._cursor_row.parentWidget().layout().spacing()
         self.assertEqual(widget._cursor_row.height(), cursor_height)
         with_cursor = widget.height()
-        self.assertLessEqual(with_cursor, 860 + cursor_height + spacing)
+        self.assertLessEqual(with_cursor, 890 + cursor_height + spacing)
         widget._set_provider_visible("cursor", False)
         QApplication.processEvents()
-        self.assertLessEqual(widget.height(), 860)
+        self.assertLessEqual(widget.height(), 890)
         self.assertEqual(with_cursor - widget.height(), cursor_height + spacing)
         widget._set_provider_visible("cursor", True)
         QApplication.processEvents()

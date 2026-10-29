@@ -219,6 +219,21 @@
     "test": "tests/test_widget_ui.py -k deepseek"
   },
   {
+    "path": "docs/todo/product/deepseek-pricing-clock.md",
+    "slug": "deepseek-pricing-clock",
+    "title": "DeepSeek pricing windows and current clock",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-28",
+    "owner": "agent",
+    "brief": "Add visible UTC windows and live current time beside pricing status.",
+    "refs": [
+      "docs/todo/done/product/deepseek-pricing.md"
+    ],
+    "test": "tests/test_widget_ui.py -k deepseek"
+  },
+  {
     "path": "docs/todo/product/grok-missing-meter.md",
     "slug": "grok-missing-meter",
     "title": "Grok billing response can omit a usage meter",

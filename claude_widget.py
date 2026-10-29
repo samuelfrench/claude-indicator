@@ -6090,8 +6090,8 @@ def deepseek_pricing_status(now: float | None = None) -> str:
 class DeepSeekUsageRow(QWidget):
     """Compact DeepSeek spend and current-credit row with source disclosure."""
 
-    _COLLAPSED_H = 30
-    _EXPANDED_H = 88
+    _COLLAPSED_H = 60
+    _EXPANDED_H = 118
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6106,7 +6106,9 @@ class DeepSeekUsageRow(QWidget):
         self._refresh_pricing()
 
     def _refresh_pricing(self):
-        self._pricing_status = deepseek_pricing_status()
+        now = time.time()
+        self._pricing_status = deepseek_pricing_status(now)
+        self._pricing_clock = datetime.fromtimestamp(now, timezone.utc).strftime("NOW %H:%M:%S UTC")
         self.setToolTip(self._tooltip(self._summary))
         self.update()
 
@@ -6146,6 +6148,7 @@ class DeepSeekUsageRow(QWidget):
     def _tooltip(self, summary: DeepSeekUsageSummary | None) -> str:
         lines = [
             f"Direct API pricing now: {self._pricing_status} (local clock schedule).",
+            self._pricing_clock,
             "deepseek-flash / deepseek-v4-pro: peak Mon–Fri 01:00–04:00 and "
             "06:00–10:00 UTC, excluding Chinese public holidays; off-peak is half peak.",
             "2026 holiday calendar included; future unverified peak windows show CHECK CALENDAR.",
@@ -6202,6 +6205,12 @@ class DeepSeekUsageRow(QWidget):
         painter.setPen(QColor(234, 179, 8) if self._pricing_status != "OFF-PEAK"
                        else QColor(74, 222, 128))
         painter.drawText(4, 26, self._pricing_status)
+        painter.setPen(QColor(180, 180, 200))
+        clock_width = painter.fontMetrics().horizontalAdvance(self._pricing_clock)
+        painter.drawText(self.width() - clock_width - 4, 26, self._pricing_clock)
+        painter.drawText(4, 40, "PEAK 01:00–04:00 / 06:00–10:00 UTC")
+        painter.setPen(QColor(140, 140, 160))
+        painter.drawText(4, 54, "Mon–Fri · except Chinese public holidays")
         painter.setFont(font)
 
         summary = self._summary
@@ -6213,7 +6222,7 @@ class DeepSeekUsageRow(QWidget):
             right_color = QColor(234, 179, 8)
         painter.setPen(right_color)
         fm = painter.fontMetrics()
-        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 18, right)
+        painter.drawText(self.width() - fm.horizontalAdvance(right) - 4, 12, right)
 
         if self._expanded:
             painter.setFont(QFont("sans-serif", 7))
@@ -6221,18 +6230,18 @@ class DeepSeekUsageRow(QWidget):
             source = "OpenCode only" if summary and summary.spend_source == "opencode" else "balance estimate"
             if not summary or not summary.spend_source:
                 source = "unavailable"
-            painter.drawText(8, 40, f"24H SPEND   {spend}   ·   {source}")
+            painter.drawText(8, 70, f"24H SPEND   {spend}   ·   {source}")
             balance_source = "live API" if summary and summary.balance_source == "live" else "last snapshot"
             if summary and summary.balance_source == "snapshot":
                 balance_source += f" · {self._snapshot_age_text(summary)}"
             if not summary or not summary.balance_source:
                 balance_source = "unavailable"
-            painter.drawText(8, 58, f"CREDIT      {credit}   ·   {balance_source}")
+            painter.drawText(8, 88, f"CREDIT      {credit}   ·   {balance_source}")
             coverage = summary.spend_coverage_s / 3600 if summary else 0
             detail = f"COVERAGE    {min(24, coverage):.1f}h"
             if summary and summary.spend_source == "opencode":
                 detail += f"   ·   {summary.spend_message_count:,} messages"
-            painter.drawText(8, 76, detail)
+            painter.drawText(8, 106, detail)
         painter.end()
 
 
