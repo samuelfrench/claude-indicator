@@ -191,6 +191,19 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/deepseek-pricing.md",
+    "slug": "deepseek-pricing",
+    "title": "DeepSeek peak/off-peak pricing in overlay",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-28",
+    "owner": "agent",
+    "brief": "Implement direct-API pricing schedule label with offline clock refresh.",
+    "refs": [],
+    "test": "tests/test_widget_ui.py -k deepseek"
+  },
+  {
     "path": "docs/todo/product/grok-missing-meter.md",
     "slug": "grok-missing-meter",
     "title": "Grok billing response can omit a usage meter",

@@ -2978,6 +2978,44 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(spent, Decimal("8"))
         self.assertEqual(coverage, 24 * 3600)
 
+    def test_deepseek_pricing_schedule_boundaries_and_holidays(self):
+        cases = {
+            "2026-10-28T00:59:59+00:00": "OFF-PEAK",
+            "2026-10-28T01:00:00+00:00": "PEAK",
+            "2026-10-28T03:59:59+00:00": "PEAK",
+            "2026-10-28T04:00:00+00:00": "OFF-PEAK",
+            "2026-10-28T05:59:59+00:00": "OFF-PEAK",
+            "2026-10-28T06:00:00+00:00": "PEAK",
+            "2026-10-28T09:59:59+00:00": "PEAK",
+            "2026-10-28T10:00:00+00:00": "OFF-PEAK",
+            "2026-10-31T02:00:00+00:00": "OFF-PEAK",
+            "2026-10-10T02:00:00+00:00": "OFF-PEAK",  # makeup working Saturday
+            "2026-10-01T02:00:00+00:00": "OFF-PEAK",  # National Day
+            "2026-02-23T07:00:00+00:00": "OFF-PEAK",  # Spring Festival
+            "2026-02-24T07:00:00+00:00": "PEAK",
+            "2027-01-04T02:00:00+00:00": "CHECK CALENDAR",
+            "2027-01-04T12:00:00+00:00": "OFF-PEAK",
+        }
+        for instant, expected in cases.items():
+            with self.subTest(instant=instant):
+                stamp = claude_widget.datetime.fromisoformat(instant).timestamp()
+                self.assertEqual(claude_widget.deepseek_pricing_status(stamp), expected)
+
+    def test_deepseek_pricing_refreshes_without_provider_data(self):
+        with patch.object(claude_widget, "deepseek_pricing_status", return_value="PEAK"):
+            row = DeepSeekUsageRow()
+        self.assertEqual(row._pricing_status, "PEAK")
+        self.assertIn("Direct API pricing now: PEAK", row.toolTip())
+        self.assertTrue(row._pricing_timer.isActive())
+        with patch.object(claude_widget, "deepseek_pricing_status", return_value="OFF-PEAK"):
+            row._pricing_timer.timeout.emit()
+        self.assertEqual(row._pricing_status, "OFF-PEAK")
+        self.assertIn("Direct API pricing now: OFF-PEAK", row.toolTip())
+        row.resize(340, row.height())
+        self.assertFalse(row.grab().isNull())
+        row.mousePressEvent(Mock())
+        self.assertFalse(row.grab().isNull())
+
     def test_deepseek_row_discloses_local_only_spend_and_live_credit(self):
         row = DeepSeekUsageRow()
         summary = DeepSeekUsageSummary(

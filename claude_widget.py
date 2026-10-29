@@ -6063,6 +6063,30 @@ def _resize_parent(widget: QWidget) -> None:
         parent = parent.parent() if hasattr(parent, "parent") else None
 
 
+# Direct API schedule verified 2026-10-28; calendar dates are Beijing dates.
+# https://api-docs.deepseek.com/quick_start/pricing/
+# https://www.beijing.gov.cn/cs/gncs/zcwj/202603/t20260327_4568275.html
+_DEEPSEEK_HOLIDAYS = {
+    2026: ((1, 1, 3), (2, 15, 23), (4, 4, 6), (5, 1, 5),
+           (6, 19, 21), (9, 25, 27), (10, 1, 7)),
+}
+
+
+def deepseek_pricing_status(now: float | None = None) -> str:
+    """Current direct-API tariff; never guess a future holiday calendar."""
+    utc = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
+    beijing = utc.astimezone(timezone(timedelta(hours=8)))
+    if beijing.weekday() >= 5 or not (1 <= utc.hour < 4 or 6 <= utc.hour < 10):
+        return "OFF-PEAK"
+    holidays = _DEEPSEEK_HOLIDAYS.get(beijing.year)
+    if holidays is None:
+        return "CHECK CALENDAR"
+    if any(beijing.month == month and start <= beijing.day <= end
+           for month, start, end in holidays):
+        return "OFF-PEAK"
+    return "PEAK"
+
+
 class DeepSeekUsageRow(QWidget):
     """Compact DeepSeek spend and current-credit row with source disclosure."""
 
@@ -6075,6 +6099,16 @@ class DeepSeekUsageRow(QWidget):
         self._expanded = False
         self.setFixedHeight(self._COLLAPSED_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pricing_timer = QTimer(self)
+        self._pricing_timer.setInterval(1000)
+        self._pricing_timer.timeout.connect(self._refresh_pricing)
+        self._pricing_timer.start()
+        self._refresh_pricing()
+
+    def _refresh_pricing(self):
+        self._pricing_status = deepseek_pricing_status()
+        self.setToolTip(self._tooltip(self._summary))
+        self.update()
 
     def set_data(self, summary: DeepSeekUsageSummary | None):
         self._summary = summary
@@ -6110,9 +6144,15 @@ class DeepSeekUsageRow(QWidget):
         return f"{age_s // 60}m old"
 
     def _tooltip(self, summary: DeepSeekUsageSummary | None) -> str:
+        lines = [
+            f"Direct API pricing now: {self._pricing_status} (local clock schedule).",
+            "deepseek-flash / deepseek-v4-pro: peak Mon–Fri 01:00–04:00 and "
+            "06:00–10:00 UTC, excluding Chinese public holidays; off-peak is half peak.",
+            "2026 holiday calendar included; future unverified peak windows show CHECK CALENDAR.",
+            "Schedule checked 2026-10-28: https://api-docs.deepseek.com/quick_start/pricing/",
+        ]
         if summary is None:
-            return "DeepSeek data has not been read yet."
-        lines: list[str] = []
+            return "\n".join(lines + ["DeepSeek data has not been read yet."])
         if summary.spent_24h is not None and summary.spend_source == "opencode":
             coverage = min(24, summary.spend_coverage_s / 3600)
             lines.append(
@@ -6157,7 +6197,12 @@ class DeepSeekUsageRow(QWidget):
         painter.setFont(font)
         arrow = "▾" if self._expanded else "▸"
         painter.setPen(QColor(100, 100, 120))
-        painter.drawText(4, 18, f"DEEPSEEK {arrow}")
+        painter.drawText(4, 12, f"DEEPSEEK {arrow}")
+        painter.setFont(QFont("sans-serif", 7))
+        painter.setPen(QColor(234, 179, 8) if self._pricing_status != "OFF-PEAK"
+                       else QColor(74, 222, 128))
+        painter.drawText(4, 26, self._pricing_status)
+        painter.setFont(font)
 
         summary = self._summary
         spend = self._spend_text(summary)
