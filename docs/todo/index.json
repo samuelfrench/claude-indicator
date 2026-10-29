@@ -78,6 +78,19 @@
     "test": "tests/test_cursor_usage.py; tests/test_widget_ui.py"
   },
   {
+    "path": "docs/todo/done/product/deepseek-pricing.md",
+    "slug": "deepseek-pricing",
+    "title": "DeepSeek peak/off-peak pricing in overlay",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-28",
+    "owner": "agent",
+    "brief": "Shipped31e770c; green CI,531+46 tests; native PEAK label verified.",
+    "refs": [],
+    "test": "tests/test_widget_ui.py -k deepseek"
+  },
+  {
     "path": "docs/todo/done/product/minimize-tray-usage.md",
     "slug": "minimize-tray-usage",
     "title": "Minimize to tray with Claude 5-hour and Codex 7-day indicators",
@@ -191,16 +204,18 @@
     "test": null
   },
   {
-    "path": "docs/todo/product/deepseek-pricing.md",
-    "slug": "deepseek-pricing",
-    "title": "DeepSeek peak/off-peak pricing in overlay",
-    "status": "now",
+    "path": "docs/todo/product/deepseek-pricing-calendar.md",
+    "slug": "deepseek-pricing-calendar",
+    "title": "Refresh DeepSeek holiday calendar for 2027",
+    "status": "next",
     "area": "product",
-    "due": null,
+    "due": "2026-12-15",
     "updated": "2026-10-28",
     "owner": "agent",
-    "brief": "Implement direct-API pricing schedule label with offline clock refresh.",
-    "refs": [],
+    "brief": "Verify official 2027 holidays before potential peak windows need calendar confirmation.",
+    "refs": [
+      "docs/todo/done/product/deepseek-pricing.md"
+    ],
     "test": "tests/test_widget_ui.py -k deepseek"
   },
   {
