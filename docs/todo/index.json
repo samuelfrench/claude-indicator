@@ -78,6 +78,21 @@
     "test": "tests/test_cursor_usage.py; tests/test_widget_ui.py"
   },
   {
+    "path": "docs/todo/done/product/deepseek-pricing-clock.md",
+    "slug": "deepseek-pricing-clock",
+    "title": "DeepSeek pricing windows and current clock",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-28",
+    "owner": "agent",
+    "brief": "Shipped9bc1de8; UTC windows/live seconds visible and native verified.",
+    "refs": [
+      "docs/todo/done/product/deepseek-pricing.md"
+    ],
+    "test": "tests/test_widget_ui.py -k deepseek"
+  },
+  {
     "path": "docs/todo/done/product/deepseek-pricing.md",
     "slug": "deepseek-pricing",
     "title": "DeepSeek peak/off-peak pricing in overlay",
@@ -213,21 +228,6 @@
     "updated": "2026-10-28",
     "owner": "agent",
     "brief": "Verify official 2027 holidays before potential peak windows need calendar confirmation.",
-    "refs": [
-      "docs/todo/done/product/deepseek-pricing.md"
-    ],
-    "test": "tests/test_widget_ui.py -k deepseek"
-  },
-  {
-    "path": "docs/todo/product/deepseek-pricing-clock.md",
-    "slug": "deepseek-pricing-clock",
-    "title": "DeepSeek pricing windows and current clock",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-10-28",
-    "owner": "agent",
-    "brief": "Add visible UTC windows and live current time beside pricing status.",
     "refs": [
       "docs/todo/done/product/deepseek-pricing.md"
     ],
