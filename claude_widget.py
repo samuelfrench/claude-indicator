@@ -168,6 +168,19 @@ OPENCODE_XAI_PROVIDER_ID = "xai"
 # clawd-bot runner drives ollama through aider) are outside it and are excluded.
 LOCAL_PROVIDER_ID = "ollama"
 LOCAL_TOKENS_REFRESH_MS = 60 * 1000
+# Email responder status: the reply bot writes one aggregate-only, mode-0600
+# JSON file after each stage. The schema is frozen at 1 and never carries
+# addresses, subjects or bodies, so this row stays a cheap local file read.
+EMAIL_RESPONDER_STATUS_PATH = (
+    Path.home() / ".local" / "state" / "email-responder" / "status.json"
+)
+EMAIL_RESPONDER_STATUS_SCHEMA = 1
+EMAIL_RESPONDER_REFRESH_MS = 15 * 1000
+EMAIL_RESPONDER_STALLED_S = 5 * 60      # running without a heartbeat this long
+EMAIL_RESPONDER_STALE_RUN_S = 2 * 3600  # idle without a run this long
+EMAIL_RESPONDER_ERROR_MAX_CHARS = 60
+EMAIL_RESPONDER_STATES = ("running", "idle", "paused", "error")
+EMAIL_RESPONDER_STAGES = ("fetch", "classify", "draft", "send", "digest", "idle")
 # Several providers share the OpenCode ledger, so the row breaks usage down per
 # model and tags each line with its provider. Long ids are shortened for display.
 OPENCODE_PROVIDER_LABELS = (
@@ -185,6 +198,7 @@ WIDGET_SECTIONS = (
     ("runners", "Runners"),
     ("tasks", "Task loops"),
     ("groups", "Task groups"),
+    ("responder", "Email responder"),
     ("cron", "Cron jobs"),
     ("system", "System"),
     ("local_ai", "Local AI"),
@@ -513,6 +527,88 @@ class TaskGroupInfo:
         if elapsed < 86400:
             return f"{int(elapsed // 3600)}h ago"
         return f"{int(elapsed // 86400)}d ago"
+
+
+def _short_ago(ts: float | None, now: float) -> str:
+    """Bounded relative age for one painted line."""
+    if ts is None:
+        return "unknown"
+    elapsed = int(max(0.0, now - ts))
+    if elapsed < 60:
+        return "just now"
+    if elapsed < 3600:
+        return f"{elapsed // 60}m ago"
+    if elapsed < 86400:
+        return f"{elapsed // 3600}h ago"
+    return f"{elapsed // 86400}d ago"
+
+
+def _one_line(text: str, limit: int | None = None) -> str:
+    """Collapse whitespace to a single painted line, optionally truncated."""
+    flattened = " ".join(str(text).split())
+    if limit is None or len(flattened) <= limit:
+        return flattened
+    return flattened[: limit - 1].rstrip() + "…"
+
+
+# An address must never reach the painted row, even if a bot error quotes one.
+_EMAIL_ADDRESS_RE = re.compile(r"[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}")
+
+
+@dataclass
+class EmailResponderStatus:
+    """Aggregate reply-bot state from the bot's local schema-1 status file.
+
+    Counts and timestamps only: the contract never carries addresses, subjects
+    or message bodies, and error text is flattened and truncated for display.
+    """
+    state: str                      # running | idle | paused | error
+    stage: str = ""                 # fetch | classify | draft | send | digest | idle
+    heartbeat_ts: float | None = None
+    last_run_ts: float | None = None
+    handled_today: int = 0
+    sent_today: int = 0
+    escalated_today: int = 0
+    pending_approval: int = 0
+    last_error: str = ""
+
+    @staticmethod
+    def _now(now: float | None) -> float:
+        return time.time() if now is None else now
+
+    def stalled(self, now: float | None = None) -> bool:
+        """Running but silent past the heartbeat window means a stuck stage."""
+        if self.state != "running" or self.heartbeat_ts is None:
+            return False
+        return self._now(now) - self.heartbeat_ts > EMAIL_RESPONDER_STALLED_S
+
+    def stale_run(self, now: float | None = None) -> bool:
+        """Idle past the run window probably means the timer died."""
+        if self.state != "idle" or self.last_run_ts is None:
+            return False
+        return self._now(now) - self.last_run_ts > EMAIL_RESPONDER_STALE_RUN_S
+
+    def summary_text(self, now: float | None = None) -> str:
+        now = self._now(now)
+        if self.state == "running":
+            if self.stalled(now):
+                minutes = int(max(0.0, now - (self.heartbeat_ts or now)) // 60)
+                if minutes < 60:
+                    return f"stalled {minutes}m"
+                return f"stalled {minutes // 60}h"
+            return f"working: {self.stage or 'unknown'}"
+        if self.state == "paused":
+            return "paused"
+        if self.state == "error":
+            detail = _one_line(
+                _EMAIL_ADDRESS_RE.sub("[address]", self.last_error),
+                EMAIL_RESPONDER_ERROR_MAX_CHARS,
+            )
+            return f"error: {detail or 'unknown'}"
+        return (
+            f"idle · last run {_short_ago(self.last_run_ts, now)}"
+            f" · {self.handled_today} handled, {self.escalated_today} for you"
+        )
 
 
 @dataclass
@@ -4065,6 +4161,58 @@ def fetch_task_groups() -> list[TaskGroupInfo]:
     return results
 
 
+def _status_timestamp(value) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _status_count(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
+
+
+def fetch_email_responder_status(
+    path: Path | None = None,
+) -> EmailResponderStatus | None:
+    """Read the reply bot's aggregate status file.
+
+    Returns None when the file is absent, unreadable, corrupt or a different
+    schema: missing status is unavailable, not zero traffic, so the row hides.
+    Timestamps, counts and state are validated; error text is flattened later.
+    """
+    if path is None:
+        path = EMAIL_RESPONDER_STATUS_PATH
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") != EMAIL_RESPONDER_STATUS_SCHEMA:
+        return None
+    state = payload.get("state")
+    if state not in EMAIL_RESPONDER_STATES:
+        return None
+    stage = payload.get("stage")
+    last_error = payload.get("last_error")
+    return EmailResponderStatus(
+        state=state,
+        stage=stage if stage in EMAIL_RESPONDER_STAGES else "",
+        heartbeat_ts=_status_timestamp(payload.get("heartbeat_at")),
+        last_run_ts=_status_timestamp(payload.get("last_run_at")),
+        handled_today=_status_count(payload.get("handled_today")),
+        sent_today=_status_count(payload.get("sent_today")),
+        escalated_today=_status_count(payload.get("escalated_today")),
+        pending_approval=_status_count(payload.get("pending_approval")),
+        last_error=last_error if isinstance(last_error, str) else "",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cron job manager
 # ---------------------------------------------------------------------------
@@ -4592,6 +4740,18 @@ class TaskGroupFetchWorker(QThread):
     def run(self):
         groups = fetch_task_groups()
         self.finished.emit(groups)
+
+
+class EmailResponderStatusWorker(QThread):
+    result = Signal(object)
+
+    def __init__(self, reader=None):
+        super().__init__()
+        self._reader = reader
+
+    def run(self):
+        reader = self._reader or fetch_email_responder_status
+        self.result.emit(reader())
 
 
 class CronJobsFetchWorker(QThread):
@@ -8127,6 +8287,112 @@ class TaskGroupWidget(QWidget):
         p.end()
 
 
+class EmailResponderRow(QWidget):
+    """One-line email-responder state, hidden until a status file exists."""
+
+    _ROW_H = 18
+    _DOT_R = 3.0
+
+    _GREEN = QColor(34, 197, 94)
+    _BLUE = QColor(96, 165, 250)
+    _AMBER = QColor(234, 179, 8)
+    _RED = QColor(239, 68, 68)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._status: EmailResponderStatus | None = None
+        self.setFixedHeight(0)
+        self.hide()
+
+    def set_data(self, status: EmailResponderStatus | None):
+        self._status = status
+        if status is None:
+            self.setFixedHeight(0)
+            self.setToolTip("")
+            self.hide()
+        else:
+            self.setFixedHeight(self._ROW_H)
+            self.setToolTip(self.tooltip_text())
+            self.show()
+        self.update()
+
+    def summary_text(self, now: float | None = None) -> str:
+        if self._status is None:
+            return ""
+        return self._status.summary_text(now)
+
+    def status_color(self, now: float | None = None) -> QColor:
+        if self._status is None:
+            return QColor(120, 120, 150)
+        state = self._status.state
+        if state == "error":
+            return self._RED
+        if state == "paused":
+            return self._AMBER
+        if state == "running":
+            return self._AMBER if self._status.stalled(now) else self._BLUE
+        if state == "idle":
+            return self._AMBER if self._status.stale_run(now) else self._GREEN
+        return QColor(120, 120, 150)
+
+    def tooltip_text(self, now: float | None = None) -> str:
+        """Aggregates and ages only; never a sender, subject or message body."""
+        s = self._status
+        if s is None:
+            return ""
+        now = time.time() if now is None else now
+        head = f"Email responder — {s.state}"
+        if s.state == "running" and s.stage:
+            head += f": {s.stage}"
+        lines = [
+            head,
+            f"last run {_short_ago(s.last_run_ts, now)}"
+            f" · heartbeat {_short_ago(s.heartbeat_ts, now)}",
+            f"handled {s.handled_today} · sent {s.sent_today}"
+            f" · escalated {s.escalated_today}"
+            f" · pending approval {s.pending_approval}",
+        ]
+        if s.state == "running" and s.stalled(now):
+            lines.append("No heartbeat for 5 minutes: the stage may be stuck.")
+        elif s.state == "idle" and s.stale_run(now):
+            lines.append("No run for 2 hours: the responder timer may be dead.")
+        return "\n".join(lines)
+
+    def paintEvent(self, event):
+        s = self._status
+        if s is None:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+
+        font = QFont("sans-serif", 8)
+        font.setWeight(QFont.Weight.Medium)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        y = 13
+        p.setPen(QColor(100, 100, 120))
+        header_text = "EMAIL"
+        p.drawText(4, y, header_text)
+
+        x = 4 + fm.horizontalAdvance(header_text) + 8
+        color = self.status_color()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(
+            QRectF(x, y - 3 - self._DOT_R, self._DOT_R * 2, self._DOT_R * 2)
+        )
+
+        p.setPen(color)
+        text_x = int(x + self._DOT_R * 2 + 4)
+        text = fm.elidedText(
+            self.summary_text(), Qt.TextElideMode.ElideRight, max(0, w - text_x - 4)
+        )
+        p.drawText(text_x, y, text)
+        p.end()
+
+
 class CronJobsWidget(QWidget):
     """Collapsible row showing user crontab jobs with per-job run health."""
 
@@ -8682,6 +8948,7 @@ class ClaudeWidget(QWidget):
         self._runner_worker: RunnerFetchWorker | None = None
         self._task_loop_worker: TaskLoopFetchWorker | None = None
         self._task_group_worker: TaskGroupFetchWorker | None = None
+        self._email_responder_worker: EmailResponderStatusWorker | None = None
         self._cron_worker: CronJobsFetchWorker | None = None
         self._codex_worker: CodexUsageWorker | None = None
         self._cursor_worker: CursorUsageWorker | None = None
@@ -8744,6 +9011,7 @@ class ClaudeWidget(QWidget):
         self._fetch_runners()
         self._fetch_task_loops()
         self._fetch_task_groups()
+        self._fetch_email_responder_status()
         self._fetch_cron_jobs()
         self._fetch_ollama()
         self._fetch_comfyui()
@@ -8984,6 +9252,10 @@ class ClaudeWidget(QWidget):
         self._task_group_row = TaskGroupWidget()
         layout.addWidget(self._task_group_row)
 
+        # Email responder aggregate status row
+        self._email_responder_row = EmailResponderRow()
+        layout.addWidget(self._email_responder_row)
+
         # Cron job manager row
         self._cron_row = CronJobsWidget()
         layout.addWidget(self._cron_row)
@@ -9117,6 +9389,8 @@ class ClaudeWidget(QWidget):
             self._fetch_task_loops()
         elif item_id == "groups":
             self._fetch_task_groups()
+        elif item_id == "responder":
+            self._fetch_email_responder_status()
         elif item_id == "cron":
             self._fetch_cron_jobs()
         elif item_id == "system":
@@ -9191,6 +9465,11 @@ class ClaudeWidget(QWidget):
                 self._task_group_row,
                 self._section_visible("groups"),
                 self._task_group_row._groups,
+            )
+            self._set_hideable_row_visible(
+                self._email_responder_row,
+                self._section_visible("responder"),
+                self._email_responder_row._status,
             )
             self._set_hideable_row_visible(
                 self._cron_row, self._section_visible("cron"), self._cron_row._jobs
@@ -9289,6 +9568,13 @@ class ClaudeWidget(QWidget):
         self._task_group_timer = QTimer(self)
         self._task_group_timer.timeout.connect(self._fetch_task_groups)
         self._task_group_timer.start(TASK_GROUP_REFRESH_MS)
+
+        # Email responder timer - a 15-second read of one local status file
+        self._email_responder_timer = QTimer(self)
+        self._email_responder_timer.timeout.connect(
+            self._fetch_email_responder_status
+        )
+        self._email_responder_timer.start(EMAIL_RESPONDER_REFRESH_MS)
 
         # Cron jobs timer - every 5 minutes
         self._cron_timer = QTimer(self)
@@ -9668,6 +9954,26 @@ class ClaudeWidget(QWidget):
 
     def _on_task_groups_fetched(self, groups: list):
         self._task_group_row.set_data(groups)
+        self.adjustSize()
+
+    def _fetch_email_responder_status(self):
+        if self._shutdown_started:
+            return
+        if not self._section_visible("responder"):
+            return
+        if (
+            self._email_responder_worker
+            and self._email_responder_worker.isRunning()
+        ):
+            return
+        self._email_responder_worker = EmailResponderStatusWorker()
+        self._email_responder_worker.result.connect(
+            self._on_email_responder_status_read
+        )
+        self._email_responder_worker.start()
+
+    def _on_email_responder_status_read(self, status):
+        self._email_responder_row.set_data(status)
         self.adjustSize()
 
     def _update_system_metrics(self):
@@ -10331,6 +10637,7 @@ class ClaudeWidget(QWidget):
                 self._runner_worker,
                 self._task_loop_worker,
                 self._task_group_worker,
+                self._email_responder_worker,
                 self._cron_worker,
                 self._codex_worker,
                 self._cursor_worker,

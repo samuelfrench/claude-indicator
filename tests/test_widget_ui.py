@@ -53,6 +53,9 @@ from claude_widget import (
     SystemMetrics,
     SystemMetricsRow,
     TaskLoopInfo,
+    EmailResponderRow,
+    EmailResponderStatus,
+    fetch_email_responder_status,
     TerminalSession,
     TerminalSessionsSnapshot,
     ModelLimit,
@@ -1137,6 +1140,20 @@ class WidgetUiTest(unittest.TestCase):
             layout.indexOf(widget._grok_row) + 1,
         )
 
+    def test_widget_places_email_responder_row_directly_after_task_group_row(self):
+        widget = self._make_inert_claude_widget()
+        layout = widget._task_group_row.parentWidget().layout()
+        task_group_index = layout.indexOf(widget._task_group_row)
+        self.assertEqual(
+            layout.indexOf(widget._email_responder_row), task_group_index + 1
+        )
+        self.assertEqual(
+            layout.indexOf(widget._cron_row),
+            layout.indexOf(widget._email_responder_row) + 1,
+        )
+        self.assertIsInstance(widget._email_responder_row, EmailResponderRow)
+        self.assertTrue(widget._email_responder_row.isHidden())
+
     def test_task_loop_status_reads_local_config_without_aws(self):
         config = {
             "demo-project": {
@@ -1720,6 +1737,9 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(ClaudeWidget, "_fetch_runners", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_task_loops", lambda self: None),
             patch.object(ClaudeWidget, "_fetch_task_groups", lambda self: None),
+            patch.object(
+                ClaudeWidget, "_fetch_email_responder_status", lambda self: None
+            ),
             patch.object(ClaudeWidget, "_fetch_cron_jobs", lambda self: None),
             patch.object(ClaudeWidget, "_update_system_metrics", lambda self: None),
             patch.object(ClaudeWidget, "_refresh_codex_usage", lambda self: None),
@@ -3529,7 +3549,8 @@ class WidgetUiTest(unittest.TestCase):
 
         worker_names = (
             "_worker", "_deploy_worker", "_runner_worker", "_task_loop_worker",
-            "_task_group_worker", "_cron_worker", "_codex_worker", "_cursor_worker",
+            "_task_group_worker", "_email_responder_worker",
+            "_cron_worker", "_codex_worker", "_cursor_worker",
             "_deepseek_worker", "_minimax_worker", "_go_worker", "_grok_worker",
             "_opencode_worker", "_ollama_worker", "_comfyui_worker", "_terminal_focus_worker",
         )
@@ -3823,6 +3844,214 @@ class PreferredQtPlatformTest(unittest.TestCase):
             {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
         )
         self.assertIsNone(platform)
+
+
+# ---------------------------------------------------------------------------
+# Email responder row: frozen schema-1 local status file, aggregates only
+# ---------------------------------------------------------------------------
+
+EMAIL_RESPONDER_STATUS = {
+    "schema": 1,
+    "state": "idle",
+    "stage": "idle",
+    "started_at": "2026-10-30T18:00:00Z",
+    "heartbeat_at": "2026-10-30T18:12:00Z",
+    "last_run_at": "2026-10-30T18:00:00Z",
+    "next_run_at": "2026-10-30T18:15:00Z",
+    "handled_today": 4,
+    "sent_today": 2,
+    "escalated_today": 2,
+    "pending_approval": 1,
+    "last_error": None,
+}
+EMAIL_RESPONDER_NOW = datetime.fromisoformat(
+    "2026-10-30T18:12:00+00:00"
+).timestamp()
+
+_QT_APP = None
+
+
+def _qt_app():
+    global _QT_APP
+    _QT_APP = QApplication.instance() or QApplication([])
+    return _QT_APP
+
+
+def _write_status(path, **overrides):
+    payload = dict(EMAIL_RESPONDER_STATUS, **overrides)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _responder_row(status, now=EMAIL_RESPONDER_NOW):
+    _qt_app()
+    row = EmailResponderRow()
+    row.set_data(status)
+    return row
+
+
+def test_email_responder_status_parses_valid_file(tmp_path):
+    status = fetch_email_responder_status(_write_status(tmp_path / "status.json"))
+
+    assert isinstance(status, EmailResponderStatus)
+    assert (status.state, status.stage) == ("idle", "idle")
+    assert status.handled_today == 4
+    assert status.sent_today == 2
+    assert status.escalated_today == 2
+    assert status.pending_approval == 1
+    assert status.last_error == ""
+    assert status.last_run_ts == datetime.fromisoformat(
+        "2026-10-30T18:00:00+00:00"
+    ).timestamp()
+
+
+def test_email_responder_status_missing_file_is_none(tmp_path):
+    assert fetch_email_responder_status(tmp_path / "absent.json") is None
+
+
+def test_email_responder_status_corrupt_file_is_none(tmp_path):
+    corrupt = tmp_path / "status.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    assert fetch_email_responder_status(corrupt) is None
+
+
+def test_email_responder_status_wrong_schema_is_none(tmp_path):
+    path = _write_status(tmp_path / "status.json", schema=2)
+    assert fetch_email_responder_status(path) is None
+
+
+def test_email_responder_status_unknown_state_is_none(tmp_path):
+    path = _write_status(tmp_path / "status.json", state="sending")
+    assert fetch_email_responder_status(path) is None
+
+
+def test_email_responder_status_never_guesses_counts_or_stages(tmp_path):
+    path = tmp_path / "status.json"
+    path.write_text(
+        json.dumps({
+            "schema": 1,
+            "state": "running",
+            "stage": "drafting",
+            "handled_today": "4",
+            "escalated_today": -2,
+            "last_error": 7,
+        }),
+        encoding="utf-8",
+    )
+    status = fetch_email_responder_status(path)
+
+    assert (status.state, status.stage) == ("running", "")
+    assert status.handled_today == 0
+    assert status.escalated_today == 0
+    assert status.last_error == ""
+    assert status.heartbeat_ts is None
+
+
+def test_email_responder_row_hides_without_a_status_file():
+    row = _responder_row(None)
+
+    assert row.isHidden()
+    assert row.height() == 0
+    assert row.summary_text() == ""
+
+
+def test_email_responder_row_idle_shows_last_run_and_counts():
+    row = _responder_row(
+        EmailResponderStatus(
+            state="idle",
+            last_run_ts=EMAIL_RESPONDER_NOW - 12 * 60,
+            handled_today=4,
+            escalated_today=2,
+        )
+    )
+
+    assert row.summary_text(EMAIL_RESPONDER_NOW) == (
+        "idle · last run 12m ago · 4 handled, 2 for you"
+    )
+    assert row.status_color(EMAIL_RESPONDER_NOW).name() == "#22c55e"
+    assert not row.isHidden()
+    assert row.height() == EmailResponderRow._ROW_H
+
+
+def test_email_responder_row_running_shows_stage():
+    row = _responder_row(EmailResponderStatus(
+        state="running", stage="draft",
+        heartbeat_ts=EMAIL_RESPONDER_NOW - 10,
+    ))
+
+    assert row.summary_text(EMAIL_RESPONDER_NOW) == "working: draft"
+    assert row.status_color(EMAIL_RESPONDER_NOW).name() == "#60a5fa"
+
+
+def test_email_responder_row_paused_is_amber():
+    row = _responder_row(EmailResponderStatus(state="paused"))
+
+    assert row.summary_text(EMAIL_RESPONDER_NOW) == "paused"
+    assert row.status_color(EMAIL_RESPONDER_NOW).name() == "#eab308"
+
+
+def test_email_responder_row_error_stays_one_truncated_line():
+    row = _responder_row(EmailResponderStatus(
+        state="error",
+        last_error="IMAP auth failed\n" + "x" * 200,
+    ))
+    text = row.summary_text(EMAIL_RESPONDER_NOW)
+
+    assert text.startswith("error: IMAP auth failed x")
+    assert "\n" not in text
+    assert len(text) <= len("error: ") + 60
+    assert row.status_color(EMAIL_RESPONDER_NOW).name() == "#ef4444"
+
+
+def test_email_responder_row_error_never_renders_an_address():
+    row = _responder_row(EmailResponderStatus(
+        state="error",
+        last_error="failure replying to maker.name+tag@example.co.uk: rejected",
+    ))
+    text = row.summary_text(EMAIL_RESPONDER_NOW)
+
+    assert "maker.name" not in text
+    assert "example.co.uk" not in text
+    assert text == "error: failure replying to [address]: rejected"
+
+
+def test_email_responder_row_stalled_running_stage_is_amber():
+    row = _responder_row(
+        EmailResponderStatus(
+            state="running",
+            stage="draft",
+            heartbeat_ts=EMAIL_RESPONDER_NOW - 7 * 60,
+        )
+    )
+
+    assert row.summary_text(EMAIL_RESPONDER_NOW) == "stalled 7m"
+    assert row.status_color(EMAIL_RESPONDER_NOW).name() == "#eab308"
+    assert "stuck" in row.tooltip_text(EMAIL_RESPONDER_NOW)
+
+
+def test_email_responder_row_stale_idle_run_is_amber():
+    row = _responder_row(EmailResponderStatus(
+        state="idle",
+        last_run_ts=EMAIL_RESPONDER_NOW - 3 * 3600,
+        handled_today=5,
+    ))
+
+    assert row.summary_text(EMAIL_RESPONDER_NOW) == (
+        "idle · last run 3h ago · 5 handled, 0 for you"
+    )
+    assert row.status_color(EMAIL_RESPONDER_NOW).name() == "#eab308"
+    assert "timer may be dead" in row.tooltip_text(EMAIL_RESPONDER_NOW)
+
+
+def test_email_responder_row_tooltip_is_aggregates_only(tmp_path):
+    row = _responder_row(fetch_email_responder_status(
+        _write_status(tmp_path / "status.json")
+    ))
+    tooltip = row.tooltip_text(EMAIL_RESPONDER_NOW)
+
+    assert "idle" in tooltip
+    assert "handled 4 · sent 2 · escalated 2 · pending approval 1" in tooltip
+    assert "@" not in tooltip
 
 
 if __name__ == "__main__":

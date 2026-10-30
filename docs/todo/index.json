@@ -106,6 +106,19 @@
     "test": "tests/test_widget_ui.py -k deepseek"
   },
   {
+    "path": "docs/todo/done/product/email-responder-status-row.md",
+    "slug": "email-responder-status-row",
+    "title": "Email responder status row",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-30",
+    "owner": "agent",
+    "brief": "One aggregate-only row shows the reply bot working, idle, paused, error, stalled or stale from a local status file.",
+    "refs": [],
+    "test": "tests/test_widget_ui.py -k email_responder"
+  },
+  {
     "path": "docs/todo/done/product/minimize-tray-usage.md",
     "slug": "minimize-tray-usage",
     "title": "Minimize to tray with Claude 5-hour and Codex 7-day indicators",

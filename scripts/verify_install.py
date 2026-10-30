@@ -33,6 +33,7 @@ import claude_widget as widget_module
 
 methods = ["_setup_tray_icon", "_setup_timers", "_fetch_usage", "_fetch_deploys",
            "_fetch_runners", "_fetch_task_loops", "_fetch_task_groups", "_fetch_cron_jobs",
+           "_fetch_email_responder_status",
            "_fetch_ollama", "_fetch_comfyui", "_update_system_metrics", "_refresh_codex_usage",
            "_refresh_deepseek_usage", "_refresh_minimax_usage", "_refresh_opencode_go_usage",
            "_refresh_grok_usage", "_refresh_cursor_usage", "_refresh_opencode_usage", "_refresh_terminal_sessions"]
