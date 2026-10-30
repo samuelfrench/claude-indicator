@@ -119,6 +119,24 @@
     "test": "tests/test_widget_ui.py -k email_responder"
   },
   {
+    "path": "docs/todo/done/product/grok-persistent-status.md",
+    "slug": "grok-persistent-status",
+    "title": "Grok usage stays visible after the CLI token expires",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-10-30",
+    "owner": "agent",
+    "brief": "Persist the last live Grok reading and show GROK CACHE until reset instead of a blank dash between CLI logins.",
+    "refs": [
+      "claude_widget.py",
+      "README.md",
+      "docs/beta/privacy-audit.md",
+      "docs/todo/product/grok-missing-meter.md"
+    ],
+    "test": "tests/test_widget_ui.py -k grok"
+  },
+  {
     "path": "docs/todo/done/product/minimize-tray-usage.md",
     "slug": "minimize-tray-usage",
     "title": "Minimize to tray with Claude 5-hour and Codex 7-day indicators",

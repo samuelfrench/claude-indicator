@@ -161,6 +161,12 @@ GROK_AUTH_LEGACY_KEY = "https://accounts.x.ai/sign-in"
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_CLI_TOKEN_AUTH = "xai-grok-cli"
 GROK_REFRESH_MS = 5 * 60 * 1000
+# The Grok CLI access token expires within hours and is only replaced when the
+# CLI runs. Keep the last good reading so the row still shows the meter after
+# the token expires; the reading is dropped at its reported reset.
+GROK_SNAPSHOT_PATH = Path.home() / ".claude" / "grok_usage_snapshot.json"
+GROK_SNAPSHOT_VERSION = 1
+GROK_SNAPSHOT_MAX_AGE_S = 24 * 3600
 OPENCODE_XAI_AUTH_PATH = DEEPSEEK_AUTH_PATH
 OPENCODE_XAI_PROVIDER_ID = "xai"
 # Local-model token tracking is scoped to the OpenCode ledger on purpose: it is
@@ -2185,14 +2191,133 @@ def fetch_grok_credits(bearer: str) -> GrokCredits:
     return parse_grok_credits(payload)
 
 
+def _grok_snapshot_money(value) -> str | None:
+    if value is None:
+        return None
+    return format(value, "f")
+
+
+def save_grok_snapshot(
+    summary: GrokUsageSummary, *, path: Path | None = None
+) -> None:
+    """Persist one successful Grok reading, without credentials or prompts."""
+    if summary.source != "live" or summary.used_percent is None:
+        return
+    path = GROK_SNAPSHOT_PATH if path is None else path
+    payload = {
+        "version": GROK_SNAPSHOT_VERSION,
+        "fetched_at": float(summary.fetched_at or time.time()),
+        "used_percent": float(summary.used_percent),
+        "resets_at": int(summary.resets_at),
+        "meter": summary.meter,
+        "products": [
+            {"product": item.product, "used_percent": float(item.used_percent)}
+            for item in summary.products
+        ],
+        "prepaid_balance": _grok_snapshot_money(summary.prepaid_balance),
+        "on_demand_cap": _grok_snapshot_money(summary.on_demand_cap),
+        "on_demand_used": _grok_snapshot_money(summary.on_demand_used),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def load_grok_snapshot(
+    *, now: float | None = None, path: Path | None = None
+) -> GrokUsageSummary | None:
+    """Return the last live Grok reading while it is still current."""
+    now = time.time() if now is None else now
+    path = GROK_SNAPSHOT_PATH if path is None else path
+    if not path.exists():
+        return None
+    try:
+        raw = _read_owned_private_json(path)
+    except ValueError:
+        return None
+    if raw.get("version") != GROK_SNAPSHOT_VERSION:
+        return None
+    try:
+        fetched_at = float(raw.get("fetched_at"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fetched_at) or fetched_at <= 0 or fetched_at > now + 300:
+        return None
+    try:
+        used_percent = _grok_percent(raw.get("used_percent"))
+    except ValueError:
+        return None
+    resets_at = raw.get("resets_at")
+    if isinstance(resets_at, bool) or not isinstance(resets_at, int) or resets_at < 0:
+        return None
+    if resets_at > 0 and now >= resets_at:
+        return None
+    if resets_at <= 0 and now - fetched_at > GROK_SNAPSHOT_MAX_AGE_S:
+        return None
+    meter = raw.get("meter")
+    if meter not in {"weekly", "on_demand"}:
+        return None
+    products: list[GrokProductUsage] = []
+    raw_products = raw.get("products")
+    if isinstance(raw_products, list):
+        seen: set[str] = set()
+        for item in raw_products:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("product")
+            if not isinstance(name, str) or not name.strip() or name.strip() in seen:
+                continue
+            try:
+                percent = _grok_percent(item.get("used_percent"))
+            except ValueError:
+                continue
+            seen.add(name.strip())
+            products.append(GrokProductUsage(product=name.strip(), used_percent=percent))
+
+    def money_field(key: str) -> Decimal | None:
+        value = raw.get(key)
+        if value is None:
+            return None
+        try:
+            return _decimal_money(value)
+        except ValueError:
+            return None
+
+    return GrokUsageSummary(
+        used_percent=used_percent,
+        resets_at=resets_at,
+        meter=meter,
+        products=tuple(products),
+        prepaid_balance=money_field("prepaid_balance"),
+        on_demand_cap=money_field("on_demand_cap"),
+        on_demand_used=money_field("on_demand_used"),
+        fetched_at=fetched_at,
+        source="snapshot",
+    )
+
+
 def read_grok_usage(
     *,
     now: float | None = None,
     auth_path: Path | None = None,
     opencode_auth_path: Path | None = None,
     environ: dict | None = None,
+    snapshot_path: Path | None = None,
 ) -> GrokUsageSummary:
     now = time.time() if now is None else now
+    snapshot_path = GROK_SNAPSHOT_PATH if snapshot_path is None else snapshot_path
     summary = GrokUsageSummary()
     try:
         bearer = read_grok_bearer(
@@ -2216,6 +2341,15 @@ def read_grok_usage(
         summary.on_demand_used = credits.on_demand_used
         summary.fetched_at = now
         summary.source = "live"
+        try:
+            save_grok_snapshot(summary, path=snapshot_path)
+        except (OSError, ValueError):
+            pass
+        return summary
+    cached = load_grok_snapshot(now=now, path=snapshot_path)
+    if cached is not None:
+        cached.error = summary.error
+        return cached
     return summary
 
 
@@ -6783,6 +6917,11 @@ class GrokUsageRow(QWidget):
         label = "OD" if summary.meter == "on_demand" else "7D"
         return f"{label} {summary.used_percent:.0f}%"
 
+    def title_text(self) -> str:
+        cached = self._summary is not None and self._summary.source == "snapshot"
+        arrow = "▾" if self._expanded else "▸"
+        return f"GROK{' CACHE' if cached else ''} {arrow}"
+
     def _peak_percent(self) -> float:
         summary = self._summary
         if summary is None or summary.used_percent is None:
@@ -6827,12 +6966,27 @@ class GrokUsageRow(QWidget):
         if summary is None:
             return "Grok data has not been read yet."
         lines: list[str] = []
-        if summary.source == "live" and summary.used_percent is not None:
+        if summary.used_percent is not None and summary.source in {"live", "snapshot"}:
             meter = "On-demand" if summary.meter == "on_demand" else "Weekly credits"
-            lines.append(
-                f"{meter} {summary.used_percent:.0f}% used "
-                "(live SuperGrok /v1/billing?format=credits)."
-            )
+            cached = summary.source == "snapshot"
+            if cached:
+                lines.append(
+                    f"Cached {meter.lower()} {summary.used_percent:.0f}% used "
+                    "from the SuperGrok credits endpoint."
+                )
+            else:
+                lines.append(
+                    f"{meter} {summary.used_percent:.0f}% used "
+                    "(live SuperGrok /v1/billing?format=credits)."
+                )
+            if cached and summary.fetched_at > 0:
+                lines.append(
+                    "Last successful read "
+                    + time.strftime(
+                        "%a %d %b %H:%M", time.localtime(summary.fetched_at)
+                    )
+                    + "."
+                )
             if summary.resets_at > 0:
                 lines.append(
                     "Resets "
@@ -6880,9 +7034,8 @@ class GrokUsageRow(QWidget):
         font = QFont("sans-serif", 8)
         font.setWeight(QFont.Weight.Medium)
         painter.setFont(font)
-        arrow = "▾" if self._expanded else "▸"
         painter.setPen(QColor(100, 100, 120))
-        painter.drawText(4, 18, f"GROK {arrow}")
+        painter.drawText(4, 18, self.title_text())
 
         summary = self._summary
         right = self.summary_text()
@@ -9223,6 +9376,7 @@ class ClaudeWidget(QWidget):
 
         # SuperGrok / Grok Build CLI weekly-credit row
         self._grok_row = GrokUsageRow()
+        self._grok_row.set_data(load_grok_snapshot())
         layout.addWidget(self._grok_row)
 
         # OpenCode ledger usage, broken down per model

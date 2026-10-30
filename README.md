@@ -32,7 +32,7 @@ The widget reuses credentials or local data from tools you have already configur
 | DeepSeek | Official balance endpoint plus local OpenCode cost ledger |
 | MiniMax | Coding-plan quota endpoint plus local OpenCode token ledger |
 | OpenCode Go | Go usage endpoint using the existing OpenCode key |
-| SuperGrok / Grok Build | CLI billing endpoint using Grok CLI or OpenCode OAuth; no Grok token refresh |
+| SuperGrok / Grok Build | CLI billing endpoint using Grok CLI or OpenCode OAuth; no Grok token refresh. The last successful reading persists in a private local snapshot and stays visible, marked `GROK CACHE`, until its reset or for 24 hours when no reset is reported |
 | Ollama / ComfyUI | Loopback status endpoints; local OpenCode ledger for model token totals |
 
 Claude's header fallback sends a real `max_tokens: 1` Haiku request to Anthropic and consumes subscription usage. The application cannot guarantee that a user's plan has overage disabled. Header-only mode lacks model-specific limits and extra-usage dollars. No new Anthropic requests were made for beta testing; validation uses mocks. Current OAuth/undocumented-source policy risks are documented in the terms check.

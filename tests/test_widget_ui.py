@@ -46,6 +46,7 @@ from claude_widget import (
     CursorUsageSummary,
     GrokUsageRow,
     GrokUsageSummary,
+    GrokProductUsage,
     MoneyBalance,
     OllamaStatus,
     DiskMetrics,
@@ -88,6 +89,9 @@ from claude_widget import (
     parse_grok_credits,
     fetch_grok_credits,
     read_grok_bearer,
+    read_grok_usage,
+    load_grok_snapshot,
+    save_grok_snapshot,
     read_claude_oauth_token,
     parse_unified_ratelimit_headers,
     record_deepseek_snapshot,
@@ -832,6 +836,145 @@ class WidgetUiTest(unittest.TestCase):
         row.set_data(GrokUsageSummary(error="Grok credential is not a SuperGrok bearer"))
         self.assertEqual(row.summary_text(), "—")
         self.assertIn("not a SuperGrok bearer", row.toolTip())
+
+    def test_grok_snapshot_round_trip_and_cached_row(self):
+        now = 1_800_000_000.0
+        summary = GrokUsageSummary(
+            used_percent=34.0,
+            resets_at=int(now) + 3 * 86400,
+            meter="weekly",
+            products=(GrokProductUsage(product="GrokBuild", used_percent=29.0),),
+            prepaid_balance=Decimal("1250"),
+            on_demand_cap=Decimal("5000"),
+            on_demand_used=Decimal("300"),
+            fetched_at=now,
+            source="live",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "grok_usage_snapshot.json"
+            save_grok_snapshot(summary, path=path)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+            cached = load_grok_snapshot(now=now + 60, path=path)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.used_percent, 34.0)
+            self.assertEqual(cached.meter, "weekly")
+            self.assertEqual(cached.resets_at, int(now) + 3 * 86400)
+            self.assertEqual(cached.products[0].product, "GrokBuild")
+            self.assertEqual(cached.prepaid_balance, Decimal("1250"))
+            self.assertEqual(cached.on_demand_cap, Decimal("5000"))
+            self.assertEqual(cached.on_demand_used, Decimal("300"))
+            self.assertEqual(cached.fetched_at, now)
+            self.assertEqual(cached.source, "snapshot")
+
+            row = GrokUsageRow()
+            row.set_data(cached)
+            self.assertEqual(row.summary_text(), "7D 34%")
+            self.assertEqual(row.title_text(), "GROK CACHE ▸")
+            self.assertIn("Cached weekly credits 34% used", row.toolTip())
+            self.assertIn("Last successful read", row.toolTip())
+            self.assertIn("Resets", row.toolTip())
+
+            self.assertIsNone(load_grok_snapshot(now=cached.resets_at + 1, path=path))
+            path.chmod(0o644)
+            self.assertIsNone(load_grok_snapshot(now=now + 60, path=path))
+
+    def test_grok_snapshot_without_reset_expires_after_a_day(self):
+        now = 1_800_000_000.0
+        summary = GrokUsageSummary(
+            used_percent=12.0,
+            resets_at=0,
+            meter="on_demand",
+            fetched_at=now,
+            source="live",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "grok_usage_snapshot.json"
+            save_grok_snapshot(summary, path=path)
+            self.assertIsNotNone(
+                load_grok_snapshot(now=now + claude_widget.GROK_SNAPSHOT_MAX_AGE_S, path=path)
+            )
+            self.assertIsNone(
+                load_grok_snapshot(
+                    now=now + claude_widget.GROK_SNAPSHOT_MAX_AGE_S + 1, path=path
+                )
+            )
+
+    def test_grok_usage_falls_back_to_snapshot_when_token_expired(self):
+        now = 1_800_000_000.0
+        live = GrokUsageSummary(
+            used_percent=34.0,
+            resets_at=int(now) + 3 * 86400,
+            meter="weekly",
+            fetched_at=now,
+            source="live",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "grok_usage_snapshot.json"
+            save_grok_snapshot(live, path=path)
+            with patch.object(
+                claude_widget,
+                "read_grok_bearer",
+                side_effect=ValueError("Grok credential expired"),
+            ):
+                summary = read_grok_usage(
+                    now=now + 60, snapshot_path=path, environ={}
+                )
+            self.assertIsNotNone(summary)
+            self.assertEqual(summary.used_percent, 34.0)
+            self.assertEqual(summary.source, "snapshot")
+            self.assertEqual(summary.error, "Grok credential expired")
+            self.assertEqual(summary.fetched_at, now)
+
+            path.unlink()
+            with patch.object(
+                claude_widget,
+                "read_grok_bearer",
+                side_effect=ValueError("Grok credential unavailable"),
+            ):
+                summary = read_grok_usage(
+                    now=now + 60, snapshot_path=path, environ={}
+                )
+            self.assertIsNone(summary.used_percent)
+            self.assertEqual(summary.source, "")
+            self.assertEqual(summary.error, "Grok credential unavailable")
+
+    def test_grok_live_read_saves_snapshot_without_credentials(self):
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc).timestamp()
+        credits = parse_grok_credits(self.GROK_CREDITS_PAYLOAD)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "grok_usage_snapshot.json"
+            with patch.object(
+                claude_widget, "read_grok_bearer", return_value="oauth-token"
+            ), patch.object(
+                claude_widget, "fetch_grok_credits", return_value=credits
+            ):
+                summary = read_grok_usage(now=now, snapshot_path=path, environ={})
+            self.assertEqual(summary.source, "live")
+            self.assertTrue(path.exists())
+            raw = json.loads(path.read_text())
+            self.assertNotIn("oauth-token", path.read_text())
+            self.assertNotIn("key", raw)
+            cached = load_grok_snapshot(now=now + 60, path=path)
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.used_percent, 34.0)
+            self.assertEqual(cached.source, "snapshot")
+
+    def test_widget_seeds_grok_row_from_snapshot_before_first_fetch(self):
+        now = time.time()
+        live = GrokUsageSummary(
+            used_percent=41.0,
+            resets_at=int(now) + 3 * 86400,
+            meter="weekly",
+            fetched_at=now,
+            source="live",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "grok_usage_snapshot.json"
+            save_grok_snapshot(live, path=path)
+            widget = self._make_inert_claude_widget(grok_snapshot_path=path)
+            self.assertEqual(widget._grok_row.summary_text(), "7D 41%")
+            self.assertEqual(widget._grok_row.title_text(), "GROK CACHE ▸")
 
     def test_widget_places_grok_row_directly_after_go_row(self):
         widget = self._make_inert_claude_widget()
@@ -1715,14 +1858,22 @@ class WidgetUiTest(unittest.TestCase):
         *,
         tray_available: bool = False,
         visibility=None,
+        grok_snapshot_path: Path | None = None,
     ):
         vis_dir = tempfile.TemporaryDirectory()
         self.addCleanup(vis_dir.cleanup)
         vis_path = Path(vis_dir.name) / "widget_visibility.json"
         if visibility is not None:
             vis_path.write_text(json.dumps(visibility), encoding="utf-8")
+        if grok_snapshot_path is None:
+            grok_snapshot_dir = tempfile.TemporaryDirectory()
+            self.addCleanup(grok_snapshot_dir.cleanup)
+            grok_snapshot_path = (
+                Path(grok_snapshot_dir.name) / "grok_usage_snapshot.json"
+            )
         patches = [
             patch.object(claude_widget, "WIDGET_VISIBILITY_PATH", vis_path),
+            patch.object(claude_widget, "GROK_SNAPSHOT_PATH", grok_snapshot_path),
             patch.object(
                 QSystemTrayIcon,
                 "isSystemTrayAvailable",
