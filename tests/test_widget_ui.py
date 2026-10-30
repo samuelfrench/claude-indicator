@@ -2106,6 +2106,18 @@ class WidgetUiTest(unittest.TestCase):
         self.assertFalse(hasattr(widget, "_smart_todo_dialog"))
         self.assertFalse(hasattr(widget, "_show_smart_todos"))
 
+    def test_traffic_report_action_opens_the_running_dashboard_port(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+
+        with patch.object(claude_widget.QDesktopServices, "openUrl", return_value=True) as open_url:
+            widget._open_traffic_report()
+
+        open_url.assert_called_once()
+        self.assertEqual(
+            open_url.call_args.args[0].toString(),
+            "http://127.0.0.1:4711/",
+        )
+
     def test_quota_trays_have_distinct_windows_and_share_the_existing_menu(self):
         widget = self._make_inert_claude_widget(tray_available=True)
         widget._usage = None
