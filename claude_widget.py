@@ -6886,7 +6886,7 @@ class CursorUsageRow(QWidget):
                 f" · OD {self._money(self._summary.on_demand_used)}")
 
     def bot_text(self) -> str:
-        return "Grok Bot   — · meter unavailable"
+        return "Grok Bot stats: see GROK row"
 
     def _detail_lines(self) -> list[str]:
         summary = self._summary
@@ -6904,7 +6904,7 @@ class CursorUsageRow(QWidget):
         self._summary = summary or CursorUsageSummary()
         lines = ["Cursor Enterprise Admin API: current billing-cycle spending.",
                  "\n".join(self._detail_lines()),
-                 "Grok Bot is billed through Cursor, separately from SuperGrok.",
+                 "The separate GROK row shows reported GrokBot credit usage from the SuperGrok source.",
                  "This endpoint does not expose a Grok Bot meter, plan, allowance or reset."]
         if self._summary.fetched_at is not None:
             lines.append("Read " + datetime.fromtimestamp(self._summary.fetched_at, timezone.utc).strftime("%d %b %H:%M UTC") + "; refreshed hourly.")
@@ -6968,7 +6968,11 @@ class GrokUsageRow(QWidget):
         if summary is None or summary.used_percent is None:
             return "—"
         label = "OD" if summary.meter == "on_demand" else "7D"
-        return f"{label} {summary.used_percent:.0f}%"
+        text = f"{label} {summary.used_percent:.0f}%"
+        bot = next((p for p in summary.products if p.product.casefold() == "grokbot"), None)
+        if bot is not None:
+            text += f" · BOT {bot.used_percent:.0f}%"
+        return text
 
     def title_text(self) -> str:
         cached = self._summary is not None and self._summary.source == "snapshot"

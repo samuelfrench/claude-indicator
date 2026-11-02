@@ -2,7 +2,7 @@
 
 Task 8 source check, 2026-10-07: no explicitly configured official Cursor Admin key or target email was found. Neither `cursor` nor `cursor-agent` is on PATH; the installed command named `agent` resolves to the Grok CLI. The standard Cursor local data directory checked was absent. Static inspection of the installed Grok Bot desktop's usage-display implementation identified in-memory usage values, but no stored usage snapshot in that installed version. Its IPC getters perform private authenticated provider calls, so they were not invoked. Browser cookies, client session tokens, passwords and account authentication databases were not read. No provider request was made during implementation or testing.
 
-The widget therefore ships a visible **Cursor: Not connected · needs API key** row and a distinct **Grok Bot: meter unavailable** subline. It does not show unknown values as zero and does not treat SuperGrok credit as Cursor usage. Installation and this source check did not change the running desktop widget or its service; isolated render proof is recorded in the task and install-validation document.
+The widget therefore ships a visible **Cursor: Not connected · needs API key** row and a **Grok Bot stats: see GROK row** subline. The GROK row displays a Bot percentage only when its billing source explicitly reports the GrokBot product. It does not show unknown values as zero and does not treat Grok credit as Cursor spending. Installation and this source check did not change the running desktop widget or its service; isolated render proof is recorded in the task and install-validation document.
 
 ## Exact settings
 

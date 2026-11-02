@@ -56,7 +56,7 @@ with ExitStack() as patches:
     assert widget.width() == 340 and image.width() == 340 and image.height() > 0
     assert not widget._cursor_row.isHidden()
     assert "Not connected" in widget._cursor_row.summary_text()
-    assert widget._cursor_row.bot_text() == "Grok Bot   — · meter unavailable"
+    assert widget._cursor_row.bot_text() == "Grok Bot stats: see GROK row"
     assert widget._cursor_row is not widget._grok_row
     image_path = os.environ.get("INDICATOR_SMOKE_IMAGE")
     if image_path:

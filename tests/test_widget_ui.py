@@ -990,7 +990,7 @@ class WidgetUiTest(unittest.TestCase):
         self.assertIsInstance(widget._cursor_row, CursorUsageRow)
         self.assertIsNot(widget._cursor_row, widget._grok_row)
         self.assertIn("Not connected", widget._cursor_row.summary_text())
-        self.assertEqual(widget._cursor_row.bot_text(), "Grok Bot   — · meter unavailable")
+        self.assertEqual(widget._cursor_row.bot_text(), "Grok Bot stats: see GROK row")
         self.assertNotIn("$0", widget._cursor_row.toolTip())
         self.assertIn("SuperGrok", widget._cursor_row.toolTip())
 
@@ -4214,3 +4214,13 @@ def test_email_responder_row_tooltip_is_aggregates_only(tmp_path):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_grok_bot_stats_are_visible_without_expanding_row():
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    row = GrokUsageRow()
+    row.set_data(GrokUsageSummary(used_percent=12, meter="weekly", source="live", products=(GrokProductUsage(product="GrokBot", used_percent=5),)))
+    assert row.summary_text() == "7D 12% · BOT 5%"
+    assert "GrokBot 5%" in row.toolTip()
+    row.close()
