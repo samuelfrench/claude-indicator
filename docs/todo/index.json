@@ -61,6 +61,21 @@
     "test": null
   },
   {
+    "path": "docs/todo/done/product/claude-local-quota-feed.md",
+    "slug": "claude-local-quota-feed",
+    "title": "Replace missing Claude quota headers with local status-line data",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-01",
+    "owner": "agent",
+    "brief": "Fix the live missing-header error using the supported local Claude Code feed.",
+    "refs": [
+      "a68e08052c4069eb4594d79d398920e453e39703"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/done/product/cursor-provider.md",
     "slug": "cursor-provider",
     "title": "Cursor provider with separate Grok Bot line",
@@ -255,26 +270,13 @@
     "status": "next",
     "area": "product",
     "due": null,
-    "updated": "2026-10-07",
+    "updated": "2026-11-01",
     "owner": "agent",
     "brief": "Keep header-only meters honest; provider terms review must precede any new authenticated probe.",
     "refs": [
       "bd69af3",
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
-    "test": null
-  },
-  {
-    "path": "docs/todo/product/claude-local-quota-feed.md",
-    "slug": "claude-local-quota-feed",
-    "title": "Replace missing Claude quota headers with local status-line data",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-11-01",
-    "owner": "agent",
-    "brief": "Fix the live missing-header error using the supported local Claude Code feed.",
-    "refs": [],
     "test": null
   },
   {
