@@ -149,6 +149,21 @@
     "test": "tests/test_widget_ui.py -k email_responder"
   },
   {
+    "path": "docs/todo/done/product/grok-bot-stats-restored.md",
+    "slug": "grok-bot-stats-restored",
+    "title": "Restore current Grok Bot stats and clarify their display source",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-02",
+    "owner": "agent",
+    "brief": "Restore current readings via native Grok /usage and expose the reported Bot breakdown.",
+    "refs": [
+      "docs/todo/done/product/grok-persistent-status.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/done/product/grok-persistent-status.md",
     "slug": "grok-persistent-status",
     "title": "Grok usage stays visible after the CLI token expires",
@@ -308,21 +323,6 @@
       "docs/todo/done/product/deepseek-pricing.md"
     ],
     "test": "tests/test_widget_ui.py -k deepseek"
-  },
-  {
-    "path": "docs/todo/product/grok-bot-stats-restored.md",
-    "slug": "grok-bot-stats-restored",
-    "title": "Restore current Grok Bot stats and clarify their display source",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-11-02",
-    "owner": "agent",
-    "brief": "Restore current readings via native Grok /usage and expose the reported Bot breakdown.",
-    "refs": [
-      "docs/todo/done/product/grok-persistent-status.md"
-    ],
-    "test": null
   },
   {
     "path": "docs/todo/product/grok-missing-meter.md",
