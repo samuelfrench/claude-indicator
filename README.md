@@ -26,7 +26,7 @@ The widget reuses credentials or local data from tools you have already configur
 
 | Provider | Current data source |
 |---|---|
-| Claude | Claude Code OAuth credentials; usage endpoint, OAuth refresh, or a minimal inference request whose response headers contain quotas |
+| Claude | Optional supported local status-line quota feed (see below); otherwise legacy Claude Code OAuth credentials; usage endpoint, OAuth refresh, or a minimal inference request whose response headers contain quotas |
 | Codex | Local `codex app-server` account rate-limit protocol, recent local session cache and local SQLite totals |
 | Cursor / Grok Bot | Official Enterprise Admin spending API with an explicitly configured key; separate Grok Bot line with an unavailable meter |
 | DeepSeek | Official balance endpoint plus local OpenCode cost ledger |
@@ -76,3 +76,9 @@ python3 scripts/verify_install.py
 ```
 
 Tests block unmocked Python HTTP requests. The installation verifier creates a fresh virtual environment and isolated home, installs the local project, checks the installed command and modules, and renders an inert offscreen widget with fetchers disabled. It never starts or restarts an existing widget. See [installation evidence](docs/beta/install-validation.md) for the current result and limits.
+
+### Local Claude quota feed
+
+Claude Code can supply subscription quota locally through its [documented status-line JSON](https://code.claude.com/docs/en/statusline). In a source checkout, set `statusLine.command` in `~/.claude/settings.json` to `python3 /absolute/path/to/scripts/claude_statusline.py --forward 'your existing status-line command'`. Omit `--forward` if there is no existing display. Preserve the other settings. The collector saves only quota percentages, resets and observation time in `~/.claude/indicator_quota.json` (mode 0600), and forwards the original input to your existing display command.
+
+When this collector is configured, the widget makes no Claude OAuth, refresh or inference requests. Quotas update after Claude Code activity; absent windows stay hidden, and snapshots expire after five minutes or their reset. Waiting/stale status is informational. This feed supplies no model-specific meters or extra-usage dollars. Other provider adapters are unchanged.

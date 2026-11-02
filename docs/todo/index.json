@@ -265,6 +265,19 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/claude-local-quota-feed.md",
+    "slug": "claude-local-quota-feed",
+    "title": "Replace missing Claude quota headers with local status-line data",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-01",
+    "owner": "agent",
+    "brief": "Fix the live missing-header error using the supported local Claude Code feed.",
+    "refs": [],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/deepseek-pricing-calendar.md",
     "slug": "deepseek-pricing-calendar",
     "title": "Refresh DeepSeek holiday calendar for 2027",
