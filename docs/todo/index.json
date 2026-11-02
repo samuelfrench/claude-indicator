@@ -155,6 +155,21 @@
     "test": "QT_QPA_PLATFORM=offscreen python3 -m pytest -q; python3 scripts/verify_install.py"
   },
   {
+    "path": "docs/todo/done/product/outreach-studio-tray.md",
+    "slug": "outreach-studio-tray",
+    "title": "Open Outreach Studio from the tray",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-01",
+    "owner": "agent",
+    "brief": "Deployed 35980eb after both green CI runs; live Claude and Codex DBus tray menus expose enabled Outreach Studio link; local app health verified.",
+    "refs": [
+      "../outreach-automation/README.md"
+    ],
+    "test": "QT_QPA_PLATFORM=offscreen python3 -m pytest -q"
+  },
+  {
     "path": "docs/todo/done/product/promo-channel-research-2026-10-08.md",
     "slug": "promo-channel-research-2026-10-08",
     "title": "Alternative Indicator promotion channels: research only",
@@ -279,21 +294,6 @@
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
     "test": "tests/test_widget_ui.py Grok billing has no weekly or on-demand meter"
-  },
-  {
-    "path": "docs/todo/product/outreach-studio-tray.md",
-    "slug": "outreach-studio-tray",
-    "title": "Open Outreach Studio from the tray",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-11-01",
-    "owner": "agent",
-    "brief": "Implemented and reviewed; 554 tests plus 46 subtests, 25 TODO tests and fresh installation verifier pass. Awaiting CI and live service restart.",
-    "refs": [
-      "../outreach-automation/README.md"
-    ],
-    "test": "QT_QPA_PLATFORM=offscreen python3 -m pytest -q"
   },
   {
     "path": "docs/todo/product/paid-release-source-and-license-decisions.md",
