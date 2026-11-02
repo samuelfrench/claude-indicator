@@ -4667,7 +4667,7 @@ def _retry_after_seconds(resp) -> float:
 
 
 def read_claude_statusline_usage() -> UsageData | None:
-    """Read the explicitly configured local feed, bounded by age and resets."""
+    """Read last-known local quotas until their window resets."""
     try:
         settings = json.loads((Path.home() / ".claude" / "settings.json").read_text())
         configured = "claude_statusline.py" in settings.get("statusLine", {}).get("command", "")
@@ -4680,8 +4680,8 @@ def read_claude_statusline_usage() -> UsageData | None:
         raw = json.loads(CLAUDE_STATUSLINE_PATH.read_text())
         fetched_at = float(raw["fetched_at"])
         now = time.time()
-        if not math.isfinite(fetched_at) or not 0 <= now - fetched_at <= 300:
-            return UsageData(error="Claude quota stale · use Claude Code to refresh", source=USAGE_SOURCE_STATUSLINE)
+        if not math.isfinite(fetched_at) or not 0 <= now - fetched_at <= 7 * 86400:
+            return waiting
         entries = []
         for name in ("five_hour", "seven_day"):
             window = raw["rate_limits"].get(name)
@@ -5248,7 +5248,14 @@ class UsageLimitsWidget(QWidget):
             parent = parent.parent() if hasattr(parent, "parent") else None
 
     def set_data(self, data: UsageData, estimate: str = ""):
-        self._local_windows = (bool(data.five_hour.resets_at), bool(data.seven_day.resets_at)) if data.source == USAGE_SOURCE_STATUSLINE else None
+        self._local_windows = None
+        if data.source == USAGE_SOURCE_STATUSLINE:
+            self._local_windows = tuple(
+                entry.reset_dt is not None and entry.reset_dt.timestamp() > time.time()
+                for entry in (data.five_hour, data.seven_day)
+            )
+            if not self._local_windows[0]:
+                estimate = ""
         self.five_hour_bar.set_data(
             data.five_hour.utilization,
             data.five_hour.time_remaining(),
@@ -9923,7 +9930,10 @@ class ClaudeWidget(QWidget):
 
         if not data.error:
             self._title_label.setText(data.plan_name)
-            if data.source != USAGE_SOURCE_STATUSLINE or (data.five_hour.resets_at and data.seven_day.resets_at):
+            if data.source != USAGE_SOURCE_STATUSLINE or (
+                data.five_hour.resets_at and data.seven_day.resets_at
+                and (not self._history.points or data.fetched_at > self._history.points[-1].timestamp)
+            ):
                 self._history.add(data)
                 self._graph.set_points(self._history.points)
             self._seed_stats_row_from_usage(data)
@@ -10012,7 +10022,10 @@ class ClaudeWidget(QWidget):
             age = self._format_age(now - data.fetched_at) if data.fetched_at else "just now"
             text = f"Updated: {age}  ·  Next: {remaining}s"
             if data.source == USAGE_SOURCE_STATUSLINE:
-                self._set_status_text(f"Claude Code · {age}", tooltip="Local Claude Code quota snapshot; refreshes after Claude Code activity.")
+                self._set_status_text(
+                    f"Claude Code cache · {age}",
+                    tooltip=f"Last-known Claude Code quota, observed {age}. Refreshes after Claude Code activity; each meter is hidden when its window resets.",
+                )
             elif data.source == USAGE_SOURCE_RATELIMIT_HEADERS:
                 self._set_status_text(
                     f"{text}  ·  OAuth",

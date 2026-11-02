@@ -40,7 +40,7 @@ def test_capture_and_read_without_provider_calls(feed):
     assert result.seven_day.utilization == 41.2
 
 
-@pytest.mark.parametrize("kind", ["missing", "malformed", "old", "future"])
+@pytest.mark.parametrize("kind", ["missing", "malformed", "too_old", "future"])
 def test_unavailable_feed_never_probes_or_invents_quota(feed, kind):
     collector.capture(payload(), feed)
     raw = json.loads(feed.read_text())
@@ -49,7 +49,7 @@ def test_unavailable_feed_never_probes_or_invents_quota(feed, kind):
     elif kind == "malformed":
         feed.write_text("{")
     else:
-        if kind == "old": raw["fetched_at"] -= 301
+        if kind == "too_old": raw["fetched_at"] -= 7 * 86400 + 1
         if kind == "future": raw["fetched_at"] += 60
         if kind == "expired": raw["rate_limits"]["five_hour"]["resets_at"] = 1
         if kind == "partial": del raw["rate_limits"]["seven_day"]
@@ -90,4 +90,46 @@ def test_render_partial_windows_without_zero_meter(feed):
     limits.set_data(widget.ClaudeUsageClient().fetch())
     assert limits.five_hour_bar.isHidden()
     assert not limits.seven_day_bar.isHidden()
+    limits.close()
+
+
+@pytest.mark.parametrize("age", [301, 3600, 10 * 3600])
+def test_idle_snapshot_preserves_weekly_quota_until_reset(feed, age):
+    collector.capture(payload(), feed)
+    raw = json.loads(feed.read_text())
+    raw["fetched_at"] -= age
+    # Five-hour window has reset; weekly observation remains useful.
+    raw["rate_limits"]["five_hour"]["resets_at"] = time.time() - 1
+    feed.write_text(json.dumps(raw))
+    result = widget.ClaudeUsageClient().fetch()
+    assert not result.error
+    assert result.fetched_at == raw["fetched_at"]
+    assert result.seven_day.utilization == 41.2
+    assert not result.five_hour.resets_at
+
+
+def test_all_windows_reset_waits_without_inventing_zero(feed):
+    raw = payload()
+    for window in raw["rate_limits"].values():
+        window["resets_at"] = time.time() - 1
+    collector.capture(raw, feed)
+    result = widget.ClaudeUsageClient().fetch()
+    assert result.error == "Waiting for Claude Code quota"
+    assert not result.five_hour.resets_at
+    assert not result.seven_day.resets_at
+
+
+def test_loaded_local_meters_hide_at_reset_without_waiting_for_fetch(feed):
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    collector.capture(payload(), feed)
+    result = widget.ClaudeUsageClient().fetch()
+    limits = widget.UsageLimitsWidget()
+    limits.set_data(result, estimate="old estimate")
+    assert not limits.five_hour_bar.isHidden()
+    with patch("claude_widget.time.time", return_value=time.time() + 86401):
+        limits.set_data(result, estimate="old estimate")
+    assert limits.five_hour_bar.isHidden()
+    assert limits.seven_day_bar.isHidden()
+    assert limits.estimate_label.text() == ""
     limits.close()

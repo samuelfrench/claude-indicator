@@ -280,6 +280,21 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/claude-idle-quota-cache.md",
+    "slug": "claude-idle-quota-cache",
+    "title": "Keep last-known Claude quotas visible while Claude Code is idle",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-02",
+    "owner": "agent",
+    "brief": "Remove the premature five-minute expiry that hides valid quota snapshots.",
+    "refs": [
+      "a68e080"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/deepseek-pricing-calendar.md",
     "slug": "deepseek-pricing-calendar",
     "title": "Refresh DeepSeek holiday calendar for 2027",
