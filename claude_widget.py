@@ -132,6 +132,7 @@ OLLAMA_URL = "http://127.0.0.1:11434"
 COMFYUI_URL = "http://127.0.0.1:8188"
 TRAFFIC_REPORT_URL = "http://127.0.0.1:4711/"
 OUTREACH_STUDIO_URL = "http://127.0.0.1:4740/"
+CRON_MANAGER_URL = "http://127.0.0.1:4741/"
 DEEPSEEK_HISTORY_VERSION = 1
 DEEPSEEK_HISTORY_RETENTION_S = 8 * 24 * 3600
 DEEPSEEK_SNAPSHOT_MAX_AGE_S = 15 * 60
@@ -10588,6 +10589,9 @@ class ClaudeWidget(QWidget):
         outreach_action = QAction("Outreach Studio", self)
         outreach_action.triggered.connect(self._open_outreach_studio)
         menu.addAction(outreach_action)
+        cron_manager_action = QAction("Cron Manager", self)
+        cron_manager_action.triggered.connect(self._open_cron_manager)
+        menu.addAction(cron_manager_action)
         recovery_action = QAction("Terminal recovery…", self)
         recovery_action.triggered.connect(self._show_terminal_recovery)
         menu.addAction(recovery_action)
@@ -10743,6 +10747,14 @@ class ClaudeWidget(QWidget):
             QToolTip.showText(
                 QCursor.pos(),
                 f"Could not open Outreach Studio.\nOpen {OUTREACH_STUDIO_URL} in your browser.",
+                msecShowTime=5000,
+            )
+
+    def _open_cron_manager(self):
+        if not QDesktopServices.openUrl(QUrl(CRON_MANAGER_URL)):
+            QToolTip.showText(
+                QCursor.pos(),
+                f"Could not open Cron Manager.\nOpen {CRON_MANAGER_URL} in your browser.",
                 msecShowTime=5000,
             )
 

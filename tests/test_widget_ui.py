@@ -2271,9 +2271,9 @@ class WidgetUiTest(unittest.TestCase):
             actions = tray.contextMenu().actions()
             self.assertEqual(
                 [action.text() for action in actions],
-                ["Traffic Report", "Outreach Studio", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
+                ["Traffic Report", "Outreach Studio", "Cron Manager", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
             )
-            self.assertTrue(actions[5].isSeparator())
+            self.assertTrue(actions[6].isSeparator())
         self.assertFalse(hasattr(widget, "_smart_todo_dialog"))
         self.assertFalse(hasattr(widget, "_show_smart_todos"))
 
@@ -2295,6 +2295,14 @@ class WidgetUiTest(unittest.TestCase):
             action = next(a for a in widget._tray.contextMenu().actions() if a.text() == "Outreach Studio")
             action.trigger()
         self.assertEqual(open_url.call_args.args[0].toString(), "http://127.0.0.1:4740/")
+
+    def test_cron_manager_tray_action_opens_local_app(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        with patch.object(claude_widget.QDesktopServices, "openUrl", return_value=True) as open_url:
+            action = next(a for a in widget._tray.contextMenu().actions() if a.text() == "Cron Manager")
+            action.trigger()
+        open_url.assert_called_once()
+        self.assertEqual(open_url.call_args.args[0].toString(), "http://127.0.0.1:4741/")
 
     def test_quota_trays_have_distinct_windows_and_share_the_existing_menu(self):
         widget = self._make_inert_claude_widget(tray_available=True)
@@ -2336,13 +2344,13 @@ class WidgetUiTest(unittest.TestCase):
         self.assertFalse(retry_timer.isActive())
         self.assertEqual(
             [action.text() for action in tray.contextMenu().actions()],
-            ["Traffic Report", "Outreach Studio", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
+            ["Traffic Report", "Outreach Studio", "Cron Manager", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
         )
 
         retry_timer.timeout.emit()
 
         self.assertIs(widget._tray, tray)
-        self.assertEqual(len(tray.contextMenu().actions()), 7)
+        self.assertEqual(len(tray.contextMenu().actions()), 8)
         self.assertEqual(len(widget.findChildren(QSystemTrayIcon)), 2)
 
     def test_minimize_fallback_moves_into_tray_when_host_becomes_available(self):
@@ -3844,7 +3852,7 @@ class WidgetUiTest(unittest.TestCase):
         actions = widget._tray.contextMenu().actions()
         self.assertEqual(
             [action.text() for action in actions],
-            ["Traffic Report", "Outreach Studio", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
+            ["Traffic Report", "Outreach Studio", "Cron Manager", "Terminal recovery…", "Configure", "Show/Hide", "", "Quit"],
         )
         menu = QMenu()
         widget._populate_config_menu(menu)
