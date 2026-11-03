@@ -10107,7 +10107,13 @@ class ClaudeWidget(QWidget):
             self._set_history_expanded(False)
 
     def _update_countdowns(self):
-        """Update countdown strings every second without re-fetching."""
+        """Update countdowns and local quota data without provider requests."""
+        if (not self._shutdown_started and self._usage is not None
+                and self._usage.source == USAGE_SOURCE_STATUSLINE
+                and (self._section_visible("claude") or self._section_visible("history"))):
+            local = read_claude_statusline_usage()
+            if local is not None and local != self._usage:
+                self._on_usage_fetched(local)
         if (self._minimize_pending_tray and not self._shutdown_started
                 and not self._restore_sliver.isVisible()
                 and not QSystemTrayIcon.isSystemTrayAvailable()):

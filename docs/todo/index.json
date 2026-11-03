@@ -323,6 +323,19 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/claude-local-quota-refresh.md",
+    "slug": "claude-local-quota-refresh",
+    "title": "Refresh Claude local quota as soon as it arrives",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-03",
+    "owner": "agent",
+    "brief": "Replace the five-minute local-feed delay with pickup on the existing one-second timer.",
+    "refs": [],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/deepseek-pricing-calendar.md",
     "slug": "deepseek-pricing-calendar",
     "title": "Refresh DeepSeek holiday calendar for 2027",

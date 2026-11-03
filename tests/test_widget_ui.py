@@ -1913,6 +1913,43 @@ class WidgetUiTest(unittest.TestCase):
         self.addCleanup(widget.deleteLater)
         return widget
 
+    def test_local_quota_tick_replaces_waiting_without_provider_fetch(self):
+        widget = self._make_inert_claude_widget()
+        waiting = UsageData(error="Waiting for Claude Code quota", source="statusline")
+        fresh = UsageData(
+            seven_day=UsageEntry(12, datetime.fromtimestamp(time.time() + 86400, timezone.utc).isoformat()),
+            fetched_at=time.time(), source="statusline",
+        )
+        widget._on_usage_fetched(waiting)
+        self.assertTrue(widget._usage_limits.isHidden())
+        with patch.object(claude_widget, "read_claude_statusline_usage", return_value=fresh), \
+                patch.object(ClaudeUsageClient, "fetch", side_effect=AssertionError("Provider fetch")), \
+                patch.object(claude_widget, "save_last_usage") as save:
+            widget._update_countdowns()
+            self.assertEqual(widget._usage, fresh)
+            self.assertFalse(widget._usage_limits.isHidden())
+            self.assertTrue(widget._usage_limits.five_hour_bar.isHidden())
+            self.assertFalse(widget._usage_limits.seven_day_bar.isHidden())
+            self.assertIn("Last-known Claude Code quota", widget._status_label.toolTip())
+            widget._update_countdowns()
+            save.assert_called_once_with(fresh)
+            widget.hide()
+            with patch.object(claude_widget, "read_claude_statusline_usage", return_value=waiting):
+                widget._update_countdowns()
+            self.assertEqual(widget._usage, waiting)
+            self.assertTrue(widget._usage_limits.isHidden())
+
+    def test_local_quota_tick_skips_inactive_sources(self):
+        widget = self._make_inert_claude_widget()
+        for mode in ("legacy", "disabled", "shutdown"):
+            with self.subTest(mode=mode):
+                widget._usage = UsageData(source="usage_api" if mode == "legacy" else "statusline")
+                widget._shutdown_started = mode == "shutdown"
+                with patch.object(widget, "_section_visible", return_value=mode != "disabled"), \
+                        patch.object(claude_widget, "read_claude_statusline_usage") as read:
+                    widget._update_countdowns()
+                    read.assert_not_called()
+
     @staticmethod
     def _terminal_session(key="1:1", parked=False, needs_attention=False):
         return TerminalSession(
