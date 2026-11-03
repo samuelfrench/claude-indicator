@@ -91,6 +91,19 @@
     "test": null
   },
   {
+    "path": "docs/todo/done/product/cron-manager-tray.md",
+    "slug": "cron-manager-tray",
+    "title": "Open Cron Manager from the tray",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-02",
+    "owner": "agent",
+    "brief": "Deployed 31415ec with green CI; live Claude/Codex tray menus expose enabled Cron Manager link to port4741.",
+    "refs": [],
+    "test": "QT_QPA_PLATFORM=offscreen python3 -m pytest -q"
+  },
+  {
     "path": "docs/todo/done/product/cursor-provider.md",
     "slug": "cursor-provider",
     "title": "Cursor provider with separate Grok Bot line",
@@ -308,19 +321,6 @@
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
     "test": null
-  },
-  {
-    "path": "docs/todo/product/cron-manager-tray.md",
-    "slug": "cron-manager-tray",
-    "title": "Open Cron Manager from the tray",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-11-02",
-    "owner": "agent",
-    "brief": "Tray action and exact URL test pass; 571 isolated tests and clean-install verifier pass. Push, verify CI and deploy.",
-    "refs": [],
-    "test": "QT_QPA_PLATFORM=offscreen python3 -m pytest -q"
   },
   {
     "path": "docs/todo/product/deepseek-pricing-calendar.md",
