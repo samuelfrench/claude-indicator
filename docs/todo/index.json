@@ -91,6 +91,21 @@
     "test": null
   },
   {
+    "path": "docs/todo/done/product/claude-local-quota-refresh.md",
+    "slug": "claude-local-quota-refresh",
+    "title": "Refresh Claude local quota as soon as it arrives",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-03",
+    "owner": "agent",
+    "brief": "Replace the five-minute local-feed delay with pickup on the existing one-second timer.",
+    "refs": [
+      "03a7e038637bebe36fb38a6f2c400e38cda3bbe1"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/done/product/cron-manager-tray.md",
     "slug": "cron-manager-tray",
     "title": "Open Cron Manager from the tray",
@@ -320,19 +335,6 @@
       "bd69af3",
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
-    "test": null
-  },
-  {
-    "path": "docs/todo/product/claude-local-quota-refresh.md",
-    "slug": "claude-local-quota-refresh",
-    "title": "Refresh Claude local quota as soon as it arrives",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-11-03",
-    "owner": "agent",
-    "brief": "Replace the five-minute local-feed delay with pickup on the existing one-second timer.",
-    "refs": [],
     "test": null
   },
   {
