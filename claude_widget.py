@@ -114,7 +114,7 @@ COMFYUI_REFRESH_MS = 10 * 1000
 TRAY_RETRY_INTERVAL_MS = 5 * 1000  # retry while the desktop tray host is absent
 RESTORE_SLIVER_WIDTH = 28
 RESTORE_SLIVER_HEIGHT = 72
-CRON_REFRESH_MS = 5 * 60 * 1000  # 5 minutes — crontab/journal state changes slowly
+CRON_REFRESH_MS = 60 * 1000  # share Cron Manager's one-minute snapshot cache
 CRON_JOURNAL_WINDOW_HOURS = 48
 CRON_LATE_GRACE_S = 180  # allow journal lag before flagging a run as missed
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
@@ -623,15 +623,20 @@ class EmailResponderStatus:
 
 @dataclass
 class CronJobInfo:
-    """One user crontab entry plus run history recovered from the journal."""
+    """A scheduler job; legacy crontab helpers also use this record."""
     label: str
     schedule: str
     command: str
     last_run_ts: float | None = None
     runs_24h: int = 0
     next_run_ts: float | None = None
-    status: str = "unknown"  # ok | late | unknown
+    status: str = "unknown"  # Cron Manager result, or legacy ok/late
     error: str = ""
+    id: str = ""
+    source: str = ""
+    project: str = ""
+    description: str = ""
+    enabled: bool | None = None
 
     def last_run_str(self) -> str:
         if self.last_run_ts is None:
@@ -656,6 +661,15 @@ class CronJobInfo:
         if remaining < 86400:
             return f"next {int(remaining // 3600)}h"
         return f"next {int(remaining // 86400)}d"
+
+
+@dataclass
+class CronSnapshot:
+    """One shared Cron Manager inventory, or a failed attempt to read it."""
+    jobs: list[CronJobInfo] = field(default_factory=list)
+    generated_at: float | None = None
+    sources: list[dict] = field(default_factory=list)
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -4598,7 +4612,7 @@ def attach_cron_run_history(
             job.status = "unknown"
 
 
-def fetch_cron_jobs() -> list[CronJobInfo]:
+def fetch_user_cron_jobs() -> list[CronJobInfo]:
     """Read the user crontab and score each job's health from the journal."""
     jobs = parse_crontab_text(_read_user_crontab())
     if not jobs:
@@ -4612,6 +4626,55 @@ def fetch_cron_jobs() -> list[CronJobInfo]:
         _system_boot_ts(),
     )
     return jobs
+
+
+def _cron_timestamp(value) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Invalid timestamp")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def parse_cron_snapshot(payload: dict) -> CronSnapshot:
+    """Use the monitor's inventory and result receipts without rescoring jobs."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list) or not isinstance(payload.get("sources"), list):
+        raise ValueError("Invalid snapshot")
+    generated_at = _cron_timestamp(payload.get("generatedAt"))
+    if generated_at is None:
+        raise ValueError("Missing snapshot time")
+    jobs = []
+    statuses = {"success", "failed", "running", "unknown", "never", "skipped", "cancelled"}
+    for item in payload["jobs"]:
+        if not isinstance(item, dict) or any(not isinstance(item.get(key), str) for key in ("id", "name", "source", "project", "schedule", "command", "description")):
+            raise ValueError("Invalid job")
+        if item.get("status") not in statuses or (item.get("enabled") is not None and type(item["enabled"]) is not bool):
+            raise ValueError("Invalid job status")
+        jobs.append(CronJobInfo(
+            id=item["id"], label=item["name"], source=item["source"],
+            project=item["project"], schedule=item["schedule"], command=item["command"],
+            description=item["description"], enabled=item.get("enabled"),
+            status=item["status"], last_run_ts=_cron_timestamp(item.get("lastRunAt")),
+            next_run_ts=_cron_timestamp(item.get("nextRunAt")),
+        ))
+    for source in payload["sources"]:
+        if not isinstance(source, dict) or any(not isinstance(source.get(key), str) for key in ("name", "status", "message")) or source["status"] not in {"ok", "partial", "unavailable"}:
+            raise ValueError("Invalid source coverage")
+    return CronSnapshot(jobs=jobs, generated_at=generated_at, sources=payload["sources"])
+
+
+def fetch_cron_jobs() -> CronSnapshot:
+    """Read only the shared loopback snapshot; never start or modify jobs."""
+    try:
+        with requests.Session() as session:
+            session.trust_env = False  # Local inventory must not use proxy settings.
+            response = session.get(CRON_MANAGER_URL + "api/snapshot", timeout=(3, 90), allow_redirects=False)
+            response.raise_for_status()
+            if response.status_code != 200:
+                raise ValueError("Unexpected snapshot response")
+            return parse_cron_snapshot(response.json())
+    except (requests.RequestException, ValueError, TypeError, OverflowError) as exc:
+        return CronSnapshot(error=f"Cron Manager unavailable ({type(exc).__name__})")
 
 
 # ---------------------------------------------------------------------------
@@ -4931,7 +4994,7 @@ class EmailResponderStatusWorker(QThread):
 
 
 class CronJobsFetchWorker(QThread):
-    finished = Signal(list)
+    finished = Signal(object)
 
     def __init__(self, fetcher=None):
         super().__init__()
@@ -8605,119 +8668,175 @@ class EmailResponderRow(QWidget):
 
 
 class CronJobsWidget(QWidget):
-    """Collapsible row showing user crontab jobs with per-job run health."""
+    """Compact, paged view of the same snapshot used by Cron Manager."""
 
     _HEADER_H = 22
     _ROW_H = 18
     _PAD = 2
+    _PAGE_SIZE = 10
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._snapshot: CronSnapshot | None = None
         self._jobs: list[CronJobInfo] = []
+        self._error = ""
         self._expanded = False
+        self._page = 0
         self.setFixedHeight(0)
         self.hide()
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName("Cron Manager jobs")
 
-    def set_data(self, jobs: list[CronJobInfo]):
-        self._jobs = jobs
-        if jobs:
-            self._update_height()
-            self.setToolTip(
-                "\n".join(f"{j.schedule}  {j.command}" for j in jobs)
-            )
-            self.show()
-        else:
-            self.setFixedHeight(0)
-            self.setToolTip("")
-            self.hide()
+    def set_data(self, snapshot: CronSnapshot):
+        self._error = snapshot.error
+        if not snapshot.error or self._snapshot is None:
+            self._snapshot = snapshot
+            self._jobs = snapshot.jobs
+        self._page = min(self._page, self._last_page())
+        self._update_height()
+        self.setToolTip(self._overview())
+        self.setAccessibleDescription(self._overview())
+        self.show()
         self.update()
 
+    def _last_page(self):
+        return max(0, (len(self._jobs) - 1) // self._PAGE_SIZE)
+
+    def _page_jobs(self):
+        start = self._page * self._PAGE_SIZE
+        return self._jobs[start:start + self._PAGE_SIZE]
+
     def _update_height(self):
-        if not self._jobs:
-            self.setFixedHeight(0)
-            return
-        if self._expanded:
-            h = self._HEADER_H + self._ROW_H * len(self._jobs) + self._PAD
-        else:
-            h = self._HEADER_H
-        self.setFixedHeight(h)
+        rows = len(self._page_jobs()) + (1 if self._last_page() else 0)
+        self.setFixedHeight(self._HEADER_H + (self._ROW_H * rows + self._PAD if self._expanded else 0))
+
+    def _change_page(self, delta):
+        self._page = max(0, min(self._last_page(), self._page + delta))
+        self._update_height()
+        if self.parent():
+            self.parent().adjustSize()
+        self.update()
 
     def mousePressEvent(self, event):
-        if not self._jobs:
-            return
-        self._expanded = not self._expanded
-        self._update_height()
+        y = event.position().y()
+        if self._expanded and self._last_page() and y >= self._HEADER_H + len(self._page_jobs()) * self._ROW_H:
+            self._change_page(-1 if event.position().x() < self.width() / 2 else 1)
+        elif y < self._HEADER_H:
+            self._expanded = not self._expanded
+            self._update_height()
         parent = self.parent()
-        while parent:
-            if hasattr(parent, "adjustSize"):
-                parent.adjustSize()
-                break
-            parent = parent.parent() if hasattr(parent, "parent") else None
+        if parent:
+            parent.adjustSize()
         event.accept()
 
+    def wheelEvent(self, event):
+        if self._expanded:
+            self._change_page(-1 if event.angleDelta().y() > 0 else 1)
+            event.accept()
+        else:
+            event.ignore()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Right, Qt.Key.Key_PageDown, Qt.Key.Key_Down):
+            self._change_page(1)
+        elif event.key() in (Qt.Key.Key_Left, Qt.Key.Key_PageUp, Qt.Key.Key_Up):
+            self._change_page(-1)
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Space):
+            self._expanded = not self._expanded
+            self._update_height()
+            if self.parent():
+                self.parent().adjustSize()
+        else:
+            return super().keyPressEvent(event)
+        self.update()
+        event.accept()
+
+    def _overview(self):
+        lines = ["Cron Manager · automatically refreshed every minute", self._summary_text()]
+        if self._snapshot and self._snapshot.generated_at is not None:
+            lines.append("Last updated: " + datetime.fromtimestamp(self._snapshot.generated_at).astimezone().isoformat(timespec="seconds"))
+        if self._error:
+            lines.append(self._error + "; retrying automatically")
+        if self._snapshot:
+            lines.extend(f"{source['name']}: {source['status']} — {source['message']}" for source in self._snapshot.sources)
+        lines.append("Click header to expand. Scroll or use arrow keys to page; hover a job for details.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _job_detail(job):
+        enabled = "disabled" if job.enabled is False else "enabled" if job.enabled is True else "enablement unknown"
+        return "\n".join([
+            f"{job.label} ({job.source} · {job.project})", job.description,
+            f"Result: {job.status} · {enabled}", f"Schedule: {job.schedule}",
+            "Last run: " + (datetime.fromtimestamp(job.last_run_ts).astimezone().isoformat(timespec="seconds") if job.last_run_ts is not None else "not recorded"),
+            "Next run: " + (datetime.fromtimestamp(job.next_run_ts).astimezone().isoformat(timespec="seconds") if job.next_run_ts is not None and job.enabled is not False else "not available"),
+            job.command, f"ID: {job.id}",
+        ])
+
+    def mouseMoveEvent(self, event):
+        row = int((event.position().y() - self._HEADER_H) // self._ROW_H)
+        jobs = self._page_jobs()
+        self.setToolTip(self._job_detail(jobs[row]) if self._expanded and 0 <= row < len(jobs) else self._overview())
+        super().mouseMoveEvent(event)
+
     def _summary_text(self) -> str:
-        late = sum(1 for j in self._jobs if j.status == "late")
-        if late:
-            return f"{len(self._jobs)} jobs · {late} late"
-        return f"{len(self._jobs)} jobs · all ok"
+        if self._error:
+            return f"{len(self._jobs)} jobs · stale / unavailable" if self._jobs else "unavailable"
+        counts = {}
+        for job in self._jobs:
+            counts[job.status] = counts.get(job.status, 0) + 1
+        parts = [f"{len(self._jobs)} jobs"]
+        parts.extend(f"{counts[status]} {status}" for status in ("failed", "running", "unknown", "never", "cancelled", "skipped", "success") if counts.get(status))
+        if self._snapshot and any(source["status"] != "ok" for source in self._snapshot.sources):
+            parts.insert(1, "partial coverage")
+        if self._snapshot and self._snapshot.generated_at is not None and time.time() - self._snapshot.generated_at > 180:
+            parts.insert(1, "stale")
+        return " · ".join(parts)
 
     @staticmethod
     def _status_color(status: str) -> QColor:
-        if status == "ok":
-            return QColor(34, 197, 94)  # green
-        if status == "late":
-            return QColor(239, 68, 68)  # red
-        return QColor(120, 120, 150)  # gray — unknown/no data
+        if status == "success":
+            return QColor(34, 197, 94)
+        if status == "failed":
+            return QColor(239, 68, 68)
+        if status == "running":
+            return QColor(96, 165, 250)
+        return QColor(160, 160, 180)
 
     def paintEvent(self, event):
-        if not self._jobs:
+        if self._snapshot is None:
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w = self.width()
-
-        font = QFont("sans-serif", 8)
-        font.setWeight(QFont.Weight.Medium)
-        p.setFont(font)
+        p.setFont(QFont("sans-serif", 8))
         fm = p.fontMetrics()
-
-        y = 14
-        arrow = "▾" if self._expanded else "▸"
-        p.setPen(QColor(100, 100, 120))
-        header_text = f"CRON JOBS {arrow}"
-        p.drawText(4, y, header_text)
-
-        if not self._expanded:
-            x = 4 + fm.horizontalAdvance(header_text) + 8
-            late = any(j.status == "late" for j in self._jobs)
-            p.setPen(self._status_color("late" if late else "ok"))
-            p.drawText(x, y, self._summary_text())
-            p.end()
-            return
-
-        for i, job in enumerate(self._jobs):
-            row_y = self._HEADER_H + self._ROW_H * i + 13
-
-            # Right side: last run (health-colored) plus next run (dim)
-            last_str = job.last_run_str()
-            next_str = job.next_run_str()
-            right = last_str if not next_str else f"{last_str} · {next_str}"
-            rw = fm.horizontalAdvance(right)
-            if next_str:
-                nx = w - 4 - fm.horizontalAdvance(f" · {next_str}")
-                p.setPen(QColor(100, 100, 130))
-                p.drawText(nx, row_y, f" · {next_str}")
-            p.setPen(self._status_color(job.status))
-            p.drawText(w - rw - 4, row_y, last_str)
-
-            # Left side: label elided to the remaining space
-            label = fm.elidedText(
-                job.label, Qt.TextElideMode.ElideRight, w - rw - 20
-            )
-            p.setPen(QColor(180, 180, 200))
-            p.drawText(8, row_y, label)
-
+        w = self.width()
+        p.setPen(QColor(160, 160, 180))
+        header = f"CRONS {'▾' if self._expanded else '▸'} "
+        p.drawText(4, 14, header)
+        x = 4 + fm.horizontalAdvance(header)
+        p.setPen(QColor(245, 180, 70) if self._error else QColor(180, 180, 200))
+        p.drawText(x, 14, fm.elidedText(self._summary_text(), Qt.TextElideMode.ElideRight, max(0, w - x - 4)))
+        if self._expanded:
+            for i, job in enumerate(self._page_jobs()):
+                y = self._HEADER_H + self._ROW_H * i + 13
+                right = job.status + (" (off)" if job.enabled is False else "")
+                right += " · " + job.last_run_str()
+                rw = fm.horizontalAdvance(right)
+                p.setPen(self._status_color(job.status))
+                p.drawText(w - rw - 4, y, right)
+                label = f"{job.label} · {job.source}"
+                p.setPen(QColor(180, 180, 200))
+                p.drawText(8, y, fm.elidedText(label, Qt.TextElideMode.ElideRight, max(0, w - rw - 20)))
+            if self._last_page():
+                p.setPen(QColor(160, 160, 180))
+                y = self.height() - 5
+                p.drawText(8, y, "‹ Previous")
+                page = f"{self._page + 1}/{self._last_page() + 1}"
+                p.drawText((w - fm.horizontalAdvance(page)) // 2, y, page)
+                p.drawText(w - fm.horizontalAdvance("Next ›") - 8, y, "Next ›")
         p.end()
 
 
@@ -9685,7 +9804,7 @@ class ClaudeWidget(QWidget):
                 self._email_responder_row._status,
             )
             self._set_hideable_row_visible(
-                self._cron_row, self._section_visible("cron"), self._cron_row._jobs
+                self._cron_row, self._section_visible("cron"), self._cron_row._snapshot
             )
             self._sys_row.setVisible(self._section_visible("system"))
             self._local_ai_section.setVisible(self._section_visible("local_ai"))
@@ -9789,7 +9908,7 @@ class ClaudeWidget(QWidget):
         )
         self._email_responder_timer.start(EMAIL_RESPONDER_REFRESH_MS)
 
-        # Cron jobs timer - every 5 minutes
+        # Cron Manager snapshot timer - every minute
         self._cron_timer = QTimer(self)
         self._cron_timer.timeout.connect(self._fetch_cron_jobs)
         self._cron_timer.start(CRON_REFRESH_MS)
@@ -10175,7 +10294,7 @@ class ClaudeWidget(QWidget):
         self._task_group_worker.start()
 
     def _fetch_cron_jobs(self):
-        if not self._section_visible("cron"):
+        if self._shutdown_started or not self._section_visible("cron"):
             return
         if self._cron_worker and self._cron_worker.isRunning():
             return
@@ -10183,8 +10302,13 @@ class ClaudeWidget(QWidget):
         self._cron_worker.finished.connect(self._on_cron_jobs_fetched)
         self._cron_worker.start()
 
-    def _on_cron_jobs_fetched(self, jobs: list):
-        self._cron_row.set_data(jobs)
+    def _on_cron_jobs_fetched(self, snapshot: CronSnapshot):
+        log_line(
+            f"cron snapshot: jobs={len(snapshot.jobs)} generated_at={snapshot.generated_at} "
+            f"state={'unavailable' if snapshot.error else 'received'}"
+        )
+        self._cron_row.set_data(snapshot)
+        self._cron_row.setVisible(self._section_visible("cron"))
         self.adjustSize()
 
     def _on_task_groups_fetched(self, groups: list):
