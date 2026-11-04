@@ -338,6 +338,22 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/cron-manager-sync.md",
+    "slug": "cron-manager-sync",
+    "title": "Automatically sync Crons with Cron Manager",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-04",
+    "owner": "agent",
+    "brief": "Replace the independent crontab view with automatic read-only Cron Manager snapshot polling.",
+    "refs": [
+      "claude_widget.py",
+      "tests/test_cron_jobs.py"
+    ],
+    "test": "tests/test_cron_jobs.py"
+  },
+  {
     "path": "docs/todo/product/deepseek-pricing-calendar.md",
     "slug": "deepseek-pricing-calendar",
     "title": "Refresh DeepSeek holiday calendar for 2027",
