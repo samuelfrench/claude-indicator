@@ -2185,11 +2185,12 @@ class WidgetUiTest(unittest.TestCase):
         for size in (16, 22, 24, 32, 64):
             with self.subTest(size=size):
                 images = [
-                    claude_widget.build_quota_tray_icon(label, used, cached)
+                    claude_widget.build_quota_tray_icon(label, used, cached, mark)
                     .pixmap(size, size).toImage()
-                    for label, used, cached in (
-                        ("C", None, False), ("C", 0, False), ("C", 47, False),
-                        ("C", 47, True), ("X", 47, False), ("X", 100, False),
+                    for label, used, cached, mark in (
+                        ("C", None, False, ""), ("C", 0, False, ""), ("C", 47, False, ""),
+                        ("C", 47, True, ""), ("X", 47, False, ""), ("X", 100, False, ""),
+                        ("C", 47, False, "W"), ("C", 47, True, "W"), ("C", None, False, "W"),
                     )
                 ]
                 self.assertTrue(all(not image.isNull() for image in images))
@@ -2245,6 +2246,69 @@ class WidgetUiTest(unittest.TestCase):
             widget._update_countdowns()
         self.assertIn("updated 1m ago", widget._codex_tray.toolTip())
         self.assertIn("Amber dot: cached usage", widget._codex_tray.toolTip())
+
+    def test_claude_tray_shows_weekly_meter_marked_w_when_no_five_hour_limit(self):
+        # Regression: verified Ultra has no five-hour limit, so the local feed
+        # carries only seven_day and the C icon showed "?" permanently.
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        self._seed_tray_quotas(widget, now)
+        weekly_reset = datetime.fromtimestamp(now + 3 * 86400, timezone.utc).isoformat()
+        widget._usage = UsageData(
+            seven_day=UsageEntry(utilization=38, resets_at=weekly_reset),
+            fetched_at=now, source="statusline",
+        )
+
+        state = widget._claude_tray_quota(now)
+        self.assertEqual(state.used_percent, 38)
+        self.assertEqual(state.window_mark, "W")
+        self.assertFalse(state.cached)
+        self.assertIn("Claude 7-day usage: 38% used", state.detail)
+        self.assertIn("resets in 3d 0h", state.detail)
+        self.assertIn("W: weekly limit (no 5-hour limit reported)", state.detail)
+        self.assertNotIn("5-hour usage", state.detail)
+
+        widget._update_tray_quotas()
+        self.assertIn("Claude 7-day usage: 38% used", widget._tray.toolTip())
+        self.assertEqual(widget._tray_icon_states["C"], (38, False, "W"))
+        weekly_icon = widget._tray.icon().cacheKey()
+
+        # A weekly reset with no fresh snapshot is unavailable, not 0%.
+        widget._usage.seven_day.resets_at = datetime.fromtimestamp(now - 1, timezone.utc).isoformat()
+        state = widget._claude_tray_quota(now)
+        self.assertIsNone(state.used_percent)
+        self.assertEqual(state.window_mark, "W")
+        self.assertIn("Claude 7-day usage: unavailable — 7-day window reset", state.detail)
+
+        widget._usage.seven_day.resets_at = weekly_reset
+
+        # When the five-hour window exists, C keeps showing it, unmarked.
+        widget._usage.five_hour = UsageEntry(
+            utilization=12,
+            resets_at=datetime.fromtimestamp(now + 3600, timezone.utc).isoformat(),
+        )
+        state = widget._claude_tray_quota(now)
+        self.assertEqual((state.used_percent, state.window_mark), (12, ""))
+        self.assertIn("Claude 5-hour usage: 12% used", state.detail)
+        self.assertNotIn("W: weekly", state.detail)
+        widget._update_tray_quotas()
+        self.assertEqual(widget._tray_icon_states["C"], (12, False, ""))
+        self.assertNotEqual(weekly_icon, widget._tray.icon().cacheKey())
+
+    def test_claude_tray_keeps_five_hour_label_when_api_reports_no_window(self):
+        # Only the local status-line feed signals an absent five-hour limit;
+        # an API snapshot without a five-hour reset stays unavailable.
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        weekly_reset = datetime.fromtimestamp(now + 86400, timezone.utc).isoformat()
+        widget._usage = UsageData(
+            seven_day=UsageEntry(utilization=38, resets_at=weekly_reset), fetched_at=now,
+        )
+        widget._has_fetched_usage = True
+        state = widget._claude_tray_quota(now)
+        self.assertIsNone(state.used_percent)
+        self.assertEqual(state.window_mark, "")
+        self.assertIn("Claude 5-hour usage: unavailable — 5-hour reset time unknown", state.detail)
 
     def test_claude_tray_labels_persisted_and_rate_limited_snapshots_as_cached(self):
         widget = self._make_inert_claude_widget(tray_available=True)

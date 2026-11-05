@@ -106,6 +106,24 @@
     "test": null
   },
   {
+    "path": "docs/todo/done/product/claude-tray-weekly-quota.md",
+    "slug": "claude-tray-weekly-quota",
+    "title": "Claude tray icon shows the 7-day meter when there is no 5-hour limit",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-05",
+    "owner": "agent",
+    "brief": "Tray C showed ? permanently on Ultra (weekly-only quota); now shows 7-day percent marked CW.",
+    "refs": [
+      "claude_widget.py",
+      "tests/test_widget_ui.py",
+      "README.md",
+      "docs/todo/done/product/claude-usage-history-recording.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/done/product/claude-usage-history-recording.md",
     "slug": "claude-usage-history-recording",
     "title": "Record Claude usage history from weekly-only local quota",

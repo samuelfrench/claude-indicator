@@ -308,11 +308,14 @@ def build_task_compass_icon(size: int = 64) -> QIcon:
 
 def build_quota_tray_icon(
     label: str, used_percent: float | None, cached: bool = False,
+    window_mark: str = "",
 ) -> QIcon:
     """Paint a readable provider letter and percent at native tray sizes.
 
-    C is Claude's 5-hour window; X is Codex's 7-day window. A small amber
-    dot marks cached values. Unknown usage is a question mark, never zero.
+    C is Claude's 5-hour window; X is Codex's 7-day window. When Claude has
+    no 5-hour limit (verified Ultra), C shows the 7-day window and
+    `window_mark` "W" is painted beside the letter. A small amber dot marks
+    cached values. Unknown usage is a question mark, never zero.
     """
     icon = QIcon()
     for size in (16, 22, 24, 32, 48, 64, 128):
@@ -335,7 +338,19 @@ def build_quota_tray_icon(
         font.setPixelSize(21)
         font.setWeight(QFont.Weight.Bold)
         painter.setFont(font)
-        painter.drawText(QRectF(1, 0, 62, 24), Qt.AlignmentFlag.AlignCenter, label)
+        if window_mark:
+            painter.drawText(
+                QRectF(0, 0, 29, 24),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, label,
+            )
+            font.setPixelSize(16)
+            painter.setFont(font)
+            painter.drawText(
+                QRectF(31, 2, 17, 22),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, window_mark,
+            )
+        else:
+            painter.drawText(QRectF(1, 0, 62, 24), Qt.AlignmentFlag.AlignCenter, label)
         if cached:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#fbbf24"))
@@ -764,6 +779,7 @@ class TrayQuotaState:
     used_percent: float | None = None
     cached: bool = False
     detail: str = ""
+    window_mark: str = ""  # "W": Claude tray shows the 7-day window
 
 
 @dataclass(frozen=True)
@@ -10815,18 +10831,30 @@ class ClaudeWidget(QWidget):
         return f"resets in {remaining}"
 
     def _claude_tray_quota(self, now: float) -> TrayQuotaState:
-        label = "Claude 5-hour usage"
+        data = self._usage
+        # Verified Ultra has no five-hour limit: the local feed then carries
+        # only seven_day. Show that weekly meter, marked "W", using the same
+        # rule as the history graph; never present the absent window as 0%.
+        weekly = (
+            data is not None and not data.error
+            and history_series_for(data) == HISTORY_SERIES_SEVEN_DAY
+        )
+        window = "7-day" if weekly else "5-hour"
+        label = f"Claude {window} usage"
         def unavailable(reason):
-            return TrayQuotaState(detail=f"{label}: unavailable — {reason}")
+            return TrayQuotaState(
+                detail=f"{label}: unavailable — {reason}",
+                window_mark="W" if weekly else "",
+            )
 
         if not (self._section_visible("claude") or self._section_visible("history")):
             return unavailable("Claude sections hidden; polling paused")
-        data = self._usage
         if data is None:
             return unavailable("waiting for usage")
         if data.error:
             return unavailable(data.error)
-        if not self._valid_tray_percent(data.five_hour.utilization):
+        entry = data.seven_day if weekly else data.five_hour
+        if not self._valid_tray_percent(entry.utilization):
             return unavailable("invalid usage snapshot")
         observed_at = data.fetched_at
         if not math.isfinite(observed_at) or observed_at <= 0 or observed_at > now + 60:
@@ -10834,11 +10862,11 @@ class ClaudeWidget(QWidget):
         age = max(0, now - observed_at)
         if age > MAX_HISTORY_AGE_S:
             return unavailable("usage snapshot expired")
-        reset = data.five_hour.reset_dt
+        reset = entry.reset_dt
         if reset is None or reset.tzinfo is None:
-            return unavailable("5-hour reset time unknown")
+            return unavailable(f"{window} reset time unknown")
         if reset.timestamp() <= now:
-            return unavailable("5-hour window reset; waiting for refresh")
+            return unavailable(f"{window} window reset; waiting for refresh")
         cached = (
             not self._has_fetched_usage or age >= REFRESH_INTERVAL_MS / 1000
             or now < self._rate_limit_until
@@ -10846,11 +10874,13 @@ class ClaudeWidget(QWidget):
         source = "Cached snapshot" if cached else "Usage snapshot"
         if now < self._rate_limit_until:
             source += "; rate limited"
-        used = data.five_hour.utilization
+        used = entry.utilization
+        weekly_note = "\nW: weekly limit (no 5-hour limit reported)" if weekly else ""
         return TrayQuotaState(
             used, cached,
             f"{label}: {used:.0f}% used\n{source}; updated {self._format_age(age)}; "
-            f"{self._tray_reset_description(reset.timestamp(), now)}",
+            f"{self._tray_reset_description(reset.timestamp(), now)}{weekly_note}",
+            "W" if weekly else "",
         )
 
     def _codex_tray_quota(self, now: float) -> TrayQuotaState:
@@ -10904,7 +10934,7 @@ class ClaudeWidget(QWidget):
             ("C", self._tray, self._claude_tray_quota(now)),
             ("X", self._codex_tray, self._codex_tray_quota(now)),
         ):
-            icon_state = (state.used_percent, state.cached)
+            icon_state = (state.used_percent, state.cached, state.window_mark)
             if self._tray_icon_states.get(label) != icon_state:
                 tray.setIcon(build_quota_tray_icon(label, *icon_state))
                 self._tray_icon_states[label] = icon_state
