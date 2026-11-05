@@ -116,6 +116,7 @@
     "owner": "agent",
     "brief": "Tray C showed ? permanently on Ultra (weekly-only quota); now shows 7-day percent marked CW.",
     "refs": [
+      "3ed5a3e47d27f01f79d44611daf51049025498f7",
       "claude_widget.py",
       "tests/test_widget_ui.py",
       "README.md",
