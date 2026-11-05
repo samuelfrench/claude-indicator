@@ -1875,6 +1875,9 @@ class WidgetUiTest(unittest.TestCase):
             patch.object(claude_widget, "WIDGET_VISIBILITY_PATH", vis_path),
             patch.object(claude_widget, "GROK_SNAPSHOT_PATH", grok_snapshot_path),
             patch.object(
+                claude_widget, "HISTORY_PATH", Path(vis_dir.name) / "usage_history.json"
+            ),
+            patch.object(
                 QSystemTrayIcon,
                 "isSystemTrayAvailable",
                 side_effect=(
@@ -1938,6 +1941,28 @@ class WidgetUiTest(unittest.TestCase):
                 widget._update_countdowns()
             self.assertEqual(widget._usage, waiting)
             self.assertTrue(widget._usage_limits.isHidden())
+
+    def test_weekly_only_local_quota_records_usage_history(self):
+        # Regression: from 2026-11-01 every snapshot lacked a five-hour window
+        # (Ultra), so history recording stopped while the meters stayed live.
+        widget = self._make_inert_claude_widget()
+        history_path = claude_widget.HISTORY_PATH
+        start = time.time() - 600
+
+        def weekly(used, fetched_at):
+            reset = datetime.fromtimestamp(fetched_at + 86400, timezone.utc).isoformat()
+            return UsageData(seven_day=UsageEntry(used, reset), fetched_at=fetched_at, source="statusline")
+
+        with patch.object(claude_widget, "save_last_usage"):
+            widget._on_usage_fetched(weekly(36, start))
+            widget._on_usage_fetched(weekly(36, start + 20))
+            widget._on_usage_fetched(weekly(37, start + 61))
+        saved = json.loads(history_path.read_text())
+        self.assertEqual([p["seven_day_pct"] for p in saved], [36.0, 37.0])
+        self.assertEqual(widget._graph._series, "seven_day")
+        self.assertEqual(widget._graph._points, widget._history.points)
+        self.assertIn("7-Day", widget._graph_title.text())
+        self.assertEqual(widget._stats_row._peak, 37.0)
 
     def test_local_quota_tick_skips_inactive_sources(self):
         widget = self._make_inert_claude_widget()

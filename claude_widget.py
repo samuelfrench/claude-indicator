@@ -103,6 +103,9 @@ WIDGET_VISIBILITY_PATH = Path.home() / ".claude" / "widget_visibility.json"
 WIDGET_VISIBILITY_VERSION = 1
 MAX_HISTORY_AGE_S = 24 * 3600  # 24 hours
 MAX_HISTORY_POINTS = 1440  # 24h at 60-sec intervals
+# Claude Code rewrites the local quota snapshot on every status-line render
+# (often several per minute); one point per minute keeps 24h within the cap.
+HISTORY_MIN_INTERVAL_S = MAX_HISTORY_AGE_S / MAX_HISTORY_POINTS
 SYSTEM_METRICS_INTERVAL_MS = 3000  # 3 seconds
 RUNNER_REFRESH_MS = 60 * 1000  # 60 seconds
 TASK_LOOP_REFRESH_MS = 60 * 1000  # 60 seconds
@@ -3713,13 +3716,32 @@ class HistoryPoint:
     model_name: str
 
 
+HISTORY_SERIES_FIVE_HOUR = "five_hour"
+HISTORY_SERIES_SEVEN_DAY = "seven_day"
+
+
+def history_series_for(data: UsageData) -> str:
+    """Graph the weekly meter when the local feed reports no five-hour window.
+
+    Verified Ultra accounts have no five-hour limit, so Claude Code's status
+    line carries only `seven_day`; the stored five-hour value is then 0.0 and
+    must not be presented as usage.
+    """
+    if (data.source == USAGE_SOURCE_STATUSLINE and not data.five_hour.resets_at
+            and data.seven_day.resets_at):
+        return HISTORY_SERIES_SEVEN_DAY
+    return HISTORY_SERIES_FIVE_HOUR
+
+
 class UsageHistory:
     """Stores usage data points to disk for graphing."""
 
     def __init__(self, path: Path = HISTORY_PATH):
         self._path = path
         self.points: list[HistoryPoint] = []
+        self.series = HISTORY_SERIES_FIVE_HOUR
         self._load()
+        self._prune()
 
     def _load(self):
         try:
@@ -3738,9 +3760,16 @@ class UsageHistory:
         except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
             self.points = []
 
-    def add(self, data: UsageData):
+    def add(self, data: UsageData) -> bool:
+        """Append one observation; returns False for errors and repeats.
+
+        Points are at least HISTORY_MIN_INTERVAL_S apart, so the frequent
+        local snapshot cannot push the 24-hour window past the point cap.
+        """
         if data.error:
-            return
+            return False
+        if self.points and data.fetched_at < self.points[-1].timestamp + HISTORY_MIN_INTERVAL_S:
+            return False
         pt = HistoryPoint(
             timestamp=data.fetched_at,
             five_hour_pct=data.five_hour.utilization,
@@ -3751,6 +3780,7 @@ class UsageHistory:
         self.points.append(pt)
         self._prune()
         self._save()
+        return True
 
     def _prune(self):
         cutoff = time.time() - MAX_HISTORY_AGE_S
@@ -3779,16 +3809,22 @@ class UsageHistory:
             pass
 
     @property
-    def avg_five_hour(self) -> float:
-        if not self.points:
+    def avg_pct(self) -> float:
+        values = self.values()
+        if not values:
             return 0.0
-        return sum(p.five_hour_pct for p in self.points) / len(self.points)
+        return sum(values) / len(values)
 
     @property
-    def peak_five_hour(self) -> float:
-        if not self.points:
+    def peak_pct(self) -> float:
+        values = self.values()
+        if not values:
             return 0.0
-        return max(p.five_hour_pct for p in self.points)
+        return max(values)
+
+    def values(self) -> list[float]:
+        """Utilization of the graphed series (`self.series`), oldest first."""
+        return [getattr(p, f"{self.series}_pct") for p in self.points]
 
     def estimated_time_left(self, current_pct: float) -> str:
         """Estimate time until 100% based on last 5 minutes of usage rate."""
@@ -3829,10 +3865,11 @@ class UsageHistory:
     @property
     def trend(self) -> str:
         """Compare last 3 vs prior 3 data points. Returns arrow."""
-        if len(self.points) < 6:
+        values = self.values()
+        if len(values) < 6:
             return "—"
-        recent = sum(p.five_hour_pct for p in self.points[-3:]) / 3
-        prior = sum(p.five_hour_pct for p in self.points[-6:-3]) / 3
+        recent = sum(values[-3:]) / 3
+        prior = sum(values[-6:-3]) / 3
         diff = recent - prior
         if diff > 2:
             return "↑"
@@ -5434,7 +5471,7 @@ class ModelLimitsWidget(QWidget):
 
 
 class UsageGraph(QWidget):
-    """Line chart showing 5-hour utilization with selectable time window."""
+    """Line chart of one history series (5-hour, or 7-day when 5-hour is absent)."""
 
     ACCENT = QColor(139, 92, 246)  # #8b5cf6 purple
 
@@ -5449,6 +5486,7 @@ class UsageGraph(QWidget):
         super().__init__(parent)
         self.setFixedHeight(110)
         self._points: list[HistoryPoint] = []
+        self._series = HISTORY_SERIES_FIVE_HOUR
         self._window_idx = 2  # default to 24h
 
     @property
@@ -5459,8 +5497,9 @@ class UsageGraph(QWidget):
         self._window_idx = idx
         self.update()
 
-    def set_points(self, points: list[HistoryPoint]):
+    def set_points(self, points: list[HistoryPoint], series: str = HISTORY_SERIES_FIVE_HOUR):
         self._points = points
+        self._series = series
         self.update()
 
     def paintEvent(self, event):
@@ -5531,7 +5570,7 @@ class UsageGraph(QWidget):
         # Build path from points
         def to_xy(pt: HistoryPoint):
             x = left_m + chart_w * ((pt.timestamp - t_start) / duration_s)
-            y = top_m + chart_h * (1 - pt.five_hour_pct / 100)
+            y = top_m + chart_h * (1 - getattr(pt, f"{self._series}_pct") / 100)
             return x, y
 
         line_path = QPainterPath()
@@ -9289,7 +9328,7 @@ class ClaudeWidget(QWidget):
         self._opencode_worker: OpencodeUsageWorker | None = None
         self._ollama_worker: OllamaFetchWorker | None = None
         self._comfyui_worker: ComfyUIFetchWorker | None = None
-        self._history = UsageHistory()
+        self._history = UsageHistory(HISTORY_PATH)
         self._next_fetch_at: float = 0.0
         saved_until, saved_count = load_rate_limit_until()
         self._rate_limit_until: float = saved_until
@@ -9366,8 +9405,9 @@ class ClaudeWidget(QWidget):
         self._refresh_terminal_sessions()
 
         # Initialize graph with persisted history
-        if self._history.points:
-            self._graph.set_points(self._history.points)
+        if self._usage and not self._usage.error:
+            self._history.series = history_series_for(self._usage)
+        self._sync_history_view()
 
         # Seed display from persisted last-good usage so values survive restarts
         if self._usage and not self._usage.error:
@@ -9400,8 +9440,8 @@ class ClaudeWidget(QWidget):
             )
             self._title_label.setText(self._usage.plan_name)
             self._stats_row.set_data(
-                self._history.avg_five_hour,
-                self._history.peak_five_hour,
+                self._history.avg_pct,
+                self._history.peak_pct,
                 self._history.trend,
                 False,
                 fast=read_fast_mode(),
@@ -10006,8 +10046,8 @@ class ClaudeWidget(QWidget):
             else:
                 extra_credits = f"${used:.2f}"
         self._stats_row.set_data(
-            self._history.avg_five_hour,
-            self._history.peak_five_hour,
+            self._history.avg_pct,
+            self._history.peak_pct,
             self._history.trend,
             data.extra_usage_enabled,
             extra_credits=extra_credits,
@@ -10054,12 +10094,12 @@ class ClaudeWidget(QWidget):
 
         if not data.error:
             self._title_label.setText(data.plan_name)
-            if data.source != USAGE_SOURCE_STATUSLINE or (
-                data.five_hour.resets_at and data.seven_day.resets_at
-                and (not self._history.points or data.fetched_at > self._history.points[-1].timestamp)
-            ):
-                self._history.add(data)
-                self._graph.set_points(self._history.points)
+            # Local snapshots may carry only the weekly window (Ultra has no
+            # five-hour limit); add() skips repeats and keeps one point a minute.
+            series = history_series_for(data)
+            if self._history.add(data) or series != self._history.series:
+                self._history.series = series
+                self._sync_history_view()
             self._seed_stats_row_from_usage(data)
             save_last_usage(data)
             scoped = "".join(
@@ -10206,20 +10246,30 @@ class ClaudeWidget(QWidget):
             self._local_ai_section.set_expanded(False)
         self._set_history_expanded(visible)
 
+    def _sync_history_view(self):
+        self._graph.set_points(self._history.points, self._history.series)
+        self._refresh_history_title()
+
     def _set_history_expanded(self, visible: bool):
         self._history_expanded = bool(visible)
-        arrow = "▾" if self._history_expanded else "▸"
-        if self._history_expanded:
-            self._graph_title.setText(f"Usage History {arrow}")
-        else:
-            avg = self._history.avg_five_hour
-            peak = self._history.peak_five_hour
-            trend = self._history.trend
-            self._graph_title.setText(
-                f"Usage History {arrow}  AVG {avg:.0f}%  PK {peak:.0f}%  {trend}"
-            )
+        self._refresh_history_title()
         self._update_window_tabs()
         self.adjustSize()
+
+    def _refresh_history_title(self):
+        arrow = "▾" if self._history_expanded else "▸"
+        title = "Usage History"
+        if self._history.series == HISTORY_SERIES_SEVEN_DAY:
+            title += " · 7-Day"
+        if self._history_expanded:
+            self._graph_title.setText(f"{title} {arrow}")
+        else:
+            avg = self._history.avg_pct
+            peak = self._history.peak_pct
+            trend = self._history.trend
+            self._graph_title.setText(
+                f"{title} {arrow}  AVG {avg:.0f}%  PK {peak:.0f}%  {trend}"
+            )
 
     def _on_local_ai_expanded_changed(self, expanded: bool):
         if expanded and self._history_expanded:

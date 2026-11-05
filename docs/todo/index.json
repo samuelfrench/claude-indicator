@@ -354,6 +354,23 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/claude-usage-history-recording.md",
+    "slug": "claude-usage-history-recording",
+    "title": "Record Claude usage history from weekly-only local quota",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-05",
+    "owner": "agent",
+    "brief": "usage_history.json stopped on 2026-10-30; record weekly-only status-line snapshots, one point a minute.",
+    "refs": [
+      "claude_widget.py",
+      "tests/test_usage_history.py",
+      "tests/test_widget_ui.py"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/deepseek-pricing-calendar.md",
     "slug": "deepseek-pricing-calendar",
     "title": "Refresh DeepSeek holiday calendar for 2027",

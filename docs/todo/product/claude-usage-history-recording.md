@@ -1,0 +1,17 @@
+---
+title: "Record Claude usage history from weekly-only local quota"
+status: now
+area: product
+due: null
+updated: 2026-11-05
+owner: agent
+brief: "usage_history.json stopped on 2026-10-30; record weekly-only status-line snapshots, one point a minute."
+refs: ["claude_widget.py", "tests/test_usage_history.py", "tests/test_widget_ui.py"]
+test: null
+---
+- **What:** `~/.claude/usage_history.json` held 293 points from 2026-10-29 22:30 CT to 2026-10-30 22:27 CT (mtime Oct 30 22:27) while `last_usage.json` and `indicator_quota.json` stayed current.
+- **Why (root cause):** The widget (`ClaudeWidget._on_usage_fetched`) is the only writer. Header polling failed from 2026-10-30 22:32 CT (`fetch error: Usage Headers Missing`; errors are never recorded). The local status-line feed added on 2026-11-01 (`a68e080`) recorded a point only when both `five_hour.resets_at` and `seven_day.resets_at` were set. Ultra has no five-hour limit, so Claude Code's `rate_limits` carry only `seven_day`; all 5,893 `src=statusline` fetches in `widget.log` through 2026-11-05 08:42 CT logged `5h=unavailable`, and none was recorded.
+- **Fix:** `UsageHistory.add` records any non-error snapshot at least `HISTORY_MIN_INTERVAL_S` (60 s) after the last point and returns whether it wrote; the status-line guard is gone. Claude Code rewrites the snapshot on every status-line render (3,792 fetches on 2026-11-04, about one per 23 s), so the interval keeps 24 h inside `MAX_HISTORY_POINTS` (1440, about 180 KB). Load prunes points older than 24 h. File format is unchanged (`timestamp, five_hour_pct, seven_day_pct, model_pct, model_name`); an absent five-hour window is stored as `five_hour_pct: 0.0`, the same value `last_usage.json` already stores beside an empty `resets_at`, so readers must use `seven_day_pct` on weekly-only accounts. `history_series_for` selects the 7-day series for the graph, AVG/PK/TR stats and the history title (`Usage History · 7-Day`) whenever the local feed has no five-hour window, so the stored 0.0 is never shown as usage. Tests now point `HISTORY_PATH` at a temp file.
+- **Validation:** New `tests/test_usage_history.py` (5 tests: weekly-only capture recorded, one point a minute, bounded at a 20 s snapshot rate over 2 days, load pruning and series stats, series selection) and `test_weekly_only_local_quota_records_usage_history`; the widget test fails on `origin/master` with `FileNotFoundError` for the history file. Isolated full suite: `583 passed, 49 subtests passed`; task tests 25/25; `build.mjs --check` ok; `git diff --check` clean; clean-install verifier passed.
+- **Next:** Push, wait for Python/install CI and repository guards, fast-forward the clean main checkout, restart `claude-indicator.service` (the documented `systemctl --user restart claude-indicator.service`), then confirm `usage_history.json` gains a point within two minutes of Claude Code activity.
+- **Not changed (follow-up idea):** The tray **C** icon (`ClaudeWidget._claude_tray_quota`) reads only the five-hour window, so on a weekly-only account it always shows `?` with `Claude 5-hour usage: unavailable — 5-hour reset time unknown`. Showing the 7-day meter there would change the README tray contract; left for a separate decision. History is written only while the widget runs; the status-line collector stays a single-file quota capture with no history writer, to avoid concurrent writers on one file.
