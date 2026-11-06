@@ -655,6 +655,7 @@ class CronJobInfo:
     project: str = ""
     description: str = ""
     enabled: bool | None = None
+    status_detail: str = ""  # optional refinement from cron-manager; only "late" is understood
 
     def last_run_str(self) -> str:
         if self.last_run_ts is None:
@@ -4712,7 +4713,8 @@ def parse_cron_snapshot(payload: dict) -> CronSnapshot:
             id=item["id"], label=item["name"], source=item["source"],
             project=item["project"], schedule=item["schedule"], command=item["command"],
             description=item["description"], enabled=item.get("enabled"),
-            status=item["status"], last_run_ts=_cron_timestamp(item.get("lastRunAt")),
+            status=item["status"], status_detail="late" if item.get("statusDetail") == "late" else "",
+            last_run_ts=_cron_timestamp(item.get("lastRunAt")),
             next_run_ts=_cron_timestamp(item.get("nextRunAt")),
         ))
     for source in payload["sources"]:
@@ -8845,10 +8847,22 @@ class CronJobsWidget(QWidget):
         if self._error:
             return f"{len(self._jobs)} jobs · stale / unavailable" if self._jobs else "unavailable"
         counts = {}
+        failed_off = 0
         for job in self._jobs:
+            if job.status == "failed" and job.enabled is False:
+                failed_off += 1  # matches cron-manager "Need attention": disabled jobs are not counted
+                continue
             counts[job.status] = counts.get(job.status, 0) + 1
+        late = sum(1 for job in self._jobs if job.status_detail == "late")
         parts = [f"{len(self._jobs)} jobs"]
-        parts.extend(f"{counts[status]} {status}" for status in ("failed", "running", "queued", "unknown", "never", "cancelled", "skipped", "success") if counts.get(status))
+        for status in ("failed", "running", "queued", "unknown", "never", "cancelled", "skipped", "success"):
+            text = f"{counts[status]} {status}" if counts.get(status) else ""
+            if status == "failed" and failed_off:
+                text = (text or "0 failed") + f" +{failed_off} off"
+            if text:
+                parts.append(text)
+            if status == "running" and late:
+                parts.append(f"{late} late")
         if self._snapshot and any(source["status"] != "ok" for source in self._snapshot.sources):
             parts.insert(1, "partial coverage")
         if self._snapshot and self._snapshot.generated_at is not None and time.time() - self._snapshot.generated_at > 180:

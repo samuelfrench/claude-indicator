@@ -353,6 +353,26 @@ class CronWidgetTest(unittest.TestCase):
             ClaudeWidget._on_cron_jobs_fetched(w, CronSnapshot(error="unavailable"))
         self.assertTrue(w._cron_row.isHidden())
 
+    def test_failed_count_excludes_disabled_and_late_detail_is_counted(self):
+        payload = manager_payload()
+        base = payload["jobs"][0]
+        def job(i, **kw):
+            return {**base, "id": i, "enabled": True, "status": "success", **kw}
+        payload["jobs"] = [job("a", status="failed"), job("b", status="failed", enabled=False),
+                           job("c", status="failed", enabled=False), job("d", statusDetail="late"),
+                           job("e", statusDetail="weird"), job("f", status="success", enabled=False)]
+        snapshot = parse_cron_snapshot(payload)
+        self.assertEqual([j.status_detail for j in snapshot.jobs], ["", "", "", "late", "", ""])
+        w = CronJobsWidget()
+        w.set_data(snapshot)
+        text = w._summary_text()
+        self.assertIn("1 failed +2 off", text)
+        self.assertIn("1 late", text)
+        self.assertIn("3 success", text)
+        payload["jobs"] = [job("b", status="failed", enabled=False)]
+        w.set_data(parse_cron_snapshot(payload))
+        self.assertIn("0 failed +1 off", w._summary_text())
+
     def test_partial_unknown_stale_and_details_are_honest(self):
         payload = manager_payload()
         payload["sources"].append({"name": "Remote", "status": "unavailable", "message": "No local registry"})
