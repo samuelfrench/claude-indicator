@@ -4697,12 +4697,17 @@ def parse_cron_snapshot(payload: dict) -> CronSnapshot:
     if generated_at is None:
         raise ValueError("Missing snapshot time")
     jobs = []
-    statuses = {"success", "failed", "running", "unknown", "never", "skipped", "cancelled"}
+    # "queued" since cron-manager 201cd61 (2026-11-04). A status this tray does not know maps to
+    # "unknown" for that one job instead of discarding the whole snapshot.
+    statuses = {"success", "failed", "running", "queued", "unknown", "never", "skipped", "cancelled"}
     for item in payload["jobs"]:
         if not isinstance(item, dict) or any(not isinstance(item.get(key), str) for key in ("id", "name", "source", "project", "schedule", "command", "description")):
             raise ValueError("Invalid job")
-        if item.get("status") not in statuses or (item.get("enabled") is not None and type(item["enabled"]) is not bool):
+        if not isinstance(item.get("status"), str) or (item.get("enabled") is not None and type(item["enabled"]) is not bool):
             raise ValueError("Invalid job status")
+        if item["status"] not in statuses:
+            log_line(f"cron snapshot: job {item['id']} has unrecognized status {item['status'][:20]!r}; shown as unknown")
+            item = {**item, "status": "unknown"}
         jobs.append(CronJobInfo(
             id=item["id"], label=item["name"], source=item["source"],
             project=item["project"], schedule=item["schedule"], command=item["command"],
@@ -8843,7 +8848,7 @@ class CronJobsWidget(QWidget):
         for job in self._jobs:
             counts[job.status] = counts.get(job.status, 0) + 1
         parts = [f"{len(self._jobs)} jobs"]
-        parts.extend(f"{counts[status]} {status}" for status in ("failed", "running", "unknown", "never", "cancelled", "skipped", "success") if counts.get(status))
+        parts.extend(f"{counts[status]} {status}" for status in ("failed", "running", "queued", "unknown", "never", "cancelled", "skipped", "success") if counts.get(status))
         if self._snapshot and any(source["status"] != "ok" for source in self._snapshot.sources):
             parts.insert(1, "partial coverage")
         if self._snapshot and self._snapshot.generated_at is not None and time.time() - self._snapshot.generated_at > 180:

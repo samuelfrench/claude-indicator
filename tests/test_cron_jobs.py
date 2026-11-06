@@ -257,6 +257,15 @@ class CronManagerFetchTest(unittest.TestCase):
         self.assertFalse(snapshot.error)
         self.assertEqual(snapshot.jobs[0].label, "Backup")
 
+    def test_queued_and_unrecognized_statuses_keep_the_snapshot(self):
+        payload = manager_payload()
+        base = payload["jobs"][0]
+        payload = {**payload, "jobs": [{**base, "status": "queued"}, {**base, "id": "later", "status": "some-new-state"}]}
+        snapshot = parse_cron_snapshot(payload)
+        self.assertEqual([job.status for job in snapshot.jobs], ["queued", "unknown"])
+        with self.assertRaises(ValueError):
+            parse_cron_snapshot({**payload, "jobs": [{**base, "status": None}]})
+
     def test_failures_and_invalid_payload_are_explicit(self):
         import requests
         from unittest.mock import Mock, patch
