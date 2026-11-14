@@ -391,6 +391,22 @@
     "test": null
   },
   {
+    "path": "docs/todo/product/codex-weekly-refresh-expiry.md",
+    "slug": "codex-weekly-refresh-expiry",
+    "title": "Correct Codex expiry after a weekly refresh",
+    "status": "now",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-14",
+    "owner": "agent",
+    "brief": "Cache reset selection fixed and validated; push, green CI and native deployment verification remain.",
+    "refs": [
+      "claude_widget.py",
+      "tests/test_widget_ui.py"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/product/deepseek-pricing-calendar.md",
     "slug": "deepseek-pricing-calendar",
     "title": "Refresh DeepSeek holiday calendar for 2027",

@@ -3071,6 +3071,76 @@ class WidgetUiTest(unittest.TestCase):
         self.assertEqual(rate_limit.secondary_resets_at, 1_767_900_000)
         self.assertEqual(rate_limit.plan_type, "pro")
 
+    def test_codex_weekly_refresh_cache_uses_event_time_not_file_mtime(self):
+        now = 1_800_000_000
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions = Path(tmpdir)
+            for name, observed, modified, used, reset in (
+                ("before-refresh", now - 90, now, 99, now + 86400),
+                ("after-refresh", now - 30, now - 30, 2, now + 7 * 86400),
+            ):
+                path = sessions / f"{name}.jsonl"
+                path.write_text(json.dumps({
+                    "type": "event_msg", "timestamp": observed,
+                    "payload": {"type": "token_count", "rate_limits": {
+                        "limit_id": "codex", "primary": {
+                            "used_percent": used, "window_minutes": 10080,
+                            "resets_at": reset,
+                        },
+                    }},
+                }) + "\n")
+                os.utime(path, (modified, modified))
+            with patch.object(claude_widget, "read_live_codex_rate_limit", return_value=None):
+                rate = read_codex_rate_limit(sessions_dir=sessions, now_ts=now)
+        self.assertIsNotNone(rate)
+        self.assertEqual(rate.primary_used_percent, 2)
+        self.assertEqual(rate.primary_resets_at, now + 7 * 86400)
+
+    def test_codex_cache_does_not_revive_superseded_reset(self):
+        now = 1_800_000_000
+        for same_file in (False, True):
+            with self.subTest(same_file=same_file), tempfile.TemporaryDirectory() as tmpdir:
+                sessions = Path(tmpdir)
+                for name, observed, reset in (
+                    ("older", now - 90, now + 86400),
+                    ("latest", now - 30, now - 1),
+                ):
+                    path = sessions / ("session.jsonl" if same_file else f"{name}.jsonl")
+                    with path.open("a") as stream:
+                        stream.write(json.dumps({
+                            "type": "event_msg", "timestamp": observed,
+                            "payload": {"type": "token_count", "rate_limits": {
+                                "limit_id": "codex", "primary": {
+                                    "used_percent": 2, "window_minutes": 10080,
+                                    "resets_at": reset,
+                                },
+                            }},
+                        }) + "\n")
+                    os.utime(path, (observed, observed))
+                self.assertIsNone(read_latest_codex_rate_limit(sessions, now_ts=now))
+
+    def test_codex_weekly_refresh_replaces_displayed_reset(self):
+        widget = self._make_inert_claude_widget(tray_available=True)
+        now = time.time()
+        old_reset = int(now + 86400)
+        new_reset = int(now + 7 * 86400)
+        def reset_text(reset):
+            return datetime.fromtimestamp(reset, timezone.utc).astimezone().strftime(
+                "%a %d %b %Y %H:%M %Z"
+            )
+        for reset, used in ((old_reset, 99), (new_reset, 2)):
+            summary = CodexUsageSummary(
+                primary_limit_used_percent=used,
+                primary_limit_window_minutes=10080,
+                primary_limit_resets_at=reset,
+                rate_limit_source="live", rate_limit_observed_at=now,
+            )
+            widget._on_codex_usage_read(summary)
+            self.assertIn(reset_text(reset), widget._codex_row.toolTip())
+            self.assertIn(reset_text(reset), widget._codex_tray.toolTip())
+        self.assertNotIn(reset_text(old_reset), widget._codex_row.toolTip())
+        self.assertNotIn(reset_text(old_reset), widget._codex_tray.toolTip())
+
     def test_read_codex_usage_summary_preserves_sqlite_thread_totals(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)

@@ -5780,6 +5780,17 @@ def _format_epoch_remaining(epoch_seconds: int) -> str:
     return f"{minutes}m"
 
 
+def _format_codex_reset_at(epoch_seconds: int) -> str:
+    if epoch_seconds <= 0:
+        return "unknown"
+    try:
+        return datetime.fromtimestamp(epoch_seconds, timezone.utc).astimezone().strftime(
+            "%a %d %b %Y %H:%M %Z"
+        )
+    except (ValueError, OverflowError, OSError):
+        return "unknown"
+
+
 def read_token_stats() -> dict:
     """Read token stats from Claude Code's stats-cache.json."""
     try:
@@ -6125,8 +6136,9 @@ def read_latest_codex_rate_limit(
     now_ts: float | None = None,
     max_age_s: float = CODEX_CACHED_RATE_LIMIT_MAX_AGE_S,
 ) -> CodexRateLimit | None:
-    """Read a recent, unexpired cached Codex rate limit as a fail-safe."""
+    """Use the newest quota event, only while it is recent and unexpired."""
     now_ts = time.time() if now_ts is None else now_ts
+    latest = None
     for session_path in _recent_codex_session_files(sessions_dir):
         try:
             file_timestamp = session_path.stat().st_mtime
@@ -6136,10 +6148,17 @@ def read_latest_codex_rate_limit(
             rate_limit = _parse_codex_rate_limit_event(
                 line, fallback_timestamp=file_timestamp
             )
-            if rate_limit is not None and _cached_codex_rate_limit_is_current(
-                rate_limit, now_ts=now_ts, max_age_s=max_age_s
-            ):
-                return rate_limit
+            if rate_limit is not None:
+                # A session can keep writing after a reset without receiving
+                # new quota data. Its file mtime must not override a newer event.
+                if latest is None or rate_limit.observed_at > latest.observed_at:
+                    latest = rate_limit
+                break
+    # Validate after selecting: an expired latest window supersedes old ones.
+    if latest is not None and _cached_codex_rate_limit_is_current(
+        latest, now_ts=now_ts, max_age_s=max_age_s
+    ):
+        return latest
     return None
 
 
@@ -6343,7 +6362,8 @@ class CodexUsageRow(QWidget):
             cwd = summary.latest_cwd or "unknown"
             limit_lines = [
                 f"{label.lower()} limit: {_fmt_percent(used_percent)} used; "
-                f"resets in {_format_epoch_remaining(resets_at)}"
+                f"resets in {_format_epoch_remaining(resets_at)} "
+                f"({_format_codex_reset_at(resets_at)})"
                 for label, used_percent, resets_at in self._rate_limit_windows(summary)
             ]
             detail_lines = limit_lines + [
@@ -10942,7 +10962,8 @@ class ClaudeWidget(QWidget):
         return TrayQuotaState(
             used, cached,
             f"{label}: {used:.0f}% used\n{source}; updated {self._format_age(age)}; "
-            f"{self._tray_reset_description(reset, now)}",
+            f"{self._tray_reset_description(reset, now)}\n"
+            f"Next reset: {_format_codex_reset_at(reset)}",
         )
 
     def _update_tray_quotas(self):
