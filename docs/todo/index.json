@@ -390,7 +390,10 @@
     "owner": "agent",
     "brief": "llama-slot-cache is installed but only a CPU test model proved it; confirm the live Qwen unit saves on its next unload and restores on the following load.",
     "refs": [
-      "docs/todo/done/product/llama-cpp-local-models.md"
+      "docs/todo/done/product/llama-cpp-local-models.md",
+      "cron:llama-slot-cache-check",
+      "~/.local/bin/llama-slot-cache-check",
+      "~/.local/state/llama-slot-cache-check/result.md"
     ],
     "test": null
   },
