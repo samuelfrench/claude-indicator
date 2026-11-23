@@ -279,6 +279,26 @@
     "test": "tests/test_widget_ui.py -k grok"
   },
   {
+    "path": "docs/todo/done/product/llama-cpp-local-models.md",
+    "slug": "llama-cpp-local-models",
+    "title": "Local AI shows llama.cpp servers, not only Ollama",
+    "status": "done",
+    "area": "product",
+    "due": null,
+    "updated": "2026-11-23",
+    "owner": "agent",
+    "brief": "Local AI said 'No models loaded' while a socket-activated llama-server held 22.5 GB VRAM; it now discovers llama-server processes and on-demand units.",
+    "refs": [
+      "065b6ccb7dcade09237369ef3e20848ff7d951e2",
+      "claude_widget.py",
+      "tests/test_llama_servers.py",
+      "tests/conftest.py",
+      "README.md",
+      "docs/beta/privacy-audit.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/done/product/minimize-tray-usage.md",
     "slug": "minimize-tray-usage",
     "title": "Minimize to tray with Claude 5-hour and Codex 7-day indicators",
@@ -436,25 +456,6 @@
       "TODO-archive.md#pre-task-files-2026-10-07"
     ],
     "test": "tests/test_widget_ui.py Grok billing has no weekly or on-demand meter"
-  },
-  {
-    "path": "docs/todo/product/llama-cpp-local-models.md",
-    "slug": "llama-cpp-local-models",
-    "title": "Local AI shows llama.cpp servers, not only Ollama",
-    "status": "now",
-    "area": "product",
-    "due": null,
-    "updated": "2026-11-23",
-    "owner": "agent",
-    "brief": "Local AI said 'No models loaded' while a socket-activated llama-server held 22.5 GB VRAM; it now discovers llama-server processes and on-demand units.",
-    "refs": [
-      "claude_widget.py",
-      "tests/test_llama_servers.py",
-      "tests/conftest.py",
-      "README.md",
-      "docs/beta/privacy-audit.md"
-    ],
-    "test": null
   },
   {
     "path": "docs/todo/product/paid-release-source-and-license-decisions.md",
