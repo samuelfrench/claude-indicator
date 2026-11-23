@@ -5364,6 +5364,32 @@ def _systemd_exec_starts(text: str) -> list[list[str]]:
     return commands
 
 
+def _llama_wrapper_argv(command: str) -> list[str]:
+    """Tokens of a small launcher script that execs llama-server, else ``[]``.
+
+    Units often start llama-server through a wrapper (``ExecStart=%h/bin/run-model``);
+    its ``--port``/``--alias``/``-m`` options are read from the script text.
+    """
+    path = Path(command.replace("%h", str(Path.home())))
+    try:
+        if not path.is_file() or path.stat().st_size > 65536:
+            return []
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    if "llama-server" not in text:
+        return []
+    try:
+        tokens = shlex.split(text, comments=True)
+    except ValueError:
+        return []
+    # Require an actual llama-server command plus an explicit port, so scripts that
+    # merely mention llama-server (watchdogs, notes) are not taken for a backend.
+    if not any(Path(token).name in LLAMA_SERVER_COMMS for token in tokens) or "--port" not in tokens:
+        return []
+    return ["llama-server", *tokens]
+
+
 def read_llama_units(unit_dir: Path | None = None) -> tuple[list[_LlamaUnit], dict[int, tuple[int, int]]]:
     """Read user systemd units: llama-server backends plus socket proxies.
 
@@ -5384,6 +5410,11 @@ def read_llama_units(unit_dir: Path | None = None) -> tuple[list[_LlamaUnit], di
             continue
         for argv in _systemd_exec_starts(text):
             exe = Path(argv[0]).name
+            if exe not in LLAMA_SERVER_COMMS and exe != "systemd-socket-proxyd":
+                wrapped = _llama_wrapper_argv(argv[0])
+                if not wrapped:
+                    continue
+                argv, exe = wrapped + argv[1:], "llama-server"
             opts = _parse_cli_options(argv)
             if exe in LLAMA_SERVER_COMMS:
                 port = _llama_option(opts, "--port")

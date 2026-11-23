@@ -190,6 +190,44 @@ class LlamaParsingTests(TestCase):
         self.assertEqual(fronts, {4791: (4790, 900), 4793: (4792, 300)})
         self.assertEqual(read_llama_units(tmp / "missing"), ([], {}))
 
+    def test_units_read_options_from_a_wrapper_script(self):
+        tmp = Path(self._tmp())
+        units = tmp / "units"
+        units.mkdir()
+        bin_dir = tmp / "home" / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "qwen-server").write_text(
+            "#!/usr/bin/env bash\n"
+            "# Wrapper: llama-server with model options\n"
+            'MODEL_DIR="$HOME/models"\n'
+            "args=(\n"
+            '  -m "$MODEL_DIR/Qwen-00001-of-00004.gguf"\n'
+            "  --alias qwen3.8-flash-next --host 127.0.0.1 --port 4791\n"
+            '  --slot-save-path "$SLOT_DIR/"\n'
+            ")\n"
+            'exec "$LLAMA_DIR/bin/llama-server" "${args[@]}" "$@"\n'
+        )
+        (bin_dir / "not-a-model").write_text("#!/bin/sh\nexec sleep 1 --port 9\n")
+        (bin_dir / "watchdog").write_text('#!/usr/bin/env python3\n# restarts llama-server when wedged\nprint("llama-server ok")\n')
+        _write_unit(units, "llama-qwen.service", (
+            "[Service]\nExecStartPre=%h/.local/bin/gpu-evict-ollama\nExecStart=%h/.local/bin/qwen-server\n"
+        ))
+        _write_unit(units, "other.service", "[Service]\nExecStart=%h/.local/bin/not-a-model\n")
+        _write_unit(units, "watchdog.service", "[Service]\nExecStart=%h/.local/bin/watchdog\n")
+        _write_unit(units, "llama-qwen-proxy.service", (
+            "[Service]\nExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=15min 127.0.0.1:4791\n"
+        ))
+        _write_unit(units, "llama-qwen-proxy.socket", "[Socket]\nListenStream=127.0.0.1:4790\n")
+
+        with patch.object(Path, "home", return_value=tmp / "home"):
+            backends, fronts = read_llama_units(units)
+
+        self.assertEqual(
+            [(unit.unit, unit.port, unit.alias, unit.model_file) for unit in backends],
+            [("llama-qwen.service", 4791, "qwen3.8-flash-next", "Qwen-00001-of-00004.gguf")],
+        )
+        self.assertEqual(fronts, {4791: (4790, 900)})
+
     def _tmp(self):
         import tempfile
 

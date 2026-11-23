@@ -380,6 +380,21 @@
     "test": "journalctl --user -u claude-indicator.service"
   },
   {
+    "path": "docs/todo/infra/llama-slot-cache-first-natural-run.md",
+    "slug": "llama-slot-cache-first-natural-run",
+    "title": "Confirm the first natural llama slot cache save and restore",
+    "status": "next",
+    "area": "infra",
+    "due": null,
+    "updated": "2026-11-23",
+    "owner": "agent",
+    "brief": "llama-slot-cache is installed but only a CPU test model proved it; confirm the live Qwen unit saves on its next unload and restores on the following load.",
+    "refs": [
+      "docs/todo/done/product/llama-cpp-local-models.md"
+    ],
+    "test": null
+  },
+  {
     "path": "docs/todo/infra/portable-python-install-verifier.md",
     "slug": "portable-python-install-verifier",
     "title": "Fresh-install verifier copies uv standalone Python incorrectly",
