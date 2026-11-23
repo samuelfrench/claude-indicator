@@ -29,3 +29,15 @@ def forbid_provider_cli_processes(monkeypatch):
         return real_popen(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", guarded)
+
+
+@pytest.fixture(autouse=True)
+def isolate_claude_statusline_settings(monkeypatch, tmp_path):
+    """Keep the owner's ~/.claude/settings.json statusLine from feeding fetch().
+
+    ``read_claude_statusline_usage`` reads ``Path.home()`` at call time; on a
+    host with the status-line feed configured, every ``ClaudeUsageClient.fetch``
+    test would otherwise return live local quota data instead of exercising
+    the mocked API path.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))

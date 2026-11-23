@@ -1,6 +1,6 @@
 # Claude Indicator
 
-A translucent Linux desktop widget for Claude and Codex usage, DeepSeek spend and credit, MiniMax/OpenCode Go/SuperGrok quotas, local system activity, and Ollama/GPU/ComfyUI status.
+A translucent Linux desktop widget for Claude and Codex usage, DeepSeek spend and credit, MiniMax/OpenCode Go/SuperGrok quotas, local system activity, and Ollama/llama.cpp/GPU/ComfyUI status.
 
 **Local desktop monitoring with no Indicator telemetry. Credentials go to their providers; the Indicator does not upload your task text or saved terminal history.** See the [privacy audit](docs/beta/privacy-audit.md) for network destinations, local storage and qualifications. Provider integrations have different policy constraints; read the [provider terms check](docs/beta/provider-terms-check.md) before enabling them or distributing a paid version.
 
@@ -34,6 +34,7 @@ The widget reuses credentials or local data from tools you have already configur
 | OpenCode Go | Go usage endpoint using the existing OpenCode key |
 | SuperGrok / Grok Build | CLI billing endpoint using Grok CLI or OpenCode OAuth; no Grok token refresh. The last successful reading persists in a private local snapshot and stays visible, marked `GROK CACHE`, until its reset or for 24 hours when no reset is reported |
 | Ollama / ComfyUI | Loopback status endpoints; local OpenCode ledger for model token totals |
+| llama.cpp `llama-server` | Running `llama-server` processes (not Ollama's own runner) found in `/proc`; loopback `/health`, `/v1/models` and `/slots` for model, context, slot and prefill/generation state; socket-activated user systemd units (`systemd-socket-proxyd` + `.socket`) for the on-demand port, idle-unload timer and not-yet-loaded models; journal timing lines for prefill progress and tokens/s; `ss` for connected clients; `nvidia-smi` per-process VRAM |
 
 Claude's header fallback sends a real `max_tokens: 1` Haiku request to Anthropic and consumes subscription usage. The application cannot guarantee that a user's plan has overage disabled. Header-only mode lacks model-specific limits and extra-usage dollars. No new Anthropic requests were made for beta testing; validation uses mocks. Current OAuth/undocumented-source policy risks are documented in the terms check.
 

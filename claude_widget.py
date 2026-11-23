@@ -7,6 +7,7 @@ import math
 import os
 import re
 import select
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -974,6 +975,89 @@ class LoadedModel:
         if seconds >= 3600:
             return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
         return f"{seconds // 60}m"
+
+
+@dataclass
+class LlamaServer:
+    """One running llama.cpp ``llama-server`` process (outside Ollama)."""
+
+    pid: int = 0
+    host: str = "127.0.0.1"
+    port: int = 8080
+    alias: str = ""
+    model_file: str = ""
+    unit: str = ""
+    # loading | idle | prefill | generating | running (activity unknown) | unreachable
+    state: str = ""
+    error: str = ""
+    n_params: int = 0
+    size_bytes: int = 0
+    ftype: str = ""
+    n_ctx: int = 0
+    slots_total: int = 0
+    slots_busy: int = 0
+    vision: bool = False
+    task_id: int = -1
+    prompt_done: int = 0
+    prompt_total_est: int = 0
+    prompt_progress: float = 0.0
+    prompt_tps: float = 0.0
+    decoded: int = 0
+    live_gen_tps: float = 0.0
+    last_gen_tps: float = 0.0
+    last_prompt_tps: float = 0.0
+    last_context_tokens: int = 0
+    last_release_at: float = 0.0
+    started_at: float = 0.0
+    vram_bytes: int = 0
+    rss_bytes: int = 0
+    front_port: int = 0
+    idle_exit_s: int = 0
+    clients: list[str] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return self.alias or self.model_file or f"llama-server :{self.port}"
+
+    @property
+    def busy(self) -> bool:
+        return self.state in ("prefill", "generating")
+
+    def prefill_eta_seconds(self) -> float | None:
+        if self.state != "prefill" or self.prompt_tps <= 0:
+            return None
+        if self.prompt_total_est <= self.prompt_done:
+            return None
+        return (self.prompt_total_est - self.prompt_done) / self.prompt_tps
+
+
+@dataclass
+class LlamaOnDemand:
+    """A socket-activated llama-server unit whose model is not loaded."""
+
+    unit: str = ""
+    alias: str = ""
+    model_file: str = ""
+    front_port: int = 0
+    idle_exit_s: int = 0
+
+    @property
+    def name(self) -> str:
+        return self.alias or self.model_file or self.unit
+
+
+@dataclass
+class GpuProcess:
+    pid: int = 0
+    name: str = ""
+    vram_bytes: int = 0
+
+
+@dataclass
+class LlamaServersSnapshot:
+    servers: list[LlamaServer] = field(default_factory=list)
+    on_demand: list[LlamaOnDemand] = field(default_factory=list)
+    gpu_processes: list[GpuProcess] = field(default_factory=list)
 
 
 @dataclass
@@ -5172,10 +5256,439 @@ class OpencodeUsageWorker(QThread):
             self.result.emit(usage)
 
 
+# ---------------------------------------------------------------------------
+# llama.cpp servers outside Ollama (standalone or socket-activated systemd units)
+# ---------------------------------------------------------------------------
+
+LLAMA_SERVER_COMMS = frozenset({"llama-server"})
+LLAMA_HTTP_TIMEOUT = 2
+LLAMA_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+LLAMA_JOURNAL_LINES = 300
+
+_LLAMA_JOURNAL_LINE_RE = re.compile(r"^(\d+(?:\.\d+)?) \S+ [^\s\[]+\[(\d+)\]: (.*)$")
+_LLAMA_PREFILL_RE = re.compile(
+    r"task (\d+) \| prompt processing, n_tokens =\s*(\d+), progress =\s*([\d.]+), "
+    r"t =\s*[\d.]+ s / ([\d.]+) tokens per second"
+)
+_LLAMA_PROMPT_EVAL_RE = re.compile(
+    r"\|\s+prompt eval time =\s*[\d.]+ ms /\s*\d+ tokens \(.*?([\d.]+) tokens per second\)"
+)
+_LLAMA_EVAL_RE = re.compile(
+    r"\|\s+eval time =\s*[\d.]+ ms /\s*\d+ tokens \(.*?([\d.]+) tokens per second\)"
+)
+_LLAMA_RELEASE_RE = re.compile(r"\| stop processing: n_tokens =\s*(\d+)")
+_SS_PROCESS_RE = re.compile(r'\("([^"]*)",pid=(\d+),')
+_TIMESPAN_UNITS = {
+    "": 1, "s": 1, "sec": 1, "m": 60, "min": 60, "h": 3600, "hr": 3600, "d": 86400,
+}
+
+
+@dataclass
+class LlamaJournalStats:
+    # task id -> (prompt tokens processed, progress fraction, prompt tokens/s)
+    prefill: dict[int, tuple[int, float, float]] = field(default_factory=dict)
+    last_gen_tps: float = 0.0
+    last_prompt_tps: float = 0.0
+    last_context_tokens: int = 0
+    last_release_at: float = 0.0
+
+
+@dataclass
+class _LlamaUnit:
+    unit: str
+    port: int
+    alias: str
+    model_file: str
+
+
+def _run_text(cmd: list[str], timeout: float = 2.0) -> str:
+    """Run a local read-only command; empty output on any failure."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _port_of(address: str) -> int:
+    tail = address.rsplit(":", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
+def _parse_cli_options(argv: list[str]) -> dict[str, str]:
+    """Map ``--key value`` / ``--key=value`` / ``-k value`` options to values."""
+    opts: dict[str, str] = {}
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("-"):
+            if arg.startswith("--") and "=" in arg:
+                key, value = arg.split("=", 1)
+                opts[key] = value
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                opts[arg] = argv[i + 1]
+                i += 1
+            else:
+                opts[arg] = ""
+        i += 1
+    return opts
+
+
+def _llama_option(opts: dict[str, str], *keys: str) -> str:
+    for key in keys:
+        if opts.get(key):
+            return opts[key]
+    return ""
+
+
+def _parse_systemd_timespan(value: str) -> int:
+    total = 0
+    for number, unit in re.findall(r"(\d+)\s*([a-z]*)", value.lower()):
+        total += int(number) * _TIMESPAN_UNITS.get(unit, 0)
+    return total
+
+
+def _systemd_exec_starts(text: str) -> list[list[str]]:
+    joined = text.replace("\\\n", " ")
+    commands = []
+    for line in joined.splitlines():
+        line = line.strip()
+        if not line.startswith("ExecStart="):
+            continue
+        try:
+            argv = shlex.split(line[len("ExecStart="):].lstrip("-@+!:"))
+        except ValueError:
+            continue
+        if argv:
+            commands.append(argv)
+    return commands
+
+
+def read_llama_units(unit_dir: Path | None = None) -> tuple[list[_LlamaUnit], dict[int, tuple[int, int]]]:
+    """Read user systemd units: llama-server backends plus socket proxies.
+
+    Returns the backends and ``{backend port: (front port, idle-exit seconds)}``
+    for ``systemd-socket-proxyd`` services whose same-named ``.socket`` listens.
+    """
+    unit_dir = unit_dir or LLAMA_UNIT_DIR
+    backends: list[_LlamaUnit] = []
+    fronts: dict[int, tuple[int, int]] = {}
+    try:
+        paths = sorted(unit_dir.glob("*.service"))
+    except OSError:
+        return backends, fronts
+    for path in paths:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        for argv in _systemd_exec_starts(text):
+            exe = Path(argv[0]).name
+            opts = _parse_cli_options(argv)
+            if exe in LLAMA_SERVER_COMMS:
+                port = _llama_option(opts, "--port")
+                backends.append(_LlamaUnit(
+                    unit=path.name,
+                    port=int(port) if port.isdigit() else 8080,
+                    alias=_llama_option(opts, "--alias", "-a"),
+                    model_file=Path(_llama_option(opts, "--model", "-m")).name,
+                ))
+            elif exe == "systemd-socket-proxyd":
+                target = _port_of(argv[-1])
+                front = 0
+                try:
+                    socket_text = path.with_suffix(".socket").read_text(errors="replace")
+                except OSError:
+                    socket_text = ""
+                for line in socket_text.splitlines():
+                    if line.strip().startswith("ListenStream="):
+                        front = _port_of(line.split("=", 1)[1].strip())
+                        break
+                if target and front:
+                    fronts[target] = (front, _parse_systemd_timespan(opts.get("--exit-idle-time", "")))
+    return backends, fronts
+
+
+def parse_llama_journal(text: str, pid: int) -> LlamaJournalStats:
+    """Extract timing numbers (never prompt text) from ``journalctl -o short-unix``."""
+    stats = LlamaJournalStats()
+    for raw in text.splitlines():
+        match = _LLAMA_JOURNAL_LINE_RE.match(raw)
+        if not match or int(match.group(2)) != pid:
+            continue
+        stamp, message = float(match.group(1)), match.group(3)
+        if hit := _LLAMA_PREFILL_RE.search(message):
+            stats.prefill[int(hit.group(1))] = (
+                int(hit.group(2)), float(hit.group(3)), float(hit.group(4)),
+            )
+        elif hit := _LLAMA_PROMPT_EVAL_RE.search(message):
+            stats.last_prompt_tps = float(hit.group(1))
+        elif hit := _LLAMA_EVAL_RE.search(message):
+            stats.last_gen_tps = float(hit.group(1))
+        elif hit := _LLAMA_RELEASE_RE.search(message):
+            stats.last_context_tokens = int(hit.group(1))
+            stats.last_release_at = stamp
+    return stats
+
+
+def parse_ss_rows(text: str) -> list[tuple[str, int, int, list[tuple[str, int]]]]:
+    """Parse ``ss -Htanp`` into (state, local port, peer port, [(process, pid)])."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        users = [(name, int(pid)) for name, pid in _SS_PROCESS_RE.findall(line)]
+        rows.append((parts[0], _port_of(parts[3]), _port_of(parts[4]), users))
+    return rows
+
+
+def _read_proc_text(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def _proc_start_epoch(proc_dir: Path, start_ticks: int) -> float:
+    for line in _read_proc_text(proc_dir / "stat").splitlines():
+        if line.startswith("btime "):
+            try:
+                return int(line.split()[1]) + start_ticks / os.sysconf("SC_CLK_TCK")
+            except (ValueError, OSError):
+                return 0.0
+    return 0.0
+
+
+def _gpu_process_name(proc_dir: Path, pid: int) -> str:
+    entry = proc_dir / str(pid)
+    comm = _read_proc_text(entry / "comm").strip() or f"pid {pid}"
+    if not comm.startswith("python"):
+        return comm
+    try:
+        argv = [a.decode(errors="replace") for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
+    except OSError:
+        return comm
+    script = next((a for a in argv[1:] if not a.startswith("-")), "")
+    if not script:
+        return comm
+    path = Path(script)
+    return (path.parent.name if path.name in ("main.py", "app.py", "server.py") else path.stem) or comm
+
+
+def _scan_llama_processes(proc_dir: Path) -> list[tuple[int, list[str], int]]:
+    """Return (pid, argv, start ticks) for llama-server processes not owned by Ollama."""
+    found = []
+    try:
+        entries = list(proc_dir.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        if _read_proc_text(entry / "comm").strip() not in LLAMA_SERVER_COMMS:
+            continue
+        try:
+            argv = [a.decode(errors="replace") for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
+        except OSError:
+            continue
+        fields = _read_proc_text(entry / "stat").rsplit(")", 1)[-1].split()
+        try:
+            ppid, start_ticks = int(fields[1]), int(fields[19])
+        except (IndexError, ValueError):
+            ppid, start_ticks = 0, 0
+        if _read_proc_text(proc_dir / str(ppid) / "comm").strip() == "ollama":
+            continue  # Ollama's own runner; /api/ps already reports it
+        found.append((int(entry.name), argv, start_ticks))
+    return sorted(found)
+
+
+def _fetch_llama_http(server: LlamaServer) -> None:
+    """Fill state/model/slot fields from the server's loopback HTTP API."""
+    host = server.host if server.host not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    base = f"http://{host}:{server.port}"
+    try:
+        response = requests.get(f"{base}/health", timeout=LLAMA_HTTP_TIMEOUT)
+    except requests.RequestException as exc:
+        server.state, server.error = "unreachable", type(exc).__name__
+        return
+    if response.status_code == 503:
+        server.state = "loading"
+        return
+    if response.status_code != 200:
+        server.state, server.error = "unreachable", f"HTTP {response.status_code}"
+        return
+    server.state = "running"
+    try:
+        response = requests.get(f"{base}/v1/models", timeout=LLAMA_HTTP_TIMEOUT)
+        data = response.json().get("data") if response.status_code == 200 else None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            entry = data[0]
+            meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
+            server.alias = server.alias or str(entry.get("id", ""))
+            server.n_params = int(meta.get("n_params") or 0)
+            server.size_bytes = int(meta.get("size") or 0)
+            server.ftype = str(meta.get("ftype") or "")
+            server.n_ctx = server.n_ctx or int(meta.get("n_ctx") or 0)
+            arch = entry.get("architecture") if isinstance(entry.get("architecture"), dict) else {}
+            if "image" in (arch.get("input_modalities") or []):
+                server.vision = True
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        pass
+    try:
+        response = requests.get(f"{base}/slots", timeout=LLAMA_HTTP_TIMEOUT)
+        slots = response.json() if response.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        slots = None
+    if not isinstance(slots, list):
+        return  # --no-slots or --api-key: activity unknown, state stays "running"
+    slots = [slot for slot in slots if isinstance(slot, dict)]
+    busy = [slot for slot in slots if slot.get("is_processing", slot.get("state", 0) != 0)]
+    server.slots_total, server.slots_busy = len(slots), len(busy)
+    if slots and not server.n_ctx:
+        server.n_ctx = int(slots[0].get("n_ctx") or 0)
+    if not busy:
+        server.state = "idle"
+        return
+    slot = busy[0]
+    try:
+        server.task_id = int(slot.get("id_task", -1))
+        server.prompt_done = int(slot.get("n_prompt_tokens_processed") or 0)
+        next_token = slot.get("next_token")
+        if isinstance(next_token, list) and next_token and isinstance(next_token[0], dict):
+            server.decoded = int(next_token[0].get("n_decoded") or 0)
+    except (TypeError, ValueError):
+        pass
+    server.state = "generating" if server.decoded > 0 else "prefill"
+
+
+def read_llama_servers(
+    proc_dir: Path = Path("/proc"),
+    unit_dir: Path | None = None,
+    run=_run_text,
+) -> LlamaServersSnapshot:
+    """Discover local llama.cpp servers, on-demand units and GPU memory holders."""
+    snapshot = LlamaServersSnapshot()
+    vram: dict[int, int] = {}
+    for line in run([
+        "nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits",
+    ]).splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            vram[int(parts[0])] = int(parts[1]) * 1024 * 1024
+    snapshot.gpu_processes = [
+        GpuProcess(pid=pid, name=_gpu_process_name(proc_dir, pid), vram_bytes=size)
+        for pid, size in sorted(vram.items(), key=lambda item: -item[1])
+    ]
+
+    processes = _scan_llama_processes(proc_dir)
+    backends, fronts = read_llama_units(unit_dir)
+    if not processes and not backends:
+        return snapshot
+    rows = parse_ss_rows(run(["ss", "-Htanp"]))
+    listening: dict[int, set[int]] = {}
+    for state, local_port, _peer, users in rows:
+        if state == "LISTEN":
+            for _name, pid in users:
+                listening.setdefault(pid, set()).add(local_port)
+    listening_ports = {port for ports in listening.values() for port in ports}
+
+    for pid, argv, start_ticks in processes:
+        opts = _parse_cli_options(argv)
+        port_text = _llama_option(opts, "--port")
+        own_ports = sorted(listening.get(pid, ()))
+        server = LlamaServer(
+            pid=pid,
+            host=_llama_option(opts, "--host") or "127.0.0.1",
+            port=int(port_text) if port_text.isdigit() else (own_ports[0] if own_ports else 8080),
+            alias=_llama_option(opts, "--alias", "-a"),
+            model_file=Path(_llama_option(opts, "--model", "-m")).name,
+            vision=bool(_llama_option(opts, "--mmproj", "-mm")),
+            vram_bytes=vram.get(pid, 0),
+            started_at=_proc_start_epoch(proc_dir, start_ticks) if start_ticks else 0.0,
+        )
+        ctx = _llama_option(opts, "--ctx-size", "-c")
+        server.n_ctx = int(ctx) if ctx.isdigit() else 0
+        for line in _read_proc_text(proc_dir / str(pid) / "status").splitlines():
+            if line.startswith("VmRSS:"):
+                try:
+                    server.rss_bytes = int(line.split()[1]) * 1024
+                except (IndexError, ValueError):
+                    pass
+        cgroup = _read_proc_text(proc_dir / str(pid) / "cgroup").strip().rsplit("/", 1)[-1]
+        server.unit = cgroup if cgroup.endswith(".service") else ""
+        server.front_port, server.idle_exit_s = fronts.get(server.port, (0, 0))
+        _fetch_llama_http(server)
+
+        if server.unit:
+            scope = ["--user"] if "user@" in _read_proc_text(proc_dir / str(pid) / "cgroup") else []
+            journal = run([
+                "journalctl", *scope, "-u", server.unit, "-n", str(LLAMA_JOURNAL_LINES),
+                "-o", "short-unix", "--no-pager", "-q",
+            ])
+            stats = parse_llama_journal(journal, pid)
+            server.last_gen_tps = stats.last_gen_tps
+            server.last_prompt_tps = stats.last_prompt_tps
+            server.last_context_tokens = stats.last_context_tokens
+            server.last_release_at = stats.last_release_at
+            if server.state == "prefill" and server.task_id in stats.prefill:
+                done, progress, tps = stats.prefill[server.task_id]
+                server.prompt_progress, server.prompt_tps = progress, tps
+                if progress >= 0.01:
+                    server.prompt_total_est = int(round(done / progress))
+                server.prompt_done = max(server.prompt_done, done)
+
+        targets = {server.port} | ({server.front_port} if server.front_port else set())
+        clients: list[str] = []
+        for state, _local, peer_port, users in rows:
+            if state != "ESTAB" or peer_port not in targets:
+                continue
+            for name, client_pid in users:
+                if client_pid == pid or name.startswith("systemd-socket"):
+                    continue
+                label = f"{name.removesuffix('.exe')} ({client_pid})"
+                if label not in clients:
+                    clients.append(label)
+        server.clients = clients
+        snapshot.servers.append(server)
+
+    running_ports = {server.port for server in snapshot.servers}
+    for unit in backends:
+        front_port, idle_exit = fronts.get(unit.port, (0, 0))
+        if not front_port or unit.port in running_ports:
+            continue
+        if rows and front_port not in listening_ports:
+            continue  # socket unit not listening: the model cannot start on demand
+        snapshot.on_demand.append(LlamaOnDemand(
+            unit=unit.unit, alias=unit.alias, model_file=unit.model_file,
+            front_port=front_port, idle_exit_s=idle_exit,
+        ))
+    return snapshot
+
+
 class OllamaFetchWorker(QThread):
-    result = Signal(object, list, int)
+    result = Signal(object, list, int, object)
+
+    def __init__(self, llama_reader=None):
+        super().__init__()
+        self._llama_reader = llama_reader
 
     def run(self):
+        status, loaded, available_count = self._read_ollama()
+        if self.isInterruptionRequested():
+            return
+        reader = self._llama_reader or read_llama_servers
+        try:
+            llama = reader()
+        except Exception as exc:  # keep the Ollama result if discovery breaks
+            log_line(f"llama.cpp discovery failed: {type(exc).__name__}: {exc}")
+            llama = LlamaServersSnapshot()
+        if not self.isInterruptionRequested():
+            self.result.emit(status, loaded, available_count, llama)
+
+    def _read_ollama(self) -> tuple[OllamaStatus, list[LoadedModel], int]:
         status = OllamaStatus()
         loaded: list[LoadedModel] = []
         available_count = 0
@@ -5187,10 +5700,9 @@ class OllamaFetchWorker(QThread):
             status.version = str(payload.get("version", ""))
         except (requests.RequestException, ValueError, TypeError) as exc:
             status.error = type(exc).__name__
-            self.result.emit(status, loaded, available_count)
-            return
+            return status, loaded, available_count
         if self.isInterruptionRequested():
-            return
+            return status, loaded, available_count
         try:
             response = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
             response.raise_for_status()
@@ -5210,7 +5722,7 @@ class OllamaFetchWorker(QThread):
         except (requests.RequestException, ValueError, TypeError, AttributeError):
             loaded = []
         if self.isInterruptionRequested():
-            return
+            return status, loaded, available_count
         try:
             response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
             response.raise_for_status()
@@ -5218,8 +5730,7 @@ class OllamaFetchWorker(QThread):
             available_count = len(models) if isinstance(models, list) else 0
         except (requests.RequestException, ValueError, TypeError, AttributeError):
             available_count = 0
-        if not self.isInterruptionRequested():
-            self.result.emit(status, loaded, available_count)
+        return status, loaded, available_count
 
 
 class ComfyUIFetchWorker(QThread):
@@ -7999,11 +8510,83 @@ class TerminalTabsPanel(QWidget):
         p.end()
 
 
+def _fmt_gib(n: int) -> str:
+    return f"{n / 1024 ** 3:.1f} GB"
+
+
+def _fmt_params(n: int) -> str:
+    if n >= 10 ** 10:
+        return f"{n / 10 ** 9:.0f}B"
+    if n >= 10 ** 9:
+        return f"{n / 10 ** 9:.1f}B"
+    if n >= 10 ** 6:
+        return f"{n / 10 ** 6:.0f}M"
+    return str(n) if n else ""
+
+
+def _compact_ftype(ftype: str) -> str:
+    """``Q3_K - Medium`` -> ``Q3_K_M`` (llama.cpp's GGUF file-type label)."""
+    return re.sub(r"\s*-\s*([A-Za-z])[A-Za-z]*\b", lambda m: "_" + m.group(1).upper(), ftype).strip()
+
+
+def llama_idle_since(server: LlamaServer, last_busy: float = 0.0) -> float:
+    return server.last_release_at or last_busy or server.started_at
+
+
+def llama_activity_text(server: LlamaServer, now: float, last_busy: float = 0.0) -> str:
+    if server.state == "prefill":
+        done = _fmt_tokens(server.prompt_done)
+        if server.prompt_total_est:
+            done += f"/~{_fmt_tokens(server.prompt_total_est)}"
+        parts = [f"PREFILL {done} tok"]
+        if server.prompt_progress:
+            parts.append(f"{server.prompt_progress * 100:.0f}%")
+        if server.prompt_tps:
+            parts.append(f"{server.prompt_tps:.1f} t/s")
+        eta = server.prefill_eta_seconds()
+        if eta is not None:
+            parts.append(f"ETA ~{_fmt_duration(eta)}")
+        return " · ".join(parts)
+    if server.state == "generating":
+        parts = [f"GENERATING {_fmt_tokens(server.decoded)} tok"]
+        if server.live_gen_tps:
+            parts.append(f"{server.live_gen_tps:.1f} t/s")
+        if server.prompt_done:
+            parts.append(f"prompt {_fmt_tokens(server.prompt_done)}")
+        return " · ".join(parts)
+    if server.state == "idle":
+        since = llama_idle_since(server, last_busy)
+        idle = max(0.0, now - since) if since else 0.0
+        text = f"IDLE {_fmt_duration(idle)}" if since else "IDLE"
+        if server.front_port and server.idle_exit_s and since:
+            remaining = server.idle_exit_s - idle
+            # The proxy's timer restarts on every connection; an open client
+            # connection keeps the model loaded past this estimate.
+            text += f" · unloads in ~{_fmt_duration(remaining)}" if remaining > 0 else " · unload pending"
+        return text
+    if server.state == "loading":
+        return "LOADING MODEL"
+    if server.state == "unreachable":
+        return f"NOT RESPONDING ({server.error or 'no reply'})"
+    return "RUNNING · activity unknown (/slots unavailable)"
+
+
+_LLAMA_STATE_COLORS = {
+    "prefill": QColor(234, 179, 8),
+    "generating": QColor(34, 197, 94),
+    "loading": QColor(100, 181, 246),
+    "unreachable": QColor(239, 68, 68),
+}
+
+
 class LocalAISection(QWidget):
-    """Collapsed local Ollama summary with compact model/GPU/ComfyUI details."""
+    """Collapsed local model summary: Ollama, llama.cpp servers, GPU and ComfyUI."""
 
     expanded_changed = Signal(bool)
     _COLLAPSED_H = 26
+    _SERVER_BLOCK_H = 64
+    _MAX_SERVERS = 2
+    _MAX_ON_DEMAND = 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -8011,6 +8594,9 @@ class LocalAISection(QWidget):
         self._status = OllamaStatus()
         self._models: list[LoadedModel] = []
         self._available_count = 0
+        self._llama = LlamaServersSnapshot()
+        self._decode_samples: dict[tuple[int, int], tuple[float, int, float]] = {}
+        self._last_busy: dict[int, float] = {}
         self._gpu = SystemMetrics()
         self._comfyui = ComfyUIStatus()
         self._task_loops: list[TaskLoopInfo] = []
@@ -8018,9 +8604,18 @@ class LocalAISection(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _expanded_height(self) -> int:
-        model_rows = max(1, min(3, len(self._models)))
+        servers = min(self._MAX_SERVERS, len(self._llama.servers))
+        on_demand = min(self._MAX_ON_DEMAND, len(self._llama.on_demand))
+        model_rows = min(3, len(self._models))
+        if not model_rows and not servers:
+            model_rows = 1  # "No models loaded" placeholder
         task_rows = max(1, min(3, len(self._task_loops)))
-        return self._COLLAPSED_H + 116 + model_rows * 28 + task_rows * 20
+        height = self._COLLAPSED_H + 116 + model_rows * 28 + task_rows * 20
+        if servers or on_demand:
+            height += 16 + servers * self._SERVER_BLOCK_H + on_demand * 14
+        if self._llama.gpu_processes:
+            height += 14
+        return height
 
     def _sync_height(self):
         self.setFixedHeight(self._expanded_height() if self._expanded else self._COLLAPSED_H)
@@ -8047,6 +8642,27 @@ class LocalAISection(QWidget):
         self._update_tooltip()
         self.update()
 
+    def set_llama(self, snapshot: LlamaServersSnapshot):
+        mono, wall = time.monotonic(), time.time()
+        samples: dict[tuple[int, int], tuple[float, int, float]] = {}
+        for server in snapshot.servers:
+            if server.state == "generating":
+                key = (server.pid, server.task_id)
+                previous = self._decode_samples.get(key)
+                if previous and mono > previous[0] and server.decoded >= previous[1]:
+                    server.live_gen_tps = (server.decoded - previous[1]) / (mono - previous[0])
+                samples[key] = (mono, server.decoded, server.live_gen_tps)
+            if server.busy:
+                self._last_busy[server.pid] = wall
+        self._decode_samples = samples
+        live = {server.pid for server in snapshot.servers}
+        self._last_busy = {pid: stamp for pid, stamp in self._last_busy.items() if pid in live}
+        self._llama = snapshot
+        if self._expanded:
+            self._sync_height()
+        self._update_tooltip()
+        self.update()
+
     def set_gpu(self, metrics: SystemMetrics):
         self._gpu = metrics
         self._update_tooltip()
@@ -8064,20 +8680,118 @@ class LocalAISection(QWidget):
         self._update_tooltip()
         self.update()
 
+    def _server_activity(self, server: LlamaServer) -> str:
+        return llama_activity_text(server, time.time(), self._last_busy.get(server.pid, 0.0))
+
+    @staticmethod
+    def _endpoint(server: LlamaServer) -> str:
+        return f":{server.front_port}→:{server.port}" if server.front_port else f":{server.port}"
+
+    def summary_text(self) -> tuple[str, QColor]:
+        gpu_text = f"GPU {self._gpu.gpu_pct:.0f}%" if self._gpu.gpu_available else "GPU —"
+        servers = self._llama.servers
+        if servers:
+            lead = next((server for server in servers if server.busy), servers[0])
+            label = lead.name.split("-")[0].upper()[:16]
+            state = {
+                "prefill": f"PREFILL {lead.prompt_progress * 100:.0f}%" if lead.prompt_progress else "PREFILL",
+                "generating": "GENERATING",
+                "idle": "IDLE",
+                "loading": "LOADING",
+                "unreachable": "NOT RESPONDING",
+            }.get(lead.state, "RUNNING")
+            if len(servers) > 1:
+                label += f" +{len(servers) - 1}"
+            color = QColor(239, 68, 68) if lead.state == "unreachable" else QColor(34, 197, 94)
+            return f"{label} {state}  ·  {gpu_text}", color
+        if self._models:
+            return f"OLLAMA {len(self._models)} LOADED  ·  {gpu_text}", QColor(34, 197, 94)
+        if self._status.running:
+            return f"NO MODEL LOADED  ·  {gpu_text}", QColor(34, 197, 94)
+        return f"STOPPED  ·  {gpu_text}", QColor(239, 68, 68)
+
     def _update_tooltip(self):
         ollama = "running" if self._status.running else "stopped"
         lines = [f"Ollama {ollama}; {len(self._models)} loaded / {self._available_count} available models."]
+        for server in self._llama.servers:
+            unit = f", unit {server.unit}" if server.unit else ""
+            lines.append(
+                f"llama.cpp {server.name} (PID {server.pid}{unit}) on 127.0.0.1{self._endpoint(server)}: "
+                f"{self._server_activity(server)}."
+            )
+            if server.model_file:
+                lines.append(f"  Model file {server.model_file}.")
+            if server.front_port and server.idle_exit_s:
+                lines.append(
+                    f"  Socket-activated on :{server.front_port}; the proxy exits after "
+                    f"{_fmt_duration(server.idle_exit_s)} idle and the model unloads (KV cache is lost)."
+                )
+        for unit in self._llama.on_demand:
+            lines.append(
+                f"llama.cpp {unit.name}: not loaded; starts on demand at 127.0.0.1:{unit.front_port} ({unit.unit})."
+            )
         if self._gpu.gpu_available:
             lines.append(
                 f"GPU {self._gpu.gpu_pct:.0f}%; VRAM {self._gpu.gpu_mem_used_gb:.1f}/"
                 f"{self._gpu.gpu_mem_total_gb:.1f} GB; {self._gpu.gpu_temp}°C."
             )
+        for process in self._llama.gpu_processes:
+            lines.append(f"  VRAM {_fmt_gib(process.vram_bytes)} held by {process.name} (PID {process.pid}).")
         lines.append("Ollama task loops come from local clawd-bot configuration; no DynamoDB query is used.")
         self.setToolTip("\n".join(lines))
 
     def mousePressEvent(self, event):
         self.set_expanded(not self._expanded)
         event.accept()
+
+    def _paint_server(self, painter: QPainter, server: LlamaServer, y: int, width: int) -> None:
+        fm = painter.fontMetrics()
+        endpoint = self._endpoint(server)
+        endpoint_w = fm.horizontalAdvance(endpoint)
+        painter.setPen(QColor(139, 92, 246))
+        painter.drawText(12, y, fm.elidedText(server.name, Qt.TextElideMode.ElideRight, width - 36 - endpoint_w))
+        painter.setPen(QColor(100, 100, 120))
+        painter.drawText(width - endpoint_w - 8, y, endpoint)
+
+        specs = [
+            _fmt_params(server.n_params),
+            _compact_ftype(server.ftype),
+            f"{_fmt_gib(server.size_bytes)} file" if server.size_bytes else "",
+            f"ctx {_fmt_tokens(server.n_ctx)}" if server.n_ctx else "",
+            "vision" if server.vision else "",
+            f"slots {server.slots_busy}/{server.slots_total}" if server.slots_total > 1 else "",
+        ]
+        spec_text = " · ".join(part for part in specs if part) or server.model_file
+        painter.setPen(QColor(130, 130, 150))
+        painter.drawText(12, y + 12, fm.elidedText(spec_text, Qt.TextElideMode.ElideRight, width - 24))
+
+        painter.setPen(_LLAMA_STATE_COLORS.get(server.state, QColor(160, 160, 180)))
+        painter.drawText(
+            12, y + 24, fm.elidedText(self._server_activity(server), Qt.TextElideMode.ElideRight, width - 24)
+        )
+
+        resources = [
+            f"VRAM {_fmt_gib(server.vram_bytes)}" if server.vram_bytes else "VRAM 0 (CPU only)",
+            f"RAM {_fmt_gib(server.rss_bytes)}" if server.rss_bytes else "",
+            f"up {_fmt_duration(max(0.0, time.time() - server.started_at))}" if server.started_at else "",
+            f"PID {server.pid}",
+        ]
+        painter.setPen(QColor(130, 130, 150))
+        painter.drawText(
+            12, y + 36,
+            fm.elidedText(" · ".join(part for part in resources if part), Qt.TextElideMode.ElideRight, width - 24),
+        )
+
+        usage = [f"client {', '.join(server.clients)}" if server.clients else "no client connected"]
+        if server.last_gen_tps:
+            usage.append(f"last gen {server.last_gen_tps:.1f} t/s")
+        if server.last_prompt_tps:
+            usage.append(f"prefill {server.last_prompt_tps:.0f} t/s")
+        if server.last_context_tokens:
+            usage.append(f"ctx used {_fmt_tokens(server.last_context_tokens)}")
+        painter.drawText(
+            12, y + 48, fm.elidedText(" · ".join(usage), Qt.TextElideMode.ElideRight, width - 24)
+        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -8089,11 +8803,12 @@ class LocalAISection(QWidget):
         fm = painter.fontMetrics()
         arrow = "▾" if self._expanded else "▸"
         painter.setPen(QColor(100, 100, 120))
-        painter.drawText(4, 17, f"OLLAMA {arrow}")
-        ollama_text = "RUNNING" if self._status.running else "STOPPED"
-        gpu_text = f"GPU {self._gpu.gpu_pct:.0f}%" if self._gpu.gpu_available else "GPU —"
-        summary = f"{ollama_text}  ·  {gpu_text}"
-        painter.setPen(QColor(34, 197, 94) if self._status.running else QColor(239, 68, 68))
+        label = f"LOCAL AI {arrow}"
+        painter.drawText(4, 17, label)
+        summary, color = self.summary_text()
+        painter.setPen(color)
+        summary_w = width - fm.horizontalAdvance(label) - 16
+        summary = fm.elidedText(summary, Qt.TextElideMode.ElideLeft, summary_w)
         painter.drawText(width - fm.horizontalAdvance(summary) - 4, 17, summary)
         if not self._expanded:
             painter.end()
@@ -8105,11 +8820,13 @@ class LocalAISection(QWidget):
         painter.drawText(8, y, f"OLLAMA  {'Running' if self._status.running else 'Stopped'}{version}")
         y += 18
         painter.setPen(QColor(100, 100, 120))
-        painter.drawText(8, y, f"LOADED MODELS  ({len(self._models)} loaded / {self._available_count} available)")
+        painter.drawText(8, y, f"OLLAMA MODELS  ({len(self._models)} loaded / {self._available_count} available)")
         y += 18
         small = QFont("sans-serif", 7)
         painter.setFont(small)
         sfm = painter.fontMetrics()
+        servers = self._llama.servers[: self._MAX_SERVERS]
+        on_demand = self._llama.on_demand[: self._MAX_ON_DEMAND]
         if self._models:
             for model in self._models[:3]:
                 info = " · ".join(part for part in (model.parameter_size, model.quantization) if part)
@@ -8121,10 +8838,28 @@ class LocalAISection(QWidget):
                 painter.setPen(QColor(130, 130, 150))
                 painter.drawText(12, y + 12, detail)
                 y += 28
-        else:
+        elif not servers:
             painter.setPen(QColor(130, 130, 150))
             painter.drawText(12, y, "No models loaded" if self._status.running else "Service unavailable")
             y += 28
+
+        if servers or on_demand:
+            painter.setFont(font)
+            painter.setPen(QColor(100, 100, 120))
+            counts = [f"{len(self._llama.servers)} running"]
+            if self._llama.on_demand:
+                counts.append(f"{len(self._llama.on_demand)} on demand")
+            painter.drawText(8, y, f"LLAMA.CPP  ({' · '.join(counts)})")
+            y += 16
+            painter.setFont(small)
+            for server in servers:
+                self._paint_server(painter, server, y, width)
+                y += self._SERVER_BLOCK_H
+            painter.setPen(QColor(130, 130, 150))
+            for unit in on_demand:
+                line = f"{unit.name} · not loaded · starts on request to :{unit.front_port}"
+                painter.drawText(12, y, sfm.elidedText(line, Qt.TextElideMode.ElideRight, width - 24))
+                y += 14
 
         painter.setFont(font)
         painter.setPen(QColor(160, 160, 180))
@@ -8136,6 +8871,16 @@ class LocalAISection(QWidget):
         else:
             gpu = "GPU  No NVIDIA GPU detected"
         painter.drawText(8, y, gpu)
+        if self._llama.gpu_processes:
+            y += 14
+            painter.setFont(small)
+            painter.setPen(QColor(130, 130, 150))
+            holders = " · ".join(
+                f"{process.name} {process.vram_bytes / 1024 ** 3:.1f}G" for process in self._llama.gpu_processes
+            )
+            painter.drawText(12, y, sfm.elidedText(f"VRAM held by  {holders}", Qt.TextElideMode.ElideRight, width - 24))
+            painter.setFont(font)
+            painter.setPen(QColor(160, 160, 180))
         y += 20
         if self._comfyui.running:
             queue = "idle"
@@ -10762,8 +11507,16 @@ class ClaudeWidget(QWidget):
         self._ollama_worker.result.connect(self._on_ollama_read)
         self._ollama_worker.start()
 
-    def _on_ollama_read(self, status: OllamaStatus, models: list, available_count: int):
+    def _on_ollama_read(
+        self,
+        status: OllamaStatus,
+        models: list,
+        available_count: int,
+        llama: LlamaServersSnapshot | None = None,
+    ):
         self._local_ai_section.set_ollama(status, models, available_count)
+        if llama is not None:
+            self._local_ai_section.set_llama(llama)
         self.adjustSize()
 
     def _fetch_comfyui(self):
