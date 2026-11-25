@@ -1,11 +1,11 @@
 ---
 title: "Resolve provider sources and license before a later paid release"
-status: waiting-sam
+status: idea
 area: product
 due: null
-updated: 2026-10-07
+updated: 2026-11-24
 owner: sam
-brief: "Dated terms review is complete; choose source license, supported adapters and any historical privacy cleanup before future distribution."
+brief: "Parked 2026-11-24: no owner artifact after 48 days. Dated terms review is complete; choose source license, supported adapters and any historical privacy cleanup before future distribution."
 refs: ["docs/beta/provider-terms-check.md", "docs/beta/privacy-audit.md", "do.md"]
 test: null
 ---
@@ -16,3 +16,9 @@ test: null
 - **Reproduce:** `git ls-files '*LICENSE*' '*COPYING*'` confirms0 current license files at this checkpoint; read both dated beta reports and refresh primary policies before a future paid release. The privacy audit found0 credential patterns in its bounded history screen but identified historical email/path/operations data; no urgent credential compromise was demonstrated.
 - **External clocks / Sam-only:** Written provider permission may have an unknown response time and only starts when Sam authorizes contact. License selection and optional coordinated history cleanup are owner decisions. No contact has been sent; no paid service added.
 - **Done:** Selected license and per-adapter supported-source/permission decisions are documented, any authorized implementation is validated/pushed/deployed, and any chosen history action has explicit scope/approval. A completed dated review does not itself clear the tool for sale. Broader user/pay/adoption milestones remain in the home sales plan.
+
+## Decision autopilot 2026-11-24 (cron:decision-triage)
+
+- **Parked:** no finished artifact and 48 days without an update; status idea keeps it out of the Needs-you count until someone prepares the exact text, form values or one-file script Sam would need.
+- Undo: set `status: waiting-sam` and `owner: sam` again and restore the brief above, then rebuild TODO.
+- Was: status waiting-sam, owner sam, brief "Dated terms review is complete; choose source license, supported adapters and any historical privacy cleanup before future distribution.".
