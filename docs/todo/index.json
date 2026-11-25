@@ -417,12 +417,12 @@
     "path": "docs/todo/product/beta-recruiting-replies.md",
     "slug": "beta-recruiting-replies",
     "title": "Authorized beta recruiting replies: existing-session access",
-    "status": "waiting-sam",
+    "status": "idea",
     "area": "product",
     "due": null,
-    "updated": "2026-10-08",
+    "updated": "2026-11-25",
     "owner": "sam",
-    "brief": "Reply campaign parked: October8 research-only hold; 0 replies. Existing-session sign-in and r/codex no-bots blockers remain for later authorized sessions.",
+    "brief": "Parked 2026-11-25: needs Sam's own X sign-in and r/codex forbids bot replies; no artifact possible, 0 replies in 48 days. Resume only if Sam wants recruiting.",
     "refs": [
       "docs/todo/done/product/beta-phase-1.md"
     ],

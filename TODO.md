@@ -10,7 +10,7 @@ _None._
 
 ## Waiting on Sam
 
-- [ ] Authorized beta recruiting replies: existing-session access — Reply campaign parked: October8 research-only hold; 0 replies. Existing-session sign-in and r/codex no-bots blockers remain for later authorized sessions. · _product_ · [details](docs/todo/product/beta-recruiting-replies.md)
+_None._
 
 ## Scheduled (by due date)
 
@@ -24,6 +24,7 @@ _None._
 
 ## Ideas
 
+- [ ] Authorized beta recruiting replies: existing-session access — Parked 2026-11-25: needs Sam's own X sign-in and r/codex forbids bot replies; no artifact possible, 0 replies in 48 days. Resume only if Sam wants recruiting. · owner sam · _product_ · [details](docs/todo/product/beta-recruiting-replies.md)
 - [ ] Resolve provider sources and license before a later paid release — Parked 2026-11-24: no owner artifact after 48 days. Dated terms review is complete; choose source license, supported adapters and any historical privacy cleanup before future distribution. · owner sam · _product_ · [details](docs/todo/product/paid-release-source-and-license-decisions.md)
 - [ ] Session notifications and local token-source ideas — Deferred ideas; no change or live session interaction in beta phase 1. · _product_ · [details](docs/todo/product/session-notification-ideas.md)
 

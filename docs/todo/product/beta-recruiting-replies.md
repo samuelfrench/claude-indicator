@@ -1,11 +1,11 @@
 ---
 title: "Authorized beta recruiting replies: existing-session access"
-status: waiting-sam
+status: idea
 area: product
 due: null
-updated: 2026-10-08
+updated: 2026-11-25
 owner: sam
-brief: "Reply campaign parked: October8 research-only hold; 0 replies. Existing-session sign-in and r/codex no-bots blockers remain for later authorized sessions."
+brief: "Parked 2026-11-25: needs Sam's own X sign-in and r/codex forbids bot replies; no artifact possible, 0 replies in 48 days. Resume only if Sam wants recruiting."
 refs: ["docs/todo/done/product/beta-phase-1.md"]
 test: null
 ---
@@ -23,3 +23,9 @@ test: null
 - **Done:** The authorized campaign has verified posted replies within its caps, each logged with platform/reply URL/thread URL/date/text, and the signup/feedback tracker is refreshed. Until then, retain concrete access/rule/stop conditions as blockers. Broader 10–20 users/launch/paid success remain separate.
 
 **2026-10-08 07:13 CT completion-status check:** Overall beta work is not finished: implementation/preparation, Task7 and Task8 are accepted, but authorized recruiting is still open. Fresh all-state GitHub query returned 0 issues; private log/tracker contain 0 posted replies and 0 confirmed users/feedback/provider requests. Existing-session and r/codex blockers above are last observed at 01:31 CT, not freshly browser-checked in this status turn. Indicator master b32eb65110bfef4bcbfd5e12f31458effd445212 matches fetched origin and has green guard37740658059; full Python/install37740480385 at e85114f7f44a2f40ac0be3a8ba6cde8006bb41a6 is green, with only completion notes thereafter. Service active/running PID954015/NRestarts0; STOP absent. No post, login attempt, account change or deployment.
+
+## P10 inbox burn-down 2026-11-25
+
+- **Parked (age 48 days, no possible artifact).** The campaign needs Sam to sign into his existing X account in a browser tab (credentials never go to an agent) and, for the 20 saved Reddit rows, a community (r/codex) whose rule 9 prohibits bot-posted replies. A script cannot supply either. The 2026-10-08 research-only hold is the last instruction; 0 replies were posted and 0 users or feedback are recorded. Posting replies on Sam's accounts is third-party publication outside the standing lanes, so it stays an owner action whenever he wants the campaign.
+- **Nothing changes in the repo:** the STOP file, drafts (`~/indicator-beta/recruit-posts.md`) and the caps in this task stay as written. Re-open when Sam decides to resume recruiting; the first step is then his X sign-in.
+- **Undo:** set `status: waiting-sam`, `owner: sam`, `updated: 2026-10-08` and restore the brief "Reply campaign parked: October8 research-only hold; 0 replies. Existing-session sign-in and r/codex no-bots blockers remain for later authorized sessions."
